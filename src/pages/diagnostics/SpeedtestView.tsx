@@ -74,6 +74,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
   const push = useToastStore((s) => s.push);
   const [busy, setBusy] = useState<string | null>(null);
   const [selectedServerId, setSelectedServerId] = useState<string>("");
+  const [engine, setEngine] = useState<"auto" | "native">("auto");
   const [confirmClear, setConfirmClear] = useState(false);
 
   const speedtest = useWsStore((s) => s.speedtest);
@@ -96,10 +97,12 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
     setBusy("speedtest");
     resetSpeedtest();
     try {
-      const serverId = selectedServerId ? Number(selectedServerId) : undefined;
+      const serverId = engine === "auto" && selectedServerId ? Number(selectedServerId) : undefined;
+      const payload: Record<string, unknown> = { engine };
+      if (serverId) payload.serverId = serverId;
       await disruptiveFetch("speedtest", "/api/v1/speedtest/start", {
         method: "POST",
-        body: JSON.stringify(serverId ? { serverId } : {}),
+        body: JSON.stringify(payload),
       });
     } catch (e) {
       if (!isCancelled(e)) push("Couldn't start the speedtest", "error", errMsg(e, "Failed to start speedtest"));
@@ -277,56 +280,90 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
             )}
 
             {/* Controls */}
-            <div className="flex flex-col sm:flex-row gap-2.5">
-              <div className="flex gap-1.5 min-w-0 sm:flex-1">
-                <Select
-                  value={selectedServerId}
-                  onChange={(e) => setSelectedServerId(e.target.value)}
-                  disabled={speedtest.running}
-                  aria-label="Speedtest server"
-                  className="h-12 rounded-2xl"
-                >
-                  <option value="">Auto · nearest server</option>
-                  {servers.map((s) => (
-                    <option key={s.id} value={String(s.id)}>
-                      {s.name} — {s.location} (#{s.id})
-                    </option>
-                  ))}
-                </Select>
-                <Button
-                  variant="secondary"
-                  className="h-12 w-12 shrink-0 rounded-2xl px-0"
-                  onClick={() => serversQuery.refetch()}
-                  aria-label="Refresh speedtest servers"
-                  title="Refresh server list"
-                  disabled={serversQuery.isFetching || speedtest.running}
-                >
-                  <RefreshCw className={cn("h-4 w-4", serversQuery.isFetching && "animate-spin")} />
-                </Button>
+            <div className="space-y-2.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11.5px] font-semibold text-muted mr-1">Engine</span>
+                {(
+                  [
+                    { id: "auto", label: "Ookla (Auto)" },
+                    { id: "native", label: "Native Rust · Cloudflare" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    disabled={speedtest.running}
+                    onClick={() => setEngine(opt.id)}
+                    className={cn(
+                      "rounded-full px-3 py-1 text-[12px] font-semibold transition-colors border",
+                      engine === opt.id
+                        ? "border-ember bg-ember-soft text-ember-ink"
+                        : "border-line bg-surface text-muted hover:text-ink"
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
               </div>
-              {speedtest.running ? (
-                <Button
-                  variant="danger"
-                  size="lg"
-                  className="h-12 sm:min-w-[220px]"
-                  onClick={stopSpeedtestRun}
-                  disabled={busy === "speedtest-stop"}
-                >
-                  <Square className="h-4 w-4" />
-                  Abort · {speedtest.progress}%
-                </Button>
-              ) : (
-                <Button
-                  variant="tier1"
-                  size="lg"
-                  className="h-12 sm:min-w-[220px] text-[15px]"
-                  onClick={startSpeedtestRun}
-                  disabled={busy === "speedtest"}
-                >
-                  <Play className="h-4 w-4 fill-current" />
-                  Run speedtest
-                </Button>
-              )}
+              <div className="flex flex-col sm:flex-row gap-2.5">
+                <div className="flex gap-1.5 min-w-0 sm:flex-1">
+                  {engine === "native" ? (
+                    <div className="flex h-12 flex-1 items-center rounded-2xl border border-line bg-sunk/60 px-4 text-[13px] font-medium text-ink-2 truncate">
+                      Cloudflare Anycast · 4-stream HTTP + concurrent DL/UL bufferbloat probe
+                    </div>
+                  ) : (
+                    <>
+                      <Select
+                        value={selectedServerId}
+                        onChange={(e) => setSelectedServerId(e.target.value)}
+                        disabled={speedtest.running}
+                        aria-label="Speedtest server"
+                        className="h-12 rounded-2xl"
+                      >
+                        <option value="">Auto · nearest server</option>
+                        {servers.map((s) => (
+                          <option key={s.id} value={String(s.id)}>
+                            {s.name} — {s.location} (#{s.id})
+                          </option>
+                        ))}
+                      </Select>
+                      <Button
+                        variant="secondary"
+                        className="h-12 w-12 shrink-0 rounded-2xl px-0"
+                        onClick={() => serversQuery.refetch()}
+                        aria-label="Refresh speedtest servers"
+                        title="Refresh server list"
+                        disabled={serversQuery.isFetching || speedtest.running}
+                      >
+                        <RefreshCw className={cn("h-4 w-4", serversQuery.isFetching && "animate-spin")} />
+                      </Button>
+                    </>
+                  )}
+                </div>
+                {speedtest.running ? (
+                  <Button
+                    variant="danger"
+                    size="lg"
+                    className="h-12 sm:min-w-[220px]"
+                    onClick={stopSpeedtestRun}
+                    disabled={busy === "speedtest-stop"}
+                  >
+                    <Square className="h-4 w-4" />
+                    Abort · {speedtest.progress}%
+                  </Button>
+                ) : (
+                  <Button
+                    variant="tier1"
+                    size="lg"
+                    className="h-12 sm:min-w-[220px] text-[15px]"
+                    onClick={startSpeedtestRun}
+                    disabled={busy === "speedtest"}
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    Run speedtest
+                  </Button>
+                )}
+              </div>
             </div>
             <p className="-mt-3 text-[11.5px] text-muted">Each run saturates the link for several seconds and counts against your data plan.</p>
           </div>

@@ -212,6 +212,8 @@ pub struct SpeedtestRun {
     pub server_location: Option<String>,
     pub external_ip: Option<String>,
     pub result_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,8 @@ pub struct SpeedtestLiveState {
     pub server_location: Option<String>,
     pub external_ip: Option<String>,
     pub result_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     pub error: Option<String>,
     pub samples: Vec<SpeedtestSample>,
 }
@@ -256,6 +260,7 @@ impl Default for SpeedtestLiveState {
             server_location: None,
             external_ip: None,
             result_url: None,
+            engine: None,
             error: None,
             samples: Vec::new(),
         }
@@ -505,8 +510,11 @@ pub struct AppState {
     pub speedtest_live: Arc<RwLock<SpeedtestLiveState>>,
     pub speedtest_history: Arc<RwLock<Vec<SpeedtestRun>>>,
     pub speedtest_pid: Arc<tokio::sync::Mutex<Option<u32>>>,
+    pub speedtest_cancel: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     pub antenna_align: Arc<RwLock<AntennaAlignState>>,
     pub align_notify: Arc<Notify>,
+    pub phy_diag: Arc<RwLock<crate::radio_tuning::PhyDiagnostics>>,
+    pub dsp_telemetry: Arc<RwLock<crate::qmi::dsp::DspTelemetrySnapshot>>,
     pub settings: Arc<RwLock<DaemonSettings>>,
     pub quecwatch: Arc<RwLock<LinkWatchRuntime>>,
     pub alerts: Arc<RwLock<VecDeque<AlertLogEntry>>>,
@@ -561,8 +569,11 @@ impl AppState {
             speedtest_live: Default::default(),
             speedtest_history: Default::default(),
             speedtest_pid: Default::default(),
+            speedtest_cancel: Default::default(),
             antenna_align: Default::default(),
             align_notify: Arc::new(Notify::new()),
+            phy_diag: Default::default(),
+            dsp_telemetry: Default::default(),
             settings: Default::default(),
             quecwatch: Default::default(),
             alerts: Default::default(),

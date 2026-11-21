@@ -396,10 +396,11 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         }
     });
 
-    // 5. Public IP refresh + QuecProfiles & Scheduled Tasks
+    // 5. Public IP refresh + QuecProfiles & Scheduled Tasks + SDX75 PHY & QMI DSP telemetry
     let st_prof = state.clone();
     tokio::spawn(async move {
         let mut tick = 0u64;
+        crate::radio_tuning::enable_phy_telemetry_counters(&st_prof).await;
         loop {
             if tick.is_multiple_of(10) {
                 refresh_public_ip(&st_prof).await;
@@ -407,6 +408,9 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
             if tick.is_multiple_of(2) {
                 crate::profiles::tick_profiles_and_schedules(&st_prof).await;
             }
+            let _ = crate::radio_tuning::poll_phy_telemetry(&st_prof).await;
+            let dsp = crate::qmi::dsp::probe_dsp_telemetry().await;
+            *st_prof.dsp_telemetry.write().await = dsp;
             tick += 1;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }

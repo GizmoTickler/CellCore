@@ -98,6 +98,8 @@ pub struct MetricsInput {
     pub usage: UsageView,
     pub notify: NotifyView,
     pub dataplane: crate::dataplane::DataplaneMetricsView,
+    pub phy: crate::radio_tuning::PhyDiagnostics,
+    pub dsp: crate::qmi::dsp::DspTelemetrySnapshot,
 }
 
 pub fn usage_view(u: &DataUsageState, today: Civil, secs: u32) -> UsageView {
@@ -187,6 +189,8 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         NotifyView { sent: n.sent.clone(), failed: n.failed.clone(), suppressed: n.suppressed.clone(), dropped: n.dropped }
     };
     let dataplane = crate::dataplane::metrics_view().await;
+    let phy = state.phy_diag.read().await.clone();
+    let dsp = state.dsp_telemetry.read().await.clone();
 
     MetricsInput {
         version: state.version.clone(),
@@ -208,6 +212,8 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         usage,
         notify,
         dataplane,
+        phy,
+        dsp,
     }
 }
 
@@ -555,6 +561,70 @@ pub fn render(m: &MetricsInput) -> String {
         p.counter("dataplane_netlink_updates_total", "Netlink address/route applies performed by the native dataplane.", dp.netlink_updates_total as f64);
     }
 
+    // --- SDX75 PHY / QoS / Security telemetry ---------------------------
+    let phy = &m.phy;
+    if let Some(tx) = phy.nr5g_tx_pwr_detail.as_ref() {
+        p.head("nr5g_tx_power_dbm", "5G NR uplink transmit power by channel (dBm).", "gauge");
+        p.sample("nr5g_tx_power_dbm", &[("channel", "pusch")], f64::from(tx.pusch_dbm));
+        p.sample("nr5g_tx_power_dbm", &[("channel", "pucch")], f64::from(tx.pucch_dbm));
+        p.sample("nr5g_tx_power_dbm", &[("channel", "max")], f64::from(tx.max_dbm));
+        p.sample("nr5g_tx_power_dbm", &[("channel", "srs")], f64::from(tx.srs_dbm));
+        p.gauge("nr5g_tx_headroom_db", "5G NR HPUE uplink power headroom (max - PUSCH, dB).", f64::from(tx.headroom_db));
+    }
+    p.opt_gauge("nr5g_pathloss_db", "5G NR RF pathloss between gNodeB and UE (dB).", phy.nr5g_pathloss_db.map(f64::from));
+    if let Some(dl) = phy.nr5g_dl_mcs.as_ref() {
+        p.gauge("nr5g_dl_mcs", "5G NR downlink Modulation and Coding Scheme index.", f64::from(dl.mcs));
+        p.gauge("nr5g_dl_mod_order", "5G NR downlink modulation order (0=QPSK,1=16QAM,2=64QAM,3=256QAM).", f64::from(dl.mod_order));
+    }
+    if let Some(ul) = phy.nr5g_ul_mcs.as_ref() {
+        p.gauge("nr5g_ul_mcs", "5G NR uplink Modulation and Coding Scheme index.", f64::from(ul.mcs));
+        p.gauge("nr5g_ul_mod_order", "5G NR uplink modulation order (0=QPSK,1=16QAM,2=64QAM,3=256QAM).", f64::from(ul.mod_order));
+    }
+    p.opt_gauge("nr5g_mimo_layers", "5G NR active MIMO spatial layers.", phy.nr5g_mimo_layers.map(f64::from));
+    if let Some(beam) = phy.ssb_beams.iter().find(|b| b.is_serving).or_else(|| phy.ssb_beams.first()) {
+        p.gauge("nr5g_ssb_beam_id", "Serving 5G NR Synchronization Signal Block (SSB) beam index.", f64::from(beam.beam_id));
+    }
+    if !phy.qos_bearers.is_empty() {
+        p.head("nr5g_five_qi", "Carrier-provisioned 5G QoS Identifier (5QI) per PDU session.", "gauge");
+        for q in phy.qos_bearers.iter().take(8) {
+            p.sample(
+                "nr5g_five_qi",
+                &[("apn", &q.apn), ("qfi", &q.qfi.to_string())],
+                f64::from(q.five_qi),
+            );
+        }
+    }
+    if !phy.ambr_caps.is_empty() {
+        p.head("nr5g_ambr_mbps", "Carrier-provisioned Session-AMBR bandwidth cap (Mbit/s).", "gauge");
+        for a in phy.ambr_caps.iter().take(8) {
+            p.sample("nr5g_ambr_mbps", &[("apn", &a.apn), ("direction", "dl")], a.dl_mbps as f64);
+            p.sample("nr5g_ambr_mbps", &[("apn", &a.apn), ("direction", "ul")], a.ul_mbps as f64);
+        }
+    }
+    if let Some(sec) = phy.air_security.as_ref() {
+        p.gauge(
+            "air_cipher_null",
+            "1 if connected on a null air-interface cipher (NEA0/EEA0); 0 when encrypted or RRC idle.",
+            b(sec.null_cipher_alert),
+        );
+    }
+    if let Some(rrc) = phy.rrc_state.as_ref() {
+        p.gauge("rrc_state_code", "RRC state code (0=disconnected, 1=idle, 2=connected, 3=inactive).", f64::from(rrc.state_code));
+    }
+
+    // --- SDX75 QRTR QMI DSP telemetry (TMD thermal + SAR backoff) -------
+    let dsp = &m.dsp;
+    if dsp.qrtr_available {
+        p.gauge("qmi_tmd_throttling", "1 when any QMI Thermal Mitigation Device is actively throttling.", b(dsp.any_throttling));
+        if !dsp.tmd_devices.is_empty() {
+            p.head("qmi_tmd_mitigation_level", "Current QMI TMD thermal mitigation level per DSP device.", "gauge");
+            for d in dsp.tmd_devices.iter().take(24) {
+                p.sample("qmi_tmd_mitigation_level", &[("device", &d.name)], f64::from(d.current_level));
+            }
+        }
+        p.opt_gauge("qmi_sar_state", "Current QMI SAR RF transmit backoff state (0 = no backoff).", dsp.sar_rf_state.map(f64::from));
+    }
+
     p.out
 }
 
@@ -677,5 +747,60 @@ mod tests {
         assert!(t.contains("cellcore_snapshot_age_seconds -1\n"));
         assert!(!t.contains("serving_cell_info{"));
         assert_eq!(line_value(&t, "cellcore_registered ").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn renders_sdx75_phy_and_qmi_dsp_metrics() {
+        let mut m = sample_input();
+        m.phy.nr5g_tx_pwr_detail = Some(crate::radio_tuning::TxPowerDetail {
+            pusch_dbm: 24,
+            pucch_dbm: 18,
+            max_dbm: 26,
+            srs_dbm: 0,
+            headroom_db: 2,
+        });
+        m.phy.nr5g_pathloss_db = Some(114);
+        m.phy.nr5g_dl_mcs = Some(crate::radio_tuning::McsDetail {
+            mcs: 28,
+            mod_order: 3,
+            modulation: "256QAM".into(),
+        });
+        m.phy.nr5g_mimo_layers = Some(4);
+        m.phy.qos_bearers.push(crate::radio_tuning::QosBearerEntry {
+            cid: 1,
+            apn: "fast.t-mobile.com".into(),
+            qfi: 1,
+            five_qi: 6,
+            priority_label: "Postpaid Priority (5QI 6)".into(),
+        });
+        m.phy.air_security = Some(crate::radio_tuning::AirSecurityInfo {
+            rat: "NR5G".into(),
+            cipher_id: 2,
+            cipher_name: "128-NEA2 (AES-CTR)".into(),
+            integrity_id: 2,
+            integrity_name: "128-NIA2 (AES-CMAC)".into(),
+            null_cipher_alert: false,
+        });
+        m.dsp.qrtr_available = true;
+        m.dsp.sar_rf_state = Some(0);
+        m.dsp.tmd_devices.push(crate::qmi::dsp::TmdDeviceInfo {
+            name: "pa".into(),
+            max_level: 3,
+            current_level: 0,
+            requested_level: 0,
+            throttling: false,
+        });
+
+        let t = render(&m);
+        assert_eq!(line_value(&t, "cellcore_nr5g_tx_power_dbm{channel=\"pusch\"}").as_deref(), Some("24"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_tx_headroom_db ").as_deref(), Some("2"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_pathloss_db ").as_deref(), Some("114"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_dl_mcs ").as_deref(), Some("28"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_mimo_layers ").as_deref(), Some("4"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_five_qi{apn=\"fast.t-mobile.com\",qfi=\"1\"}").as_deref(), Some("6"));
+        assert_eq!(line_value(&t, "cellcore_air_cipher_null ").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_qmi_tmd_throttling ").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_qmi_tmd_mitigation_level{device=\"pa\"}").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_qmi_sar_state ").as_deref(), Some("0"));
     }
 }

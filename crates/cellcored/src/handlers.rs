@@ -28,7 +28,7 @@ use crate::{
     reconcile::{run_boot_reconcile, set_usb_gadget_enabled},
     smd::Priority,
     sms::{encode_submit_pdus, parse_cmgl_response},
-    speedtest::{SPEEDTEST_HISTORY_PATH, list_nearby_servers_cached, start_speedtest, stop_speedtest},
+    speedtest::{SPEEDTEST_HISTORY_PATH, list_nearby_servers_cached, stop_speedtest},
     state::{
         AppState, ETC_QM_DIR, format_now_hms, redact_sensitive, save_json_atomic,
     },
@@ -3297,6 +3297,7 @@ pub async fn get_speedtest_servers() -> Response {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpeedtestStartReq {
     server_id: Option<i64>,
+    engine: Option<String>,
 }
 
 pub async fn post_speedtest_start(
@@ -3329,7 +3330,18 @@ pub async fn post_speedtest_start(
     if srv_id.is_some_and(|id| id <= 0) {
         return err_resp(StatusCode::BAD_REQUEST, "serverId must be a positive server number");
     }
-    match start_speedtest(ctx.app.clone(), srv_id).await {
+    let engine = match req.engine.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("auto") => crate::speedtest::SpeedtestEngine::Auto,
+        Some("ookla") => crate::speedtest::SpeedtestEngine::Ookla,
+        Some("native") => crate::speedtest::SpeedtestEngine::Native,
+        Some(other) => {
+            return err_resp(
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported speedtest engine {other:?} (allowed: auto, ookla, native)"),
+            );
+        }
+    };
+    match crate::speedtest::start_speedtest_with_engine(ctx.app.clone(), srv_id, engine).await {
         Ok(()) => Json(serde_json::json!({ "status": "started" })).into_response(),
         Err(e) => err_resp(StatusCode::CONFLICT, e),
     }

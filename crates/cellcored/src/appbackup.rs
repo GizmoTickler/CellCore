@@ -1150,6 +1150,19 @@ impl Applier for HandlerApplier {
                     } else {
                         Some(rt.nr5g_band_priority)
                     },
+                    nr5g_pref_freq_list: if rt.nr5g_pref_freq_list.is_empty() {
+                        None
+                    } else {
+                        Some(rt.nr5g_pref_freq_list)
+                    },
+                    nr5g_earfcn_lock: if rt.nr5g_earfcn_lock.is_empty() {
+                        None
+                    } else {
+                        Some(rt.nr5g_earfcn_lock)
+                    },
+                    event_a3_enabled: rt.event_a3_enabled,
+                    event_a3_offset: rt.event_a3_offset,
+                    sim_slot: None,
                 };
                 if patch.is_empty() {
                     return Ok("skipped: no radioTuning fields present".into());

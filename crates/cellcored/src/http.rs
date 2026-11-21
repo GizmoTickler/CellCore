@@ -350,6 +350,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/cellular/tower-finder", get(crate::tower_finder::get_tower_finder).put(crate::tower_finder::put_tower_finder))
         .route("/api/v1/cellular/tower-finder/lookup", post(crate::tower_finder::post_tower_lookup))
         .route("/api/v1/cellular/tuning", get(crate::radio_tuning::get_tuning).post(crate::radio_tuning::post_tuning))
+        .route("/api/v1/cellular/dsp", get(crate::qmi::dsp::get_dsp_telemetry))
         .route("/api/v1/network/lan", get(handlers::get_network_lan).post(handlers::post_network_lan))
         .route("/api/v1/network/data-usage", get(handlers::get_data_usage).post(handlers::post_data_usage).delete(handlers::delete_data_usage))
         .route("/api/v1/diagnostics/health", get(handlers::get_health))

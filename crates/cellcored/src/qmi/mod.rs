@@ -3,6 +3,7 @@
 
 pub mod codec;
 pub mod dms;
+pub mod dsp;
 pub mod nas;
 pub mod qrtr;
 pub mod uim;
@@ -19,7 +20,9 @@ pub const SVC_NAS: u32 = 0x03;
 pub const SVC_QOS: u32 = 0x04;
 pub const SVC_WMS: u32 = 0x05;
 pub const SVC_UIM: u32 = 0x0B;
+pub const SVC_SAR: u32 = 0x11;
 pub const SVC_TS: u32 = 0x17;
+pub const SVC_TMD: u32 = 0x18;
 pub const SVC_WDA: u32 = 0x1A;
 pub const SVC_DSD: u32 = 0x2A;
 pub const SVC_DPM: u32 = 0x2F;

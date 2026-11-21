@@ -215,8 +215,11 @@ async fn async_main() {
         speedtest_live: Arc::new(RwLock::new(Default::default())),
         speedtest_history: Arc::new(RwLock::new(speedtest_history)),
         speedtest_pid: Arc::new(Mutex::new(None)),
+        speedtest_cancel: Arc::new(Mutex::new(None)),
         antenna_align: Arc::new(RwLock::new(AntennaAlignState::default())),
         align_notify: Arc::new(tokio::sync::Notify::new()),
+        phy_diag: Arc::new(RwLock::new(Default::default())),
+        dsp_telemetry: Arc::new(RwLock::new(Default::default())),
         settings: Arc::new(RwLock::new(settings)),
         quecwatch: Arc::new(RwLock::new(LinkWatchRuntime {
             status: "idle".into(),
@@ -283,7 +286,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.2.0");
     }
 
     #[test]
