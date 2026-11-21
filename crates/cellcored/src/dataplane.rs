@@ -130,6 +130,8 @@ pub struct DataplaneConfig {
     pub ipv6_prefix_sharing: bool,
     pub preserve_ipa_offload: bool,
     pub kernel_tuning: KernelTuningProfile,
+    #[serde(default)]
+    pub sfe_fastpath: bool,
 }
 
 impl Default for DataplaneConfig {
@@ -152,6 +154,7 @@ impl Default for DataplaneConfig {
             ipv6_prefix_sharing: true,
             preserve_ipa_offload: true,
             kernel_tuning: KernelTuningProfile::Default,
+            sfe_fastpath: false,
         }
     }
 }
@@ -210,6 +213,7 @@ pub struct KernelTelemetry {
     pub netdev_budget_usecs: Option<u64>,
     pub tcp_slow_start_after_idle: Option<u64>,
     pub tcp_mtu_probing: Option<u64>,
+    pub tcp_notsent_lowat: Option<u64>,
     pub rps_sock_flow_entries: Option<u64>,
     pub tcp_fastopen: Option<u64>,
     pub conntrack_max: Option<u64>,
@@ -256,6 +260,7 @@ pub struct DataplaneSnapshot {
     pub ipa_ippt_active: bool,
     pub ipa_v6_sharing_prefix: Option<String>,
     pub ipa_cli_present: bool,
+    pub sfe_loaded: bool,
     pub indications_received: u64,
     pub reconnect_attempts: u64,
     pub netlink_updates: u64,
@@ -306,6 +311,56 @@ static HUB: OnceLock<Arc<DataplaneHub>> = OnceLock::new();
 static BASELINE_SYSCTLS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
 static NATIVE_CONNECTED_SINCE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SFE_LOADED_BY_US: AtomicBool = AtomicBool::new(false);
+
+/// True when Qualcomm Shortcut Forwarding Engine (`shortcut_fe`) is currently loaded in the kernel.
+pub fn is_sfe_loaded() -> bool {
+    Path::new(&crate::paths::p("/sys/module/shortcut_fe")).exists()
+        || Path::new(&crate::paths::p("/sys/sfe_ipv4")).exists()
+}
+
+/// Reconcile opt-in Qualcomm SFE software fastpath kernel modules.
+pub async fn reconcile_sfe_fastpath(enable: bool, force_unload: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let opt_bin = "/usr/sbin/data_path_opt";
+    if enable {
+        if !is_sfe_loaded() {
+            if Path::new(&crate::paths::p(opt_bin)).exists() {
+                let _ = run(opt_bin, &["-l", "SFE"], ExecOpts::new(10, 16 * KIB)).await;
+            }
+            if !is_sfe_loaded() {
+                for kmod in ["shortcut-fe", "shortcut-fe-ipv6", "shortcut-fe-cm"] {
+                    let _ = run("modprobe", &[kmod], ExecOpts::new(5, 16 * KIB)).await;
+                }
+            }
+            if is_sfe_loaded() {
+                SFE_LOADED_BY_US.store(true, Ordering::Relaxed);
+            } else {
+                warnings.push("Failed to load Qualcomm SFE fastpath modules (shortcut-fe)".into());
+            }
+        } else {
+            SFE_LOADED_BY_US.store(true, Ordering::Relaxed);
+        }
+    } else if force_unload || SFE_LOADED_BY_US.load(Ordering::Relaxed) {
+        if is_sfe_loaded() {
+            if Path::new(&crate::paths::p(opt_bin)).exists() {
+                let _ = run(opt_bin, &["-u", "SFE"], ExecOpts::new(10, 16 * KIB)).await;
+            }
+            if is_sfe_loaded() {
+                for kmod in ["shortcut_fe_cm", "shortcut_fe_ipv6", "shortcut_fe"] {
+                    let _ = run("rmmod", &[kmod], ExecOpts::new(5, 16 * KIB)).await;
+                }
+            }
+        }
+        if !is_sfe_loaded() {
+            SFE_LOADED_BY_US.store(false, Ordering::Relaxed);
+        } else {
+            warnings.push("Failed to unload Qualcomm SFE fastpath modules".into());
+        }
+    }
+    crate::radio_tuning::set_cached_sfe_state(Some(is_sfe_loaded()));
+    warnings
+}
 
 /// True while `DataplaneMode::Native` is active (or stopping QCMAP/netmgrd), so `at_fwd`
 /// commands backed by QCMAP (`AT+QMAP`, `+QMAPWAC`, `+QDMZ`, `+QIP6CFG`) are never written
@@ -679,28 +734,31 @@ const HIGH_THROUGHPUT_SYSCTLS: &[(&str, &str)] = &[
     ("/proc/sys/net/core/netdev_budget_usecs", "8000"),
     ("/proc/sys/net/ipv4/tcp_slow_start_after_idle", "0"),
     ("/proc/sys/net/ipv4/tcp_mtu_probing", "1"),
+    ("/proc/sys/net/ipv4/tcp_notsent_lowat", "131072"),
     ("/proc/sys/net/core/rps_sock_flow_entries", "32768"),
     ("/proc/sys/net/ipv4/tcp_fastopen", "3"),
     ("/proc/sys/net/netfilter/nf_conntrack_max", "65536"),
     ("/sys/module/nf_conntrack/parameters/hashsize", "16384"),
-    ("/sys/class/net/eth0/queues/rx-0/rps_cpus", "e"),
+    ("/sys/class/net/eth0/queues/rx-0/rps_cpus", "c"),
     ("/sys/class/net/eth0/queues/rx-0/rps_flow_cnt", "4096"),
     ("/sys/class/net/eth0/queues/tx-0/xps_cpus", "c"),
     ("/sys/class/net/eth0/gro_flush_timeout", "20000"),
     ("/sys/class/net/eth0/napi_defer_hard_irqs", "2"),
-    ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_cpus", "e"),
-    ("/sys/class/net/rmnet_ipa0/queues/rx-1/rps_cpus", "e"),
-    ("/sys/class/net/rmnet_ipa0/queues/rx-2/rps_cpus", "e"),
-    ("/sys/class/net/rmnet_ipa0/queues/rx-3/rps_cpus", "e"),
+    ("/sys/class/net/rmnet_ipa0/gro_flush_timeout", "20000"),
+    ("/sys/class/net/rmnet_ipa0/napi_defer_hard_irqs", "2"),
+    ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_cpus", "c"),
+    ("/sys/class/net/rmnet_ipa0/queues/rx-1/rps_cpus", "c"),
+    ("/sys/class/net/rmnet_ipa0/queues/rx-2/rps_cpus", "c"),
+    ("/sys/class/net/rmnet_ipa0/queues/rx-3/rps_cpus", "c"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_flow_cnt", "4096"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-1/rps_flow_cnt", "4096"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-2/rps_flow_cnt", "4096"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-3/rps_flow_cnt", "4096"),
-    ("/sys/class/net/rmnet_ipa0/queues/tx-0/xps_cpus", "1"),
-    ("/sys/class/net/rmnet_ipa0/queues/tx-1/xps_cpus", "2"),
+    ("/sys/class/net/rmnet_ipa0/queues/tx-0/xps_cpus", "4"),
+    ("/sys/class/net/rmnet_ipa0/queues/tx-1/xps_cpus", "8"),
     ("/sys/class/net/rmnet_ipa0/queues/tx-2/xps_cpus", "4"),
     ("/sys/class/net/rmnet_ipa0/queues/tx-3/xps_cpus", "8"),
-    ("/sys/class/net/rmnet_data0/queues/rx-0/rps_cpus", "e"),
+    ("/sys/class/net/rmnet_data0/queues/rx-0/rps_cpus", "c"),
     ("/sys/class/net/rmnet_data0/queues/rx-0/rps_flow_cnt", "4096"),
     ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "performance"),
     ("/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor", "performance"),
@@ -729,7 +787,7 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
     if let Some(iface) = active_iface
         && netlink::validate_managed_iface(iface).is_ok()
     {
-        for (suffix, val) in [("rps_cpus", "e"), ("rps_flow_cnt", "4096")] {
+        for (suffix, val) in [("rps_cpus", "c"), ("rps_flow_cnt", "4096")] {
             let rel = format!("/sys/class/net/{iface}/queues/rx-0/{suffix}");
             if !HIGH_THROUGHPUT_SYSCTLS.iter().any(|(r, _)| *r == rel) {
                 dyn_entries.push((rel, val));
@@ -796,9 +854,44 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
     warnings
 }
 
-/// Enable hardware/kernel GRO forwarding offloads (`rx-gro-list`, `rx-udp-gro-forwarding`)
-/// on `eth0` and the active `rmnet_data*` interface, and pin `eth0-*` PCIe MSI IRQs
-/// onto CPUs 2–3 (isolated from modem `ipcc_0` on CPU 0 and Qualcomm `gsi/IPA` on CPU 1).
+/// Alternate `eth0-*` PCIe MSI IRQs across single-CPU masks `"4"` (CPU 2) and `"8"` (CPU 3)
+/// so GICv3 does not steer multi-bit `"c"` solely onto its lowest set bit (CPU 2).
+pub(crate) fn pin_eth0_irqs_alternating() -> Vec<(String, &'static str)> {
+    let mut assigned = Vec::new();
+    let irqs_path = crate::paths::p("/proc/interrupts");
+    let Ok(text) = fs::read_to_string(&irqs_path) else {
+        return assigned;
+    };
+    let mut idx = 0usize;
+    for line in text.lines() {
+        if !line.contains("eth0-") {
+            continue;
+        }
+        if let Some((num_raw, _)) = line.split_once(':') {
+            let irq = num_raw.trim();
+            if !irq.is_empty() && irq.bytes().all(|b| b.is_ascii_digit()) {
+                let mask = if idx.is_multiple_of(2) { "4" } else { "8" };
+                idx += 1;
+                let aff_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity"));
+                if Path::new(&aff_path).exists() {
+                    let _ = fs::write(&aff_path, format!("{mask}\n"));
+                } else {
+                    let list_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
+                    if Path::new(&list_path).exists() {
+                        let cpu = if mask == "4" { "2" } else { "3" };
+                        let _ = fs::write(&list_path, format!("{cpu}\n"));
+                    }
+                }
+                assigned.push((irq.to_string(), mask));
+            }
+        }
+    }
+    assigned
+}
+
+/// Enable hardware/kernel GRO/GSO/TSO + UDP GRO forwarding while keeping `rx-gro-list off`
+/// (avoids `frag_list` linearization penalty on TCP/IPv6/WireGuard), and split `eth0-*` MSI IRQs
+/// evenly across CPU 2 (`"4"`) and CPU 3 (`"8"`), isolated from `ipcc_0` (CPU 0) and `gsi/IPA` (CPU 1).
 fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
     let mut ifaces: Vec<&str> = vec!["eth0"];
     if let Some(iface) = active_iface
@@ -812,30 +905,44 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
         if !Path::new(&sys_if).exists() {
             continue;
         }
-        let _ = crate::uci::run_cmd_blocking_timeout(
+        if crate::uci::run_cmd_blocking_timeout(
             "ethtool",
-            &["-K", iface, "rx-gro-list", "on", "rx-udp-gro-forwarding", "on"],
+            &[
+                "-K",
+                iface,
+                "gro",
+                "on",
+                "gso",
+                "on",
+                "tso",
+                "on",
+                "rx-gro-list",
+                "off",
+                "rx-udp-gro-forwarding",
+                "on",
+            ],
             Duration::from_secs(2),
-        );
-    }
-
-    let irqs_path = crate::paths::p("/proc/interrupts");
-    if let Ok(text) = fs::read_to_string(&irqs_path) {
-        for line in text.lines() {
-            if !line.contains("eth0-") {
-                continue;
-            }
-            if let Some((num_raw, _)) = line.split_once(':') {
-                let irq = num_raw.trim();
-                if !irq.is_empty() && irq.bytes().all(|b| b.is_ascii_digit()) {
-                    let aff_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
-                    if Path::new(&aff_path).exists() {
-                        let _ = fs::write(&aff_path, "2-3\n");
-                    }
-                }
-            }
+        )
+        .is_err()
+        {
+            let _ = crate::uci::run_cmd_blocking_timeout(
+                "ethtool",
+                &[
+                    "-K",
+                    iface,
+                    "gro",
+                    "on",
+                    "rx-gro-list",
+                    "off",
+                    "rx-udp-gro-forwarding",
+                    "on",
+                ],
+                Duration::from_secs(2),
+            );
         }
     }
+
+    let _ = pin_eth0_irqs_alternating();
 }
 
 pub(crate) fn parse_ipa_eth_driver(status_text: &str) -> Option<String> {
@@ -980,6 +1087,7 @@ pub fn collect_kernel_telemetry(
         netdev_budget_usecs: read_u64_sys("/proc/sys/net/core/netdev_budget_usecs"),
         tcp_slow_start_after_idle: read_u64_sys("/proc/sys/net/ipv4/tcp_slow_start_after_idle"),
         tcp_mtu_probing: read_u64_sys("/proc/sys/net/ipv4/tcp_mtu_probing"),
+        tcp_notsent_lowat: read_u64_sys("/proc/sys/net/ipv4/tcp_notsent_lowat"),
         rps_sock_flow_entries: read_u64_sys("/proc/sys/net/core/rps_sock_flow_entries"),
         tcp_fastopen: read_u64_sys("/proc/sys/net/ipv4/tcp_fastopen"),
         conntrack_max: read_u64_sys("/proc/sys/net/netfilter/nf_conntrack_max"),
@@ -1037,6 +1145,9 @@ pub fn start(state: &AppState) {
     }
     let st = state.clone();
     tokio::spawn(async move {
+        if cfg.sfe_fastpath {
+            let _ = reconcile_sfe_fastpath(true, false).await;
+        }
         supervisor_loop(st, h).await;
     });
 }
@@ -1073,12 +1184,14 @@ impl From<&DataplaneConfig> for AppliedCfgSig {
 #[derive(Debug, Clone, Default)]
 struct NativeNatState {
     iface: String,
+    link_mtu: u32,
     nft_table: bool,
     fw4_forward: bool,
     ipt_nat: bool,
     ipt_forward: bool,
-    ipt_mss: bool,
-    ip6t_mss: bool,
+    ip6t_forward: bool,
+    ipt_mss_arg: Option<String>,
+    ip6t_mss_arg: Option<String>,
 }
 
 struct NativeHandles {
@@ -1089,6 +1202,8 @@ struct NativeHandles {
     last_v4_ip: Option<String>,
     last_v6_ip: Option<String>,
     last_v6_key: Option<(String, u8)>,
+    last_link_mtu: u32,
+    wda_negotiated_ep: Option<(u32, u32)>,
     last_applied_sig: Option<AppliedCfgSig>,
     last_resolved_iface: Option<String>,
     applied_dns: Vec<String>,
@@ -1115,6 +1230,8 @@ impl NativeHandles {
             last_v4_ip: None,
             last_v6_ip: None,
             last_v6_key: None,
+            last_link_mtu: 1500,
+            wda_negotiated_ep: None,
             last_applied_sig: None,
             last_resolved_iface: None,
             applied_dns: Vec::new(),
@@ -1178,15 +1295,31 @@ pub(crate) fn fw4_chain_covers_iface(chain_text: &str, iface: &str) -> bool {
         .any(|line| line.contains("oifname") && line.contains(&quoted))
 }
 
-pub(crate) fn build_native_nat_nft_script(iface: &str, include_masq: bool) -> Result<String, String> {
+pub(crate) fn build_native_nat_nft_script(
+    iface: &str,
+    include_masq: bool,
+    link_mtu: u32,
+) -> Result<String, String> {
     netlink::validate_managed_iface(iface)?;
-    let mut s = format!(
-        "add table inet qm_native_nat\n\
+    let mtu = link_mtu.clamp(1280, 1500);
+    let mut s = "add table inet qm_native_nat\n\
          flush table inet qm_native_nat\n\
-         add chain inet qm_native_nat forward {{ type filter hook forward priority mangle; policy accept; }}\n\
-         add rule inet qm_native_nat forward oifname \"{iface}\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n\
-         add rule inet qm_native_nat forward iifname \"{iface}\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n"
-    );
+         add chain inet qm_native_nat forward { type filter hook forward priority mangle; policy accept; }\n"
+        .to_string();
+    if mtu < 1500 {
+        let mss4 = mtu - 40;
+        let mss6 = mtu - 60;
+        s.push_str(&format!(
+            "add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set {mss4}\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set {mss4}\n\
+             add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set {mss6}\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set {mss6}\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "add rule inet qm_native_nat forward oifname \"{iface}\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n"
+        ));
+    }
     if include_masq {
         s.push_str(&format!(
             "add chain inet qm_native_nat postrouting {{ type nat hook postrouting priority srcnat + 10; policy accept; }}\n\
@@ -1219,7 +1352,8 @@ pub(crate) fn ipt_rules_cover_iface(rules_text: &str, iface: &str) -> bool {
 async fn apply_native_nat(
     nh: &mut NativeHandles,
     iface: &str,
-    has_v4: bool,
+    want_masq: bool,
+    link_mtu: u32,
     warnings: &mut Vec<String>,
 ) {
     if let Err(e) = netlink::validate_managed_iface(iface) {
@@ -1231,13 +1365,15 @@ async fn apply_native_nat(
     let nft_bin = "/usr/sbin/nft";
     let ipt_bin = "/usr/sbin/iptables";
     let ip6t_bin = "/usr/sbin/ip6tables";
+    let mtu = link_mtu.clamp(1280, 1500);
     let mut st = NativeNatState {
         iface: iface.to_string(),
+        link_mtu: mtu,
         ..Default::default()
     };
 
     if Path::new(&crate::paths::p(nft_bin)).exists() {
-        let include_masq = if has_v4 {
+        let include_masq = if want_masq {
             let covered = match run(nft_bin, &["list", "chain", "inet", "fw4", "srcnat"], ExecOpts::new(5, 32 * KIB)).await {
                 Ok(out) if out.ok() => fw4_chain_covers_iface(&out.stdout_str(), iface),
                 _ => false,
@@ -1246,7 +1382,7 @@ async fn apply_native_nat(
         } else {
             false
         };
-        match build_native_nat_nft_script(iface, include_masq) {
+        match build_native_nat_nft_script(iface, include_masq, mtu) {
             Ok(script) => {
                 match run(nft_bin, &["-f", "-"], ExecOpts::new(5, 16 * KIB).stdin(script.into_bytes())).await {
                     Ok(out) if out.ok() => st.nft_table = true,
@@ -1273,7 +1409,7 @@ async fn apply_native_nat(
             }
         }
     } else if Path::new(&crate::paths::p(ipt_bin)).exists() {
-        if has_v4
+        if want_masq
             && let Ok(out) = run(ipt_bin, &["-t", "nat", "-S", "POSTROUTING"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
             && !ipt_rules_cover_iface(&out.stdout_str(), iface)
@@ -1306,24 +1442,54 @@ async fn apply_native_nat(
                 Err(e) => warnings.push(format!("native forward iptables exec: {e}")),
             }
         }
+        if Path::new(&crate::paths::p(ip6t_bin)).exists()
+            && let Ok(out) = run(ip6t_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await
+            && out.ok()
+            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
+        {
+            match run(
+                ip6t_bin,
+                &["-t", "filter", "-A", "zone_wan_dest_accept", "-o", iface, "-m", "comment", "--comment", "qm_native", "-j", "ACCEPT"],
+                ExecOpts::new(5, 16 * KIB),
+            )
+            .await
+            {
+                Ok(r) if r.ok() => st.ip6t_forward = true,
+                Ok(r) => warnings.push(format!("native forward ip6tables: {}", r.err_summary("ip6tables"))),
+                Err(e) => warnings.push(format!("native forward ip6tables exec: {e}")),
+            }
+        }
         if let Ok(out) = run(ipt_bin, &["-t", "mangle", "-S", "FORWARD"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
             && !ipt_rules_cover_iface(&out.stdout_str(), iface)
         {
-            let r_out = run(
-                ipt_bin,
-                &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-            let r_in = run(
-                ipt_bin,
-                &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-            if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
-                st.ipt_mss = true;
+            if mtu < 1500 {
+                let mss4 = (mtu - 40).to_string();
+                let r_out = run(
+                    ipt_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                let r_in = run(
+                    ipt_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
+                    st.ipt_mss_arg = Some(mss4);
+                }
+            } else {
+                let r_out = run(
+                    ipt_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                if r_out.is_ok_and(|r| r.ok()) {
+                    st.ipt_mss_arg = Some("pmtu".into());
+                }
             }
         }
         if Path::new(&crate::paths::p(ip6t_bin)).exists()
@@ -1331,25 +1497,45 @@ async fn apply_native_nat(
             && out.ok()
             && !ipt_rules_cover_iface(&out.stdout_str(), iface)
         {
-            let r_out = run(
-                ip6t_bin,
-                &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-            let r_in = run(
-                ip6t_bin,
-                &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-            if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
-                st.ip6t_mss = true;
+            if mtu < 1500 {
+                let mss6 = (mtu - 60).to_string();
+                let r_out = run(
+                    ip6t_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                let r_in = run(
+                    ip6t_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
+                    st.ip6t_mss_arg = Some(mss6);
+                }
+            } else {
+                let r_out = run(
+                    ip6t_bin,
+                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+                if r_out.is_ok_and(|r| r.ok()) {
+                    st.ip6t_mss_arg = Some("pmtu".into());
+                }
             }
         }
     }
 
-    if st.nft_table || st.fw4_forward || st.ipt_nat || st.ipt_forward || st.ipt_mss || st.ip6t_mss {
+    if st.nft_table
+        || st.fw4_forward
+        || st.ipt_nat
+        || st.ipt_forward
+        || st.ip6t_forward
+        || st.ipt_mss_arg.is_some()
+        || st.ip6t_mss_arg.is_some()
+    {
         nh.native_nat = Some(st);
     }
 }
@@ -1402,24 +1588,50 @@ async fn teardown_native_nat(nh: &mut NativeHandles, warnings: &mut Vec<String>)
         )
         .await;
     }
-    if st.ipt_mss {
-        for flag in ["-o", "-i"] {
+    if st.ip6t_forward {
+        let _ = run(
+            ip6t_bin,
+            &["-t", "filter", "-D", "zone_wan_dest_accept", "-o", &st.iface, "-m", "comment", "--comment", "qm_native", "-j", "ACCEPT"],
+            ExecOpts::new(5, 16 * KIB),
+        )
+        .await;
+    }
+    if let Some(ref mss_arg) = st.ipt_mss_arg {
+        if mss_arg == "pmtu" {
             let _ = run(
                 ipt_bin,
-                &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                &["-t", "mangle", "-D", "FORWARD", "-o", &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
                 ExecOpts::new(5, 16 * KIB),
             )
             .await;
+        } else {
+            for flag in ["-o", "-i"] {
+                let _ = run(
+                    ipt_bin,
+                    &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", mss_arg],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+            }
         }
     }
-    if st.ip6t_mss {
-        for flag in ["-o", "-i"] {
+    if let Some(ref mss_arg) = st.ip6t_mss_arg {
+        if mss_arg == "pmtu" {
             let _ = run(
                 ip6t_bin,
-                &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                &["-t", "mangle", "-D", "FORWARD", "-o", &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
                 ExecOpts::new(5, 16 * KIB),
             )
             .await;
+        } else {
+            for flag in ["-o", "-i"] {
+                let _ = run(
+                    ip6t_bin,
+                    &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", mss_arg],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await;
+            }
         }
     }
 }
@@ -1427,11 +1639,13 @@ async fn teardown_native_nat(nh: &mut NativeHandles, warnings: &mut Vec<String>)
 async fn heal_native_firewall_if_needed(
     nh: &mut NativeHandles,
     iface: &str,
-    has_v4: bool,
+    want_masq: bool,
+    link_mtu: u32,
     warnings: &mut Vec<String>,
 ) -> bool {
     let nft_bin = "/usr/sbin/nft";
     let ipt_bin = "/usr/sbin/iptables";
+    let ip6t_bin = "/usr/sbin/ip6tables";
     let missing = if Path::new(&crate::paths::p(nft_bin)).exists() {
         let table_missing = run(nft_bin, &["list", "table", "inet", "qm_native_nat"], ExecOpts::new(5, 16 * KIB))
             .await
@@ -1446,25 +1660,37 @@ async fn heal_native_firewall_if_needed(
             Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
             _ => false,
         };
+        let fwd6_missing = if Path::new(&crate::paths::p(ip6t_bin)).exists() {
+            match run(ip6t_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await {
+                Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
+                _ => false,
+            }
+        } else {
+            false
+        };
         let mss_missing = match run(ipt_bin, &["-t", "mangle", "-S", "FORWARD"], ExecOpts::new(5, 32 * KIB)).await {
             Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
             _ => false,
         };
-        fwd_missing || mss_missing
+        fwd_missing || fwd6_missing || mss_missing
     } else {
         false
     };
-    if missing {
-        apply_native_nat(nh, iface, has_v4, warnings).await;
+    let mtu_changed = nh
+        .native_nat
+        .as_ref()
+        .is_some_and(|st| st.link_mtu != link_mtu.clamp(1280, 1500));
+    if missing || mtu_changed {
+        apply_native_nat(nh, iface, want_masq, link_mtu, warnings).await;
     }
-    missing
+    missing || mtu_changed
 }
 
 fn apply_iface_rps_high_throughput(iface: &str) {
     if netlink::validate_managed_iface(iface).is_err() {
         return;
     }
-    for (suffix, val) in [("rps_cpus", "e\n"), ("rps_flow_cnt", "4096\n")] {
+    for (suffix, val) in [("rps_cpus", "c\n"), ("rps_flow_cnt", "4096\n")] {
         let rel = format!("/sys/class/net/{iface}/queues/rx-0/{suffix}");
         let real = crate::paths::p(&rel);
         if Path::new(&real).exists() {
@@ -1653,6 +1879,8 @@ async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: 
     nh.last_v4_ip = None;
     nh.last_v6_ip = None;
     nh.last_v6_key = None;
+    nh.last_link_mtu = 1500;
+    nh.wda_negotiated_ep = None;
     nh.last_applied_sig = None;
     nh.last_resolved_iface = None;
 
@@ -1941,8 +2169,30 @@ async fn bring_up_native_family(
     Ok((cli, hdl, rt))
 }
 
+pub(crate) fn needs_wda_qmapv5_negotiation(fmt: Option<&WdaDataFormat>) -> bool {
+    let Some(f) = fmt else {
+        return true;
+    };
+    f.link_protocol != Some(wda::LINK_PROT_RAW_IP)
+        || f.dl_agg_protocol != Some(wda::AGG_QMAP_V5)
+        || f.ul_agg_protocol != Some(wda::AGG_QMAP_V5)
+        || f.dl_max_size.unwrap_or(0) < 32768
+}
+
+/// Resolve dual-stack cellular link MTU using `.min()` across valid reported `mtu4` / `mtu6`
+/// (`1280..=1500`), defaulting to `1500` only when neither family reports a valid MTU.
+pub(crate) fn resolve_dual_stack_link_mtu(mtu4: Option<u32>, mtu6: Option<u32>) -> u32 {
+    [mtu4, mtu6]
+        .into_iter()
+        .flatten()
+        .filter(|m| (1280..=1500).contains(m))
+        .min()
+        .unwrap_or(1500)
+}
+
 struct AppliedNetlinkState {
     resolved_iface: String,
+    link_mtu: u32,
     v4_ip: Option<Ipv4Addr>,
     v6_addr_str: Option<String>,
     v6_dns: Vec<Ipv6Addr>,
@@ -1966,16 +2216,18 @@ async fn apply_native_netlink(
         netlink::validate_managed_iface(&iface)?;
         netlink::validate_managed_table(table)?;
         let links = netlink::list_links()?;
+        netlink::ensure_rmnet_ipa_parent_mtu(&links);
         let link = netlink::resolve_rmnet_link(&links, &iface, mux_id)
             .ok_or_else(|| format!("interface {iface} not present in kernel netlink"))?;
         netlink::validate_managed_iface(&link.name)?;
         let resolved_iface = link.name.clone();
         let ifindex = link.ifindex;
+        let _ = netlink::ensure_rmnet_qmapv5_flags(&resolved_iface, ifindex);
         netlink::set_link_up(&resolved_iface, ifindex, true)?;
 
-        let mtu4 = v4.as_ref().and_then(|r| r.mtu);
-        let mtu6 = v6.as_ref().and_then(|r| r.mtu);
-        let link_mtu = mtu4.into_iter().chain(mtu6).max().unwrap_or(1500);
+        let mtu4 = v4.as_ref().and_then(|r| r.mtu).filter(|m| (1280..=1500).contains(m));
+        let mtu6 = v6.as_ref().and_then(|r| r.mtu).filter(|m| (1280..=1500).contains(m));
+        let link_mtu = resolve_dual_stack_link_mtu(mtu4, mtu6);
         netlink::set_link_mtu(&resolved_iface, ifindex, link_mtu)?;
 
         let mut out_v4_ip = None;
@@ -2028,6 +2280,7 @@ async fn apply_native_netlink(
         }
         Ok(AppliedNetlinkState {
             resolved_iface,
+            link_mtu,
             v4_ip: out_v4_ip,
             v6_addr_str: out_v6_addr_str,
             v6_dns: out_v6_dns,
@@ -2060,6 +2313,8 @@ fn qrtr_telemetry_from(bsnap: qmi::qrtr::BusSnapshot) -> QrtrTelemetry {
 
 async fn recv_bus_wakeup(
     bus_rx: Option<&mut tokio::sync::broadcast::Receiver<QrtrBusEvent>>,
+    bus: Option<&QrtrBus>,
+    last_ssr_count: u64,
     need_services: bool,
 ) -> QrtrBusEvent {
     let Some(rx) = bus_rx else {
@@ -2068,7 +2323,19 @@ async fn recv_bus_wakeup(
     loop {
         match rx.recv().await {
             Ok(ev) if bus_event_should_wake(&ev, need_services) => return ev,
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                if let Some(b) = bus {
+                    let bsnap = b.snapshot();
+                    if bsnap.ssr_count > last_ssr_count {
+                        return QrtrBusEvent::Ssr {
+                            node: bsnap.modem_node,
+                            reason: format!("QRTR broadcast lagged ({skipped} events) across SSR"),
+                        };
+                    }
+                }
+                continue;
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 return std::future::pending().await;
             }
@@ -2117,6 +2384,8 @@ pub struct DataplaneMetricsView {
     pub wds_v4_connected: bool,
     pub wds_v6_connected: bool,
     pub ipa_clk_mhz: Option<u64>,
+    pub ipa_hardware_offload_pct: Option<u8>,
+    pub qrtr_ssr_total: u64,
     pub tuning_warnings: usize,
     pub indications_total: u64,
     pub netlink_updates_total: u64,
@@ -2135,9 +2404,59 @@ pub async fn metrics_view() -> DataplaneMetricsView {
         wds_v4_connected: snap.wds_v4.state == "connected",
         wds_v6_connected: snap.wds_v6.state == "connected",
         ipa_clk_mhz: snap.kernel.ipa_offload.clk_rate_mhz,
+        ipa_hardware_offload_pct: snap.kernel.ipa_offload.eth_hardware_offload_pct,
+        qrtr_ssr_total: snap.qrtr.ssr_count,
         tuning_warnings,
         indications_total: snap.indications_received,
         netlink_updates_total: snap.netlink_updates,
+    }
+}
+
+fn handle_modem_ssr(
+    state: &AppState,
+    ph: &mut ProbeHandles,
+    nh: &mut NativeHandles,
+    node: u32,
+    ssr_count: u64,
+    reason: &str,
+) {
+    NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+    state.push_daemon_log(format!("dataplane: QRTR SSR #{ssr_count} detected on node {node}: {reason}"));
+    crate::obs::emit(
+        crate::obs::EventKind::ModemSsr,
+        crate::obs::Severity::Critical,
+        format!("Modem baseband SSR (#{ssr_count})"),
+        serde_json::json!({
+            "node": node,
+            "ssrCount": ssr_count,
+            "reason": reason,
+        }),
+    );
+    ph.clear_on_ssr();
+    nh.v4_client = None;
+    nh.v6_client = None;
+    nh.v4_handle = None;
+    nh.v6_handle = None;
+    nh.last_v4_ip = None;
+    nh.last_v6_ip = None;
+    nh.last_v6_key = None;
+    nh.wda_negotiated_ep = None;
+}
+
+async fn flush_conntrack_and_reload_odhcpd(v4_changed: bool, v6_changed: bool) {
+    if v4_changed || v6_changed {
+        for bin in ["/usr/sbin/conntrack", "/sbin/conntrack"] {
+            if Path::new(&crate::paths::p(bin)).exists() {
+                let _ = run(bin, &["-F"], ExecOpts::new(3, 16 * KIB)).await;
+                break;
+            }
+        }
+    }
+    if v6_changed {
+        let odhcpd = "/etc/init.d/odhcpd";
+        if Path::new(&crate::paths::p(odhcpd)).exists() {
+            let _ = run(odhcpd, &["reload"], ExecOpts::new(5, 16 * KIB)).await;
+        }
     }
 }
 
@@ -2149,6 +2468,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
     let mut ph = ProbeHandles::default();
     let mut native_tick: u64 = 0;
     let mut loop_tick: u64 = 0;
+    let mut last_ssr_count: u64 = 0;
+    let mut pending_phy_reenable = false;
 
     loop {
         loop_tick = loop_tick.wrapping_add(1);
@@ -2156,6 +2477,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         if bus.is_none() {
             match QrtrBus::connect() {
                 Ok(b) => {
+                    last_ssr_count = b.snapshot().ssr_count;
                     bus_rx = Some(b.subscribe());
                     bus = Some(b);
                     state.push_daemon_log("dataplane: AF_QIPCRTR control bus connected");
@@ -2177,6 +2499,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         ..Default::default()
                     };
                     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
+                    snap.sfe_loaded = is_sfe_loaded();
                     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone())).await;
                     refresh_netlink_into(&mut snap, &cfg.iface).await;
@@ -2190,6 +2513,19 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         }
 
         let b = bus.as_ref().expect("QRTR bus initialized");
+        let bsnap_initial = b.snapshot();
+        if bsnap_initial.ssr_count > last_ssr_count {
+            last_ssr_count = bsnap_initial.ssr_count;
+            handle_modem_ssr(
+                &state,
+                &mut ph,
+                &mut nh,
+                bsnap_initial.modem_node,
+                last_ssr_count,
+                "SSR counter latched",
+            );
+            pending_phy_reenable = true;
+        }
         let prev_counts = {
             let s = h.snapshot.read().await;
             (s.indications_received, s.reconnect_attempts, s.netlink_updates, s.last_indication.clone())
@@ -2197,7 +2533,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         let mut snap = DataplaneSnapshot {
             updated_at: now_secs(),
             mode: cfg.mode,
-            qrtr: qrtr_telemetry_from(b.snapshot()),
+            qrtr: qrtr_telemetry_from(bsnap_initial),
             indications_received: prev_counts.0,
             reconnect_attempts: prev_counts.1,
             netlink_updates: prev_counts.2,
@@ -2206,6 +2542,13 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         };
 
         probe_readonly_qmi(b, &ind_tx, &mut ph, &mut snap, &cfg).await;
+        if pending_phy_reenable && (snap.nas_sys.is_some() || snap.operating_mode.is_some()) {
+            pending_phy_reenable = false;
+            let st_phy = state.clone();
+            tokio::spawn(async move {
+                crate::radio_tuning::enable_phy_telemetry_counters(&st_phy).await;
+            });
+        }
 
         let mut next_sleep = Duration::from_secs(15);
         match cfg.mode {
@@ -2289,6 +2632,48 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     let mut v4_rt = None;
                     let mut v6_rt = None;
                     let mut had_err = false;
+
+                    let need_wds_start = (cfg.ip_family.wants_v4() && nh.v4_client.is_none())
+                        || (cfg.ip_family.wants_v6() && nh.v6_client.is_none());
+                    let want_ep = (cfg.ep_type, cfg.ep_iface_id);
+                    if need_wds_start
+                        && needs_wda_qmapv5_negotiation(ph.wda_format.as_ref())
+                        && nh.wda_negotiated_ep != Some(want_ep)
+                        && let Some(wda_c) = ensure_probe_client(&mut ph.wda, b, SVC_WDA, "WDA", &ind_tx, Duration::from_secs(3)).await
+                    {
+                        match wda::set_data_format(
+                            wda_c.as_ref(),
+                            wda::LINK_PROT_RAW_IP,
+                            wda::AGG_QMAP_V5,
+                            wda::AGG_QMAP_V5,
+                            64,
+                            32768,
+                            16,
+                            16384,
+                            1,
+                            want_ep,
+                        )
+                        .await
+                        {
+                            Ok(fmt) => {
+                                ph.wda_format = Some(fmt.clone());
+                                ph.wda_ep = Some(want_ep);
+                                snap.wda_format = Some(fmt);
+                                nh.wda_negotiated_ep = Some(want_ep);
+                                state.push_daemon_log(
+                                    "dataplane: negotiated WDA QMAPv5 (dl=64/32768, ul=16/16384, flow_control=1)",
+                                );
+                            }
+                            Err(ref e) if is_transport_err(e) => {
+                                ph.wda = None;
+                                snap.warnings.push(format!("WDA QMAPv5 set_data_format: {e}"));
+                            }
+                            Err(e) => {
+                                nh.wda_negotiated_ep = Some(want_ep);
+                                snap.warnings.push(format!("WDA QMAPv5 set_data_format: {e}"));
+                            }
+                        }
+                    }
 
                     if cfg.ip_family.wants_v4() {
                         if let Some(cli) = nh.v4_client.clone().filter(|c| c.is_alive()) {
@@ -2398,9 +2783,14 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     let cur_sig = AppliedCfgSig::from(&cfg);
                     let v4_changed = v4_rt.as_ref().and_then(|r| r.ipv4_addr.clone()) != nh.last_v4_ip;
                     let v6_changed = ipv6_bearer_changed(v6_rt.as_ref(), nh.last_v6_key.as_ref());
+                    let desired_mtu = resolve_dual_stack_link_mtu(
+                        v4_rt.as_ref().and_then(|r| r.mtu),
+                        v6_rt.as_ref().and_then(|r| r.mtu),
+                    );
+                    let mtu_changed = desired_mtu != nh.last_link_mtu;
                     let cfg_changed = nh.last_applied_sig.as_ref() != Some(&cur_sig);
-                    let apply_v4 = cfg_changed || v4_changed;
-                    let apply_v6 = cfg_changed || v6_changed;
+                    let apply_v4 = cfg_changed || v4_changed || mtu_changed;
+                    let apply_v6 = cfg_changed || v6_changed || mtu_changed;
                     if (apply_v4 || apply_v6) && (v4_rt.is_some() || v6_rt.is_some()) {
                         if cfg_changed && nh.last_applied_sig.is_some() {
                             teardown_ipa_and_dns(&mut nh, &cfg, !cfg.manage_dns, &mut snap.warnings).await;
@@ -2420,6 +2810,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             Ok(applied) => {
                                 snap.netlink_updates += 1;
                                 let resolved_iface = applied.resolved_iface.clone();
+                                nh.last_link_mtu = applied.link_mtu;
                                 if apply_v4 {
                                     nh.last_v4_ip = applied.v4_ip.map(|ip| ip.to_string());
                                     nh.ippt_host_ip = applied.ippt_host_ip;
@@ -2431,6 +2822,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 }
                                 nh.last_applied_sig = Some(cur_sig);
                                 nh.last_resolved_iface = Some(resolved_iface.clone());
+
+                                flush_conntrack_and_reload_odhcpd(v4_changed, v6_changed).await;
 
                                 if cfg.kernel_tuning == KernelTuningProfile::HighThroughput {
                                     let tune_if = resolved_iface.clone();
@@ -2490,12 +2883,18 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
 
                                 let has_v4 = v4_rt.as_ref().and_then(|r| r.ipv4_addr.as_ref()).is_some();
                                 let has_v6 = v6_rt.as_ref().and_then(|r| r.ipv6_addr.as_ref()).is_some();
-                                if cfg.ippt {
-                                    teardown_native_nat(&mut nh, &mut snap.warnings).await;
-                                } else if (has_v4 || has_v6)
-                                    && (cfg_changed || (apply_v4 && applied.v4_ip.is_some()) || nh.native_nat.is_none())
-                                {
-                                    apply_native_nat(&mut nh, &resolved_iface, has_v4, &mut snap.warnings).await;
+                                // Keep the `forward` MSS clamp chain active even when `cfg.ippt == true`
+                                // (only omit `postrouting masquerade` when `cfg.ippt && cfg.ippt_skip_nat`).
+                                let want_masq = has_v4 && !(cfg.ippt && cfg.ippt_skip_nat);
+                                if has_v4 || has_v6 {
+                                    apply_native_nat(
+                                        &mut nh,
+                                        &resolved_iface,
+                                        want_masq,
+                                        applied.link_mtu,
+                                        &mut snap.warnings,
+                                    )
+                                    .await;
                                 }
                                 nh.backoff.reset();
                             }
@@ -2506,13 +2905,21 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                     } else if !had_err && (v4_rt.is_some() || v6_rt.is_some()) {
                         nh.backoff.reset();
-                        // Self-heal firewall rules after fw4/fw3 reload (~every 60s).
+                        // Self-heal firewall rules after fw4/fw3 reload (~every 60s), including IPPT MSS clamp.
                         if native_tick.is_multiple_of(4)
                             && let Some(active_iface) = nh.last_resolved_iface.clone()
                         {
                             let has_v4 = v4_rt.as_ref().and_then(|r| r.ipv4_addr.as_ref()).is_some();
-                            if !cfg.ippt
-                                && heal_native_firewall_if_needed(&mut nh, &active_iface, has_v4, &mut snap.warnings).await
+                            let want_masq = has_v4 && !(cfg.ippt && cfg.ippt_skip_nat);
+                            let last_mtu = nh.last_link_mtu;
+                            if heal_native_firewall_if_needed(
+                                &mut nh,
+                                &active_iface,
+                                want_masq,
+                                last_mtu,
+                                &mut snap.warnings,
+                            )
+                            .await
                             {
                                 state.push_daemon_log("dataplane: healed missing fw4/nft/iptables native rules");
                             }
@@ -2560,7 +2967,12 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
             }
         }
 
+        if cfg.sfe_fastpath && loop_tick.is_multiple_of(4) && !is_sfe_loaded() {
+            snap.warnings.extend(reconcile_sfe_fastpath(true, false).await);
+        }
+
         snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
+        snap.sfe_loaded = is_sfe_loaded();
         snap.applied_dns = nh.applied_dns.clone();
         snap.active_ippt_mac = nh.ipa_ippt_mac.clone();
         snap.ipa_ippt_active = nh.ipa_ippt_active;
@@ -2600,17 +3012,14 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     }
                 }
             }
-            ev = recv_bus_wakeup(bus_rx.as_mut(), need_services) => {
+            ev = recv_bus_wakeup(bus_rx.as_mut(), Some(b.as_ref()), last_ssr_count, need_services) => {
                 if let QrtrBusEvent::Ssr { node, reason } = ev {
-                    state.push_daemon_log(format!("dataplane: QRTR SSR detected on node {node}: {reason}"));
-                    ph.clear_on_ssr();
-                    nh.v4_client = None;
-                    nh.v6_client = None;
-                    nh.v4_handle = None;
-                    nh.v6_handle = None;
-                    nh.last_v4_ip = None;
-                    nh.last_v6_ip = None;
-                    nh.last_v6_key = None;
+                    let cur_ssr = b.snapshot().ssr_count;
+                    if cur_ssr > last_ssr_count {
+                        last_ssr_count = cur_ssr;
+                        handle_modem_ssr(&state, &mut ph, &mut nh, node, last_ssr_count, &reason);
+                        pending_phy_reenable = true;
+                    }
                 }
             }
         }
@@ -2626,6 +3035,7 @@ async fn get_status() -> Response {
     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone())).await;
     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
+    snap.sfe_loaded = is_sfe_loaded();
     Json(serde_json::json!({
         "status": "ok",
         "config": cfg,
@@ -2683,6 +3093,9 @@ pub async fn apply_config_from_backup(app: &AppState, mut next: DataplaneConfig)
             .await
             .unwrap_or_default();
         *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
+    }
+    if next.sfe_fastpath != prev.sfe_fastpath {
+        let _ = reconcile_sfe_fastpath(next.sfe_fastpath, !next.sfe_fastpath).await;
     }
     *h.config.write().await = next.clone();
     if next.mode == DataplaneMode::Native {
@@ -2747,6 +3160,8 @@ pub struct ConfigReq {
     pub preserve_ipa_offload: Option<bool>,
     #[serde(default)]
     pub kernel_tuning: Option<KernelTuningProfile>,
+    #[serde(default)]
+    pub sfe_fastpath: Option<bool>,
     #[serde(default)]
     pub confirm: Option<String>,
 }
@@ -2853,6 +3268,9 @@ async fn post_config(
     if let Some(kt) = req.kernel_tuning {
         next.kernel_tuning = kt;
     }
+    if let Some(sfe) = req.sfe_fastpath {
+        next.sfe_fastpath = sfe;
+    }
 
     if next.mode == DataplaneMode::Native && next.ippt && next.ippt_mac.is_none() {
         return bad("ipptMac is required when enabling IP Passthrough in native mode");
@@ -2879,6 +3297,11 @@ async fn post_config(
             .unwrap_or_default();
         *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
     }
+    let sfe_warns = if next.sfe_fastpath != prev.sfe_fastpath {
+        reconcile_sfe_fastpath(next.sfe_fastpath, !next.sfe_fastpath).await
+    } else {
+        Vec::new()
+    };
     *h.config.write().await = next.clone();
     if next.mode == DataplaneMode::Native {
         NATIVE_MODE_ACTIVE.store(true, Ordering::Relaxed);
@@ -2886,28 +3309,32 @@ async fn post_config(
     h.wake.notify_one();
 
     ctx.app.push_daemon_log(format!(
-        "dataplane: config updated (mode={}, iface={}, profile={}, tuning={})",
+        "dataplane: config updated (mode={}, iface={}, profile={}, tuning={}, sfe={})",
         next.mode.as_str(),
         next.iface,
         next.profile_index,
         next.kernel_tuning.as_str(),
+        next.sfe_fastpath,
     ));
     ctx.app.audit.event(
         "dataplane",
         "config",
         format!(
-            "mode={} iface={} profile={} tuning={}",
+            "mode={} iface={} profile={} tuning={} sfe={}",
             next.mode.as_str(),
             next.iface,
             next.profile_index,
-            next.kernel_tuning.as_str()
+            next.kernel_tuning.as_str(),
+            next.sfe_fastpath,
         ),
     );
 
     let mut snap = h.snapshot.read().await.clone();
+    snap.warnings.extend(sfe_warns);
     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     snap.kernel = collect_kernel_telemetry_async(next.kernel_tuning, tw, Some(next.iface.clone())).await;
     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
+    snap.sfe_loaded = is_sfe_loaded();
     Json(serde_json::json!({
         "status": "ok",
         "config": next,
@@ -3006,14 +3433,20 @@ mod tests {
             ("/proc/sys/net/ipv4/tcp_congestion_control", "cubic\n"),
             ("/proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic\n"),
             ("/proc/sys/net/ipv4/tcp_fastopen", "1\n"),
+            ("/proc/sys/net/ipv4/tcp_notsent_lowat", "4294967295\n"),
             ("/proc/sys/net/netfilter/nf_conntrack_max", "32768\n"),
             ("/proc/sys/net/netfilter/nf_conntrack_count", "25\n"),
             ("/sys/module/nf_conntrack/parameters/hashsize", "8192\n"),
             ("/sys/class/net/eth0/queues/rx-0/rps_cpus", "0\n"),
             ("/sys/class/net/eth0/queues/tx-0/xps_cpus", "0\n"),
+            ("/sys/class/net/rmnet_ipa0/gro_flush_timeout", "0\n"),
+            ("/sys/class/net/rmnet_ipa0/napi_defer_hard_irqs", "0\n"),
             ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_cpus", "8\n"),
             ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_flow_cnt", "0\n"),
             ("/sys/class/net/rmnet_ipa0/queues/tx-0/xps_cpus", "0\n"),
+            ("/sys/class/net/rmnet_ipa0/queues/tx-1/xps_cpus", "0\n"),
+            ("/sys/class/net/rmnet_ipa0/queues/tx-2/xps_cpus", "0\n"),
+            ("/sys/class/net/rmnet_ipa0/queues/tx-3/xps_cpus", "0\n"),
             ("/sys/class/net/rmnet_data1/queues/rx-0/rps_cpus", "0\n"),
             ("/sys/class/net/rmnet_data1/queues/rx-0/rps_flow_cnt", "0\n"),
             ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "schedutil\n"),
@@ -3046,16 +3479,22 @@ mod tests {
         assert_eq!(k.netdev_budget, Some(1_200));
         assert_eq!(k.netdev_budget_usecs, Some(8_000));
         assert_eq!(k.tcp_fastopen, Some(3));
+        assert_eq!(k.tcp_notsent_lowat, Some(131_072));
         assert_eq!(k.conntrack_max, Some(65536));
         assert_eq!(k.conntrack_count, Some(25));
         assert_eq!(k.conntrack_hashsize, Some(16384));
         assert_eq!(k.cpu_governor.as_deref(), Some("performance"));
         assert_eq!(k.cpu_cur_freq_mhz, Some(1516));
         assert_eq!(k.cpu_max_freq_mhz, Some(2208));
-        assert_eq!(k.rps_maps.get("eth0:rx-0/rps_cpus").map(String::as_str), Some("e"));
-        assert_eq!(k.rps_maps.get("rmnet_data1:rx-0/rps_cpus").map(String::as_str), Some("e"));
+        assert_eq!(k.rps_maps.get("eth0:rx-0/rps_cpus").map(String::as_str), Some("c"));
+        assert_eq!(k.rps_maps.get("rmnet_data1:rx-0/rps_cpus").map(String::as_str), Some("c"));
         assert_eq!(k.rps_maps.get("rmnet_data1:rx-0/rps_flow_cnt").map(String::as_str), Some("4096"));
-        assert_eq!(k.xps_maps.get("rmnet_ipa0:tx-0/xps_cpus").map(String::as_str), Some("1"));
+        assert_eq!(k.xps_maps.get("rmnet_ipa0:tx-0/xps_cpus").map(String::as_str), Some("4"));
+        assert_eq!(k.xps_maps.get("rmnet_ipa0:tx-1/xps_cpus").map(String::as_str), Some("8"));
+        assert_eq!(k.xps_maps.get("rmnet_ipa0:tx-2/xps_cpus").map(String::as_str), Some("4"));
+        assert_eq!(k.xps_maps.get("rmnet_ipa0:tx-3/xps_cpus").map(String::as_str), Some("8"));
+        assert_eq!(read_trimmed("/sys/class/net/rmnet_ipa0/gro_flush_timeout").as_deref(), Some("20000"));
+        assert_eq!(read_trimmed("/sys/class/net/rmnet_ipa0/napi_defer_hard_irqs").as_deref(), Some("2"));
         assert_eq!(k.rps_maps.get("rmnet_ipa0:rx-0/rps_flow_cnt").map(String::as_str), Some("4096"));
         assert_eq!(k.ipa_offload.hw_type.as_deref(), Some("25"));
         assert_eq!(k.ipa_offload.clk_rate_mhz, Some(120));
@@ -3321,17 +3760,48 @@ mod tests {
         assert!(fw4_chain_covers_iface(fw4_set, "rmnet_data1"));
         assert!(!fw4_chain_covers_iface("chain srcnat {\n\t}\n", "rmnet_data1"));
 
-        let script = build_native_nat_nft_script("rmnet_data1", true).unwrap();
+        let script = build_native_nat_nft_script("rmnet_data1", true, 1500).unwrap();
         assert!(script.contains("table inet qm_native_nat"));
         assert!(script.contains("oifname \"rmnet_data1\" meta nfproto ipv4 masquerade"));
         assert!(script.contains("oifname \"rmnet_data1\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu"));
-        assert!(script.contains("iifname \"rmnet_data1\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu"));
-        let mss_only = build_native_nat_nft_script("rmnet_data1", false).unwrap();
-        assert!(!mss_only.contains("masquerade"));
-        assert!(mss_only.contains("tcp option maxseg size set rt mtu"));
-        assert!(build_native_nat_nft_script("eth0", true).is_err());
-        assert!(build_native_nat_nft_script("br-lan", true).is_err());
-        assert!(build_native_nat_nft_script("rmnet_data0\nflush ruleset", true).is_err());
+        assert!(!script.contains("iifname \"rmnet_data1\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu"));
+
+        // IPPT with skip_nat=true + T-Mobile 1428 MTU: keeps symmetric v4/v6 MSS clamping active while omitting masquerade!
+        let ippt_mss = build_native_nat_nft_script("rmnet_data1", false, 1428).unwrap();
+        assert!(!ippt_mss.contains("masquerade"));
+        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set 1388"));
+        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set 1388"));
+        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set 1368"));
+        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set 1368"));
+
+        assert!(build_native_nat_nft_script("eth0", true, 1500).is_err());
+        assert!(build_native_nat_nft_script("br-lan", true, 1500).is_err());
+        assert!(build_native_nat_nft_script("rmnet_data0\nflush ruleset", true, 1500).is_err());
+
+        // Dual-stack WDS MTU `.min()` across reported non-zero mtu4/mtu6
+        assert_eq!(resolve_dual_stack_link_mtu(Some(1428), Some(1440)), 1428);
+        assert_eq!(resolve_dual_stack_link_mtu(Some(1500), Some(1420)), 1420);
+        assert_eq!(resolve_dual_stack_link_mtu(Some(0), Some(1430)), 1430);
+        assert_eq!(resolve_dual_stack_link_mtu(None, Some(1428)), 1428);
+        assert_eq!(resolve_dual_stack_link_mtu(None, None), 1500);
+        assert_eq!(resolve_dual_stack_link_mtu(Some(0), Some(0)), 1500);
+
+        // WDA QMAPv5 negotiation check
+        assert!(needs_wda_qmapv5_negotiation(None));
+        assert!(needs_wda_qmapv5_negotiation(Some(&WdaDataFormat {
+            link_protocol: Some(wda::LINK_PROT_RAW_IP),
+            ul_agg_protocol: Some(wda::AGG_QMAP_V5),
+            dl_agg_protocol: Some(wda::AGG_QMAP_V5),
+            dl_max_size: Some(16384),
+            ..Default::default()
+        })));
+        assert!(!needs_wda_qmapv5_negotiation(Some(&WdaDataFormat {
+            link_protocol: Some(wda::LINK_PROT_RAW_IP),
+            ul_agg_protocol: Some(wda::AGG_QMAP_V5),
+            dl_agg_protocol: Some(wda::AGG_QMAP_V5),
+            dl_max_size: Some(32768),
+            ..Default::default()
+        })));
 
         let chain_with_handles = concat!(
             "table inet fw4 {\n",
@@ -3396,5 +3866,41 @@ mod tests {
         assert!(ipv6_bearer_changed(None, Some(&k1)));
         assert!(ipv6_bearer_changed(Some(&rt1), None));
         assert!(!ipv6_bearer_changed(None, None));
+    }
+
+    #[test]
+    fn splits_eth0_msi_irqs_alternating_across_cpu2_and_cpu3_masks() {
+        let sbx = crate::paths::TestSandbox::new("eth0_irqs");
+        sbx.write(
+            "/proc/interrupts",
+            concat!(
+                "           CPU0       CPU1       CPU2       CPU3\n",
+                " 22:       1000          0          0          0   GICv3 102 Edge      ipcc_0\n",
+                " 45:          0       9000          0          0   GICv3 210 Level     gsi\n",
+                " 81:          0          0       5000          0   PCI-MSI 524288 Edge      eth0-0\n",
+                " 82:          0          0       4000          0   PCI-MSI 524289 Edge      eth0-1\n",
+                " 83:          0          0       3000          0   PCI-MSI 524290 Edge      eth0-2\n",
+                " 84:          0          0       2000          0   PCI-MSI 524291 Edge      eth0-3\n",
+            ),
+        );
+        let p81 = sbx.write("/proc/irq/81/smp_affinity", "f\n");
+        let p82 = sbx.write("/proc/irq/82/smp_affinity", "f\n");
+        let p83 = sbx.write("/proc/irq/83/smp_affinity", "f\n");
+        let p84 = sbx.write("/proc/irq/84/smp_affinity", "f\n");
+
+        let assigned = pin_eth0_irqs_alternating();
+        assert_eq!(
+            assigned,
+            vec![
+                ("81".into(), "4"),
+                ("82".into(), "8"),
+                ("83".into(), "4"),
+                ("84".into(), "8"),
+            ]
+        );
+        assert_eq!(fs::read_to_string(p81).unwrap().trim(), "4");
+        assert_eq!(fs::read_to_string(p82).unwrap().trim(), "8");
+        assert_eq!(fs::read_to_string(p83).unwrap().trim(), "4");
+        assert_eq!(fs::read_to_string(p84).unwrap().trim(), "8");
     }
 }

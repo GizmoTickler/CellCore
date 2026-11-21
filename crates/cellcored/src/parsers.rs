@@ -667,33 +667,58 @@ fn non_empty_or(val: String, fallback: &str) -> String {
 }
 
 pub fn parse_mimo_signal(qrsrp_resp: &str, qrsrq_resp: &str, qsinr_resp: &str) -> MimoSignalData {
-    let parse_tuple = |resp: &str, prefix: &str| -> (Vec<Option<f64>>, String) {
-        let lines: Vec<String> = clean_at_lines(resp)
+    let parse_tuples = |resp: &str, prefix: &str| -> Vec<(Vec<Option<f64>>, String)> {
+        clean_at_lines(resp)
             .into_iter()
             .filter(|l| l.starts_with(prefix))
-            .collect();
-        // Prefer NR5G line over LTE when both are emitted in EN-DC.
-        let line = lines
-            .iter()
-            .find(|l| l.to_ascii_uppercase().contains("NR5G"))
-            .or_else(|| lines.first());
-        let Some(line) = line else {
-            return (vec![None, None, None, None], String::new());
-        };
-        let rest = line[prefix.len()..].trim_start_matches([':', ' ', '\t']);
-        let f = split_csv_fields(rest);
-        let vals = (0..4)
-            .map(|i| {
-                to_f64(f.get(i).map(|s| s.as_str()))
-                    .filter(|&n| n != -140.0 && n != -32768.0 && n != 255.0)
+            .map(|line| {
+                let rest = line[prefix.len()..].trim_start_matches([':', ' ', '\t']);
+                let f = split_csv_fields(rest);
+                let vals = (0..4)
+                    .map(|i| {
+                        to_f64(f.get(i).map(|s| s.as_str()))
+                            .filter(|&n| n != -140.0 && n != -32768.0 && n != 255.0)
+                    })
+                    .collect();
+                let rat = unquote(f.get(4).map(|s| s.as_str()));
+                (vals, rat)
             })
-            .collect();
-        let rat = unquote(f.get(4).map(|s| s.as_str()));
-        (vals, rat)
+            .collect()
     };
-    let (rsrp, r1) = parse_tuple(qrsrp_resp, "+QRSRP");
-    let (rsrq, r2) = parse_tuple(qrsrq_resp, "+QRSRQ");
-    let (sinr, r3) = parse_tuple(qsinr_resp, "+QSINR");
+
+    let pick_best = |tuples: Vec<(Vec<Option<f64>>, String)>, preferred_rat: Option<&str>| -> (Vec<Option<f64>>, String) {
+        let is_nr = |r: &str| r.to_ascii_uppercase().contains("NR5G");
+        let has_valid = |v: &[Option<f64>]| v.iter().any(Option::is_some);
+
+        if let Some(pref) = preferred_rat {
+            let want_nr = is_nr(pref);
+            if let Some(hit) = tuples
+                .iter()
+                .find(|(v, r)| is_nr(r) == want_nr && has_valid(v))
+            {
+                return hit.clone();
+            }
+        }
+        // In EN-DC when both `,LTE` and `,NR5G` lines are present, prefer `,NR5G` when valid.
+        if let Some(nr) = tuples.iter().find(|(v, r)| is_nr(r) && has_valid(v)) {
+            return nr.clone();
+        }
+        if let Some(valid) = tuples.iter().find(|(v, _)| has_valid(v)) {
+            return valid.clone();
+        }
+        if let Some(nr_any) = tuples.iter().find(|(_, r)| is_nr(r)) {
+            return nr_any.clone();
+        }
+        tuples
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| (vec![None, None, None, None], String::new()))
+    };
+
+    let (rsrp, r1) = pick_best(parse_tuples(qrsrp_resp, "+QRSRP"), None);
+    let pref = (!r1.is_empty()).then_some(r1.as_str());
+    let (rsrq, r2) = pick_best(parse_tuples(qrsrq_resp, "+QRSRQ"), pref);
+    let (sinr, r3) = pick_best(parse_tuples(qsinr_resp, "+QSINR"), pref);
     let rat = [r1, r2, r3]
         .into_iter()
         .find(|s| !s.is_empty())
@@ -1638,6 +1663,20 @@ mod tests {
         assert_eq!(sig.rat, "NR5G");
         assert_eq!(sig.rsrp, vec![Some(-93.0), Some(-101.0), Some(-92.0), Some(-92.0)]);
         assert_eq!(sig.sinr, vec![Some(15.0), Some(11.0), Some(17.0), Some(20.0)]);
+
+        // Reverse EN-DC order (NR5G before LTE) must keep NR5G rather than letting LTE overwrite it.
+        let compound_rev = "+QRSRP: -93,-101,-92,-92,NR5G\r\n+QRSRP: -102,-103,-140,-140,LTE\r\n+QRSRQ: -10,-11,-10,-11,NR5G\r\n+QRSRQ: -13,-14,-140,-140,LTE\r\n+QSINR: 18,16,19,21,NR5G\r\n+QSINR: 8,7,-32768,-32768,LTE\r\nOK";
+        let sig_rev = parse_mimo_signal(compound_rev, compound_rev, compound_rev);
+        assert_eq!(sig_rev.rat, "NR5G");
+        assert_eq!(sig_rev.rsrp, vec![Some(-93.0), Some(-101.0), Some(-92.0), Some(-92.0)]);
+        assert_eq!(sig_rev.sinr, vec![Some(18.0), Some(16.0), Some(19.0), Some(21.0)]);
+
+        // LTE anchor where modem emits sentinel -140/-32768 NR5G line must fall back cleanly to valid LTE!
+        let lte_with_dead_nr = "+QRSRP: -95,-98,-101,-103,LTE\r\n+QRSRP: -140,-140,-140,-140,NR5G\r\n+QRSRQ: -9,-10,-11,-11,LTE\r\n+QRSRQ: -32768,-32768,-32768,-32768,NR5G\r\n+QSINR: 14,12,10,9,LTE\r\n+QSINR: -32768,-32768,-32768,-32768,NR5G\r\nOK";
+        let sig_lte = parse_mimo_signal(lte_with_dead_nr, lte_with_dead_nr, lte_with_dead_nr);
+        assert_eq!(sig_lte.rat, "LTE");
+        assert_eq!(sig_lte.rsrp, vec![Some(-95.0), Some(-98.0), Some(-101.0), Some(-103.0)]);
+        assert_eq!(sig_lte.sinr, vec![Some(14.0), Some(12.0), Some(10.0), Some(9.0)]);
 
         let sbx = crate::paths::TestSandbox::new("sysfs-therm");
         sbx.write("/sys/class/thermal/thermal_zone0/type", "sdr0-pa1\n");

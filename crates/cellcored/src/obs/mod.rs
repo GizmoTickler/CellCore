@@ -28,7 +28,10 @@ mod api;
 
 use std::{
     collections::VecDeque,
-    sync::{LazyLock, Mutex, MutexGuard, OnceLock},
+    sync::{
+        LazyLock, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -81,6 +84,8 @@ pub struct PersistedObs {
 
 pub struct Obs {
     pub persisted: Mutex<PersistedObs>,
+    pub state_dirty: AtomicBool,
+    last_flushed: Mutex<Option<PersistedObs>>,
     pub config: Mutex<config::ObsConfig>,
     pub events: Mutex<events::EventStore>,
     pub detector: Mutex<events::SnapshotDetector>,
@@ -92,6 +97,8 @@ pub struct Obs {
 
 static OBS: LazyLock<Obs> = LazyLock::new(|| Obs {
     persisted: Mutex::new(PersistedObs::default()),
+    state_dirty: AtomicBool::new(false),
+    last_flushed: Mutex::new(None),
     config: Mutex::new(config::ObsConfig::default()),
     events: Mutex::new(events::EventStore::default()),
     detector: Mutex::new(events::SnapshotDetector::default()),
@@ -106,6 +113,14 @@ pub fn obs() -> &'static Obs {
 }
 
 impl Obs {
+    pub fn mark_state_dirty(&self) {
+        self.state_dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_state_dirty(&self) -> bool {
+        self.state_dirty.swap(false, Ordering::Relaxed)
+    }
+
     fn broadcast(&self, value: &serde_json::Value) {
         if let Some(tx) = self.ws.get()
             && tx.receiver_count() > 0
@@ -139,6 +154,7 @@ pub fn start(state: &AppState) {
     let _ = std::fs::create_dir_all(crate::paths::p(ETC_QM_DIR));
     let first_run = !std::path::Path::new(&crate::paths::p(OBS_STATE_PATH)).exists();
     let mut prev: PersistedObs = load_json_or_default(OBS_STATE_PATH);
+    let disk_baseline = (!first_run).then(|| prev.clone());
     *lock(&OBS.config) = load_json_or_default(OBS_CONFIG_PATH);
     {
         let stored: events::StoredEvents = load_json_or_default(EVENTS_PATH);
@@ -158,7 +174,10 @@ pub fn start(state: &AppState) {
         // A restart in the middle of an episode: keep counting from here.
         lock(&OBS.failover).resume(ep.clone());
     }
+    let dirty_at_start = disk_baseline.as_ref() != Some(&prev);
+    *lock(&OBS.last_flushed) = disk_baseline;
     *lock(&OBS.persisted) = prev;
+    OBS.state_dirty.store(dirty_at_start, Ordering::Relaxed);
 
     emit(
         EventKind::DaemonStart,
@@ -181,6 +200,7 @@ pub fn start(state: &AppState) {
 
 /// Everything flushed to flash. Called hourly, on SIGTERM and right before a
 /// reboot (through `telemetry::flush_persistent_state`).
+/// Skips NAND writes for `/etc/cellcore/obs_state.json` when unchanged (`!state_dirty`).
 pub fn flush_now(clean_shutdown: bool) {
     let snapshot = {
         let mut ev = lock(&OBS.events);
@@ -190,21 +210,37 @@ pub fn flush_now(clean_shutdown: bool) {
     if let Some(stored) = snapshot {
         let _ = save_json_atomic(EVENTS_PATH, &stored, 0o600);
     }
-    let p = {
+    let maybe_state = {
         let mut p = lock(&OBS.persisted);
-        if clean_shutdown {
+        if clean_shutdown && !p.clean_shutdown {
             p.clean_shutdown = true;
+            OBS.mark_state_dirty();
         }
-        p.episode = lock(&OBS.failover).episode.clone();
-        p.clone()
+        let cur_ep = lock(&OBS.failover).episode.clone();
+        if p.episode != cur_ep {
+            p.episode = cur_ep;
+            OBS.mark_state_dirty();
+        }
+        let mut last = lock(&OBS.last_flushed);
+        let flagged = OBS.take_state_dirty();
+        if flagged || last.as_ref() != Some(&*p) {
+            let cloned = p.clone();
+            *last = Some(cloned.clone());
+            Some(cloned)
+        } else {
+            None
+        }
     };
-    let _ = save_json_atomic(OBS_STATE_PATH, &p, 0o600);
+    if let Some(p) = maybe_state {
+        let _ = save_json_atomic(OBS_STATE_PATH, &p, 0o600);
+    }
 }
 
 /// Record why the coming reboot happens; the reboot paths flush right after
 /// (`telemetry::flush_persistent_state`), and the next start reports it.
 pub fn set_boot_reason(reason: &str) {
     lock(&OBS.persisted).pending_boot_reason = Some(reason.to_string());
+    OBS.mark_state_dirty();
 }
 
 pub fn save_config() -> Result<(), String> {
@@ -281,5 +317,32 @@ mod tests {
         assert_eq!(p.lifetime_rx, 5);
         assert!(!p.clean_shutdown);
         assert!(p.episode.is_none());
+    }
+
+    #[test]
+    fn flush_now_skips_nand_write_when_state_not_dirty() {
+        let env = crate::paths::TestSandbox::new("obs-dirty-flush");
+        env.write("/etc/cellcore/.keep", "");
+        let state_file = env.root.join("etc/cellcore/obs_state.json");
+
+        {
+            let mut p = lock(&OBS.persisted);
+            *p = PersistedObs::default();
+            p.lifetime_rx = 42;
+            *lock(&OBS.last_flushed) = None;
+            OBS.mark_state_dirty();
+        }
+        flush_now(false);
+        assert!(state_file.exists(), "first dirty flush must write obs_state.json");
+
+        // Remove file without mutating state: an idle hourly flush must NOT rewrite NAND.
+        std::fs::remove_file(&state_file).unwrap();
+        flush_now(false);
+        assert!(!state_file.exists(), "unchanged state must not write obs_state.json");
+
+        // Marking state dirty via set_boot_reason writes again.
+        set_boot_reason("manual reboot");
+        flush_now(false);
+        assert!(state_file.exists(), "dirty state must write obs_state.json");
     }
 }

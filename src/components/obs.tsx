@@ -53,6 +53,11 @@ export const EVENT_META: Record<EventType, { label: string; group: EventGroup; i
   standby_leak: { label: "Standby leak", group: "usage", icon: Droplets },
   sms_received: { label: "SMS received", group: "system", icon: MessageSquare },
   vpn: { label: "VPN", group: "link", icon: Shield },
+  antenna_degraded: { label: "Antenna degraded", group: "radio", icon: AlertTriangle },
+  thermal_throttle: { label: "Thermal throttle", group: "system", icon: Gauge },
+  sar_backoff: { label: "SAR backoff", group: "radio", icon: Radio },
+  air_cipher_null: { label: "Null air cipher", group: "link", icon: ShieldAlert },
+  modem_ssr: { label: "Modem SSR", group: "recovery", icon: LifeBuoy },
 };
 
 export const EVENT_GROUPS: Array<{ id: EventGroup; label: string }> = [

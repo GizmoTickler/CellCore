@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Check, Cpu, Radio, RefreshCw, ShieldAlert, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { apiFetch } from "../../lib/api";
+import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
 import { useToastStore } from "../../stores/toast-store";
 import { Badge, Button, Card, CardHeader, Input, Meter, Select, Skeleton, Switch } from "../../components/ui";
@@ -95,6 +96,7 @@ interface PhyDiagnostics {
   nr5gCsi: CsiMetrics | null;
   lteCsi: CsiMetrics | null;
   nr5gMimoLayers: number | null;
+  nr5gActiveRank?: number | null;
   nr5gTxPwr: string | null;
   nr5gTxPwrDetail: TxPowerDetail | null;
   nr5gPathlossDb: number | null;
@@ -106,6 +108,7 @@ interface PhyDiagnostics {
   nr5gAmbr: string | null;
   airSecurity: AirSecurityInfo | null;
   rrcState: RrcStateInfo | null;
+  rrcTimeSummary?: string | null;
   cRnti: number | null;
   overheatInd: boolean | null;
   sfeEnabled: boolean | null;
@@ -289,14 +292,30 @@ export function RadioTuningCard() {
     if (!dirty) return;
     setBusy(true);
     try {
-      const res = await apiFetch<{ note?: string }>("/api/v1/cellular/tuning", {
+      const res = await disruptiveFetch<{ note?: string }>("radio tuning", "/api/v1/cellular/tuning", {
         method: "POST",
         body: JSON.stringify(patch),
       });
       toast("Radio tuning applied", "success", res.note);
       await qc.invalidateQueries({ queryKey: KEY });
     } catch (e) {
-      toast("Radio tuning failed", "error", errText(e));
+      if (!isCancelled(e)) toast("Radio tuning failed", "error", errText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function lockSarZero() {
+    setBusy(true);
+    try {
+      await disruptiveFetch("SAR backoff override", "/api/v1/cellular/tuning", {
+        method: "POST",
+        body: JSON.stringify({ sarBackoffLockZero: true }),
+      });
+      toast("SAR RF state locked to 0 (no backoff)", "success");
+      await Promise.all([qc.invalidateQueries({ queryKey: KEY }), qc.invalidateQueries({ queryKey: DSP_KEY })]);
+    } catch (e) {
+      if (!isCancelled(e)) toast("SAR lock failed", "error", errText(e));
     } finally {
       setBusy(false);
     }
@@ -370,6 +389,9 @@ export function RadioTuningCard() {
                   <Badge variant={phy.rrcState.stateCode === 2 ? "success" : "neutral"}>
                     RRC {phy.rrcState.stateName}
                   </Badge>
+                )}
+                {phy.rrcTimeSummary && (
+                  <Badge variant="neutral">{phy.rrcTimeSummary}</Badge>
                 )}
                 {phy.cRnti != null && (
                   <Badge variant="neutral">C-RNTI 0x{phy.cRnti.toString(16).toUpperCase()}</Badge>
@@ -452,7 +474,7 @@ export function RadioTuningCard() {
               <div className="qm-subcard p-3 min-w-0">
                 <div className="text-[11px] font-semibold text-muted">MIMO / CSI</div>
                 <div className="mt-1 font-mono text-[13px] font-semibold text-ink qm-tabular truncate">
-                  {phy.nr5gMimoLayers != null ? `${phy.nr5gMimoLayers}×L` : "--"}
+                  {(phy.nr5gActiveRank ?? phy.nr5gMimoLayers) != null ? `${phy.nr5gActiveRank ?? phy.nr5gMimoLayers}×L` : "--"}
                   {phy.nr5gCsi ? ` · CQI ${phy.nr5gCsi.cqi}` : ""}
                 </div>
                 <div className="mt-0.5 text-[10.5px] text-muted truncate">
@@ -558,6 +580,11 @@ export function RadioTuningCard() {
                     <Badge variant={dsp.sarRfState && dsp.sarRfState > 0 ? "warning" : "neutral"}>
                       {dsp.sarLabel}
                     </Badge>
+                    {dsp.sarRfState != null && dsp.sarRfState > 0 && (
+                      <Button size="sm" variant="secondary" disabled={busy} onClick={() => void lockSarZero()}>
+                        Lock SAR 0 (No Backoff)
+                      </Button>
+                    )}
                   </div>
                 </div>
                 {dsp.tmdDevices.length > 0 && (

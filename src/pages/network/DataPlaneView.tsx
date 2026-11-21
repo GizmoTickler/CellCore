@@ -75,11 +75,13 @@ interface DataplaneStatusResp {
     ipv6PrefixSharing: boolean;
     preserveIpaOffload: boolean;
     kernelTuning: "default" | "high-throughput";
+    sfeFastpath?: boolean;
   };
   snapshot: {
     updatedAt: number;
     mode: "coexist" | "native";
     supervisorState: string;
+    sfeLoaded?: boolean;
     qrtr: {
       available: boolean;
       localNode: number | null;
@@ -114,6 +116,7 @@ interface DataplaneStatusResp {
       dlAggProtocol: number | null;
       dlMaxDatagrams: number | null;
       dlMaxSize: number | null;
+      flowControl?: number | null;
     } | null;
     wdsV4: WdsFamilySnapshot;
     wdsV6: WdsFamilySnapshot;
@@ -362,6 +365,22 @@ export function DataPlaneView() {
       onDone: () => void refresh(),
       success: ht ? "High-throughput profile applied" : "Default kernel settings restored",
     });
+  }
+
+  async function toggleSfeFastpath(next: boolean) {
+    setBusy("sfe");
+    try {
+      await apiFetch("/api/v1/dataplane/config", {
+        method: "POST",
+        body: JSON.stringify({ sfeFastpath: next }),
+      });
+      toast(next ? "Qualcomm SFE fastpath enabled" : "Qualcomm SFE fastpath disabled", "success");
+      await refresh();
+    } catch (e) {
+      if (!isCancelled(e)) toast("SFE fastpath update failed", "error", errText(e));
+    } finally {
+      setBusy(null);
+    }
   }
 
   if (q.error) return <LoadError error={q.error} onRetry={() => void q.refetch()} />;
@@ -687,6 +706,20 @@ export function DataPlaneView() {
                 Restore Defaults
               </Button>
             )}
+          </div>
+          <div className="qm-subcard p-3.5 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <Switch
+                checked={Boolean(config.sfeFastpath)}
+                disabled={busy === "sfe"}
+                onChange={(next) => void toggleSfeFastpath(next)}
+                label="Qualcomm SFE Software Fastpath (Experimental)"
+                description="Load shortcut-fe kernel fastpath modules for software-accelerated flows when IPA hardware offload misses"
+              />
+              <Badge variant={s.sfeLoaded ? "info" : "neutral"} className="shrink-0">
+                {s.sfeLoaded ? "SFE loaded" : "SFE off"}
+              </Badge>
+            </div>
           </div>
         </Card>
 

@@ -5,7 +5,7 @@
 //! * Service capability discovery (`LOC`, `WMS`, `TIME`, `ANT_SWITCH`, `SMART_TX`)
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use super::{
     QmiClient, QmiError, SVC_NAS, SVC_SAR, SVC_TMD,
@@ -29,14 +29,26 @@ const QMI_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const TMD_GET_MITIGATION_DEVICE_LIST: u16 = 0x0020;
 pub const TMD_GET_MITIGATION_LEVEL: u16 = 0x0022;
+pub const SAR_RF_SET_STATE: u16 = 0x0001;
 pub const SAR_RF_GET_STATE: u16 = 0x0002;
 
-static DSP_QRTR_BUS: OnceLock<Option<Arc<QrtrBus>>> = OnceLock::new();
+static DSP_QRTR_BUS: Mutex<Option<Arc<QrtrBus>>> = Mutex::const_new(None);
 
-fn shared_dsp_bus() -> Option<Arc<QrtrBus>> {
-    DSP_QRTR_BUS
-        .get_or_init(|| QrtrBus::connect().ok())
-        .clone()
+async fn shared_dsp_bus() -> Option<Arc<QrtrBus>> {
+    let mut guard = DSP_QRTR_BUS.lock().await;
+    if let Some(bus) = guard.as_ref() {
+        if bus.snapshot().available {
+            return Some(Arc::clone(bus));
+        }
+        *guard = None;
+    }
+    let bus = QrtrBus::connect().ok()?;
+    *guard = Some(Arc::clone(&bus));
+    Some(bus)
+}
+
+async fn invalidate_dsp_bus() {
+    *DSP_QRTR_BUS.lock().await = None;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,10 +169,42 @@ pub async fn query_sar_state(client: &dyn QmiClient) -> Result<u32, QmiError> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+pub async fn set_sar_state_rpc(client: &dyn QmiClient, state: u32) -> Result<(), QmiError> {
+    let mut w = TlvWriter::new();
+    w.push_u32(0x01, state);
+    let tlvs = client.rpc(SAR_RF_SET_STATE, w.finish(), QMI_TIMEOUT).await?;
+    check_result_tlv(&tlvs)
+}
+
+/// Set QMI SAR RF state (`SAR_RF_SET_STATE = 0x0001`, e.g. `0` = Default / No Backoff).
+pub async fn set_sar_rf_state(state: u32) -> Result<(), QmiError> {
+    let bus = shared_dsp_bus()
+        .await
+        .ok_or_else(|| QmiError::Unsupported("QRTR bus unavailable".into()))?;
+    if bus.snapshot().services.is_empty() {
+        if bus.send_lookup().await.is_err() {
+            invalidate_dsp_bus().await;
+            return Err(QmiError::Io("QRTR lookup failed".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (ind_tx, _ind_rx) = mpsc::channel(4);
+    let ep = match bus.open_service(SVC_SAR, "SAR_SET", ind_tx, QMI_TIMEOUT).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if matches!(e, QmiError::Io(_) | QmiError::Ssr) {
+                invalidate_dsp_bus().await;
+            }
+            return Err(e);
+        }
+    };
+    set_sar_state_rpc(ep.as_ref(), state).await
+}
+
 /// Probe live SDX75 DSP services directly over QRTR (`AF_QIPCRTR`).
 pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     let now = crate::auth::now_secs();
-    let Some(bus) = shared_dsp_bus() else {
+    let Some(bus) = shared_dsp_bus().await else {
         return DspTelemetrySnapshot {
             sar_label: sar_state_label(None),
             updated_at: now,
@@ -169,7 +213,14 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     };
 
     if bus.snapshot().services.is_empty() {
-        let _ = bus.send_lookup().await;
+        if bus.send_lookup().await.is_err() {
+            invalidate_dsp_bus().await;
+            return DspTelemetrySnapshot {
+                sar_label: sar_state_label(None),
+                updated_at: now,
+                ..Default::default()
+            };
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     let services = bus.snapshot().services;
@@ -214,7 +265,7 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     };
 
     let any_throttling = tmd_devices.iter().any(|d| d.throttling);
-    DspTelemetrySnapshot {
+    let snap = DspTelemetrySnapshot {
         qrtr_available: true,
         dsp_service_count: services.len(),
         capabilities: caps,
@@ -224,7 +275,9 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
         any_throttling,
         qmi_signal,
         updated_at: now,
-    }
+    };
+    crate::obs::events::on_dsp_telemetry(&snap);
+    snap
 }
 
 pub async fn get_dsp_telemetry(State(ctx): State<HttpCtx>) -> Response {
@@ -260,5 +313,20 @@ mod tests {
         assert_eq!(sar_state_label(None), "Unavailable");
         assert_eq!(sar_state_label(Some(0)), "Default (no backoff)");
         assert_eq!(sar_state_label(Some(2)), "SAR Backoff State 2");
+    }
+
+    #[tokio::test]
+    async fn encodes_sar_rf_set_state_zero() {
+        use crate::qmi::{
+            codec::{make_result_ok_tlv, parse_tlvs, read_u32_le},
+            test_support::MockQmiClient,
+        };
+        let mock = MockQmiClient::new(|msg_id, req_bytes| {
+            assert_eq!(msg_id, SAR_RF_SET_STATE);
+            let req_tlvs = parse_tlvs(req_bytes)?;
+            assert_eq!(read_u32_le(&req_tlvs, 0x01), Some(0));
+            parse_tlvs(&make_result_ok_tlv())
+        });
+        set_sar_state_rpc(&mock, 0).await.unwrap();
     }
 }
