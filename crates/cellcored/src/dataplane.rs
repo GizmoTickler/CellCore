@@ -367,12 +367,14 @@ pub async fn native_bearer_overlay() -> Option<NativeBearerOverlay> {
 }
 
 /// Queue a full native bearer reconnect if `Native` mode is active.
-pub async fn trigger_native_reconnect_if_active() {
+pub async fn trigger_native_reconnect_if_active() -> bool {
     let h = hub();
     if h.config.read().await.mode == DataplaneMode::Native {
         *h.reconnect_queue.lock().unwrap_or_else(|e| e.into_inner()) = Some("all".into());
         h.wake.notify_one();
+        return true;
     }
+    false
 }
 
 fn hub() -> Arc<DataplaneHub> {
@@ -684,6 +686,8 @@ const HIGH_THROUGHPUT_SYSCTLS: &[(&str, &str)] = &[
     ("/sys/class/net/eth0/queues/rx-0/rps_cpus", "e"),
     ("/sys/class/net/eth0/queues/rx-0/rps_flow_cnt", "4096"),
     ("/sys/class/net/eth0/queues/tx-0/xps_cpus", "c"),
+    ("/sys/class/net/eth0/gro_flush_timeout", "20000"),
+    ("/sys/class/net/eth0/napi_defer_hard_irqs", "2"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-0/rps_cpus", "e"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-1/rps_cpus", "e"),
     ("/sys/class/net/rmnet_ipa0/queues/rx-2/rps_cpus", "e"),
@@ -731,6 +735,12 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                 dyn_entries.push((rel, val));
             }
         }
+        for (leaf, val) in [("gro_flush_timeout", "20000"), ("napi_defer_hard_irqs", "2")] {
+            let rel = format!("/sys/class/net/{iface}/{leaf}");
+            if !HIGH_THROUGHPUT_SYSCTLS.iter().any(|(r, _)| *r == rel) {
+                dyn_entries.push((rel, val));
+            }
+        }
     }
 
     if !dyn_entries.is_empty() {
@@ -766,6 +776,7 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                     let _ = fs::write(&real, format!("{val}\n"));
                 }
             }
+            tune_nic_offloads_and_irqs(active_iface);
         }
         KernelTuningProfile::Default => {
             let pairs = baseline_lock.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -783,6 +794,48 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
         }
     }
     warnings
+}
+
+/// Enable hardware/kernel GRO forwarding offloads (`rx-gro-list`, `rx-udp-gro-forwarding`)
+/// on `eth0` and the active `rmnet_data*` interface, and pin `eth0-*` PCIe MSI IRQs
+/// onto CPUs 2–3 (isolated from modem `ipcc_0` on CPU 0 and Qualcomm `gsi/IPA` on CPU 1).
+fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
+    let mut ifaces: Vec<&str> = vec!["eth0"];
+    if let Some(iface) = active_iface
+        && netlink::validate_managed_iface(iface).is_ok()
+        && iface != "eth0"
+    {
+        ifaces.push(iface);
+    }
+    for iface in ifaces {
+        let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
+        if !Path::new(&sys_if).exists() {
+            continue;
+        }
+        let _ = crate::uci::run_cmd_blocking_timeout(
+            "ethtool",
+            &["-K", iface, "rx-gro-list", "on", "rx-udp-gro-forwarding", "on"],
+            Duration::from_secs(2),
+        );
+    }
+
+    let irqs_path = crate::paths::p("/proc/interrupts");
+    if let Ok(text) = fs::read_to_string(&irqs_path) {
+        for line in text.lines() {
+            if !line.contains("eth0-") {
+                continue;
+            }
+            if let Some((num_raw, _)) = line.split_once(':') {
+                let irq = num_raw.trim();
+                if !irq.is_empty() && irq.bytes().all(|b| b.is_ascii_digit()) {
+                    let aff_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
+                    if Path::new(&aff_path).exists() {
+                        let _ = fs::write(&aff_path, "2-3\n");
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_ipa_eth_driver(status_text: &str) -> Option<String> {

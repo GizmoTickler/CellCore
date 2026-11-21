@@ -236,10 +236,8 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    const tok = useAuthStore.getState().token;
-    const url = tok
-      ? `${proto}//${host}/api/v1/ws?token=${encodeURIComponent(tok)}`
-      : `${proto}//${host}/api/v1/ws`;
+    // Authenticate via the HttpOnly SameSite=Strict qm_session cookie instead of leaking tokens into WS URLs.
+    const url = `${proto}//${host}/api/v1/ws`;
     set({ status: "connecting" });
     startWatchdog(get, set);
 

@@ -173,11 +173,12 @@ async fn wan_restart_sequence(state: AppState) {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
-    let _ = run_cmd("ubus", &["call", "network.interface.wan", "down"], Duration::from_secs(3)).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
-    let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
-    crate::dataplane::trigger_native_reconnect_if_active().await;
+    if !crate::dataplane::trigger_native_reconnect_if_active().await {
+        let _ = run_cmd("ubus", &["call", "network.interface.wan", "down"], Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
+        let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
+    }
 }
 
 async fn modem_reset_sequence(state: AppState) {
@@ -199,9 +200,10 @@ async fn modem_reset_sequence(state: AppState) {
         drop(guard);
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
-    let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
-    crate::dataplane::trigger_native_reconnect_if_active().await;
+    if !crate::dataplane::trigger_native_reconnect_if_active().await {
+        let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
+        let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
+    }
 }
 
 pub fn ipc_socket_path() -> String {

@@ -74,7 +74,10 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                 record_signal_history_point(&st_rf).await;
             }
 
-            let wait_dur = if st_rf.ws_tx.receiver_count() > 0 {
+            let st_running = st_rf.speedtest_live.read().await.running;
+            let wait_dur = if st_running {
+                Duration::from_secs(1)
+            } else if st_rf.ws_tx.receiver_count() > 0 {
                 Duration::from_secs(3)
             } else {
                 Duration::from_secs(15)
@@ -404,6 +407,8 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         loop {
             if tick.is_multiple_of(10) {
                 refresh_public_ip(&st_prof).await;
+                let cert = crate::acme::inspect_active_cert().await;
+                *st_prof.tls_cert_info.write().await = cert;
             }
             if tick.is_multiple_of(2) {
                 crate::profiles::tick_profiles_and_schedules(&st_prof).await;

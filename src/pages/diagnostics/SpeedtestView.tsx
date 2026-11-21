@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ExternalLink, History, Minus, Play, RefreshCw, Square, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ExternalLink, History, Minus, Play, Radio, RefreshCw, Square, Trash2 } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
@@ -79,6 +79,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
 
   const speedtest = useWsStore((s) => s.speedtest);
   const speedtestHistory = useWsStore((s) => s.speedtestHistory);
+  const modem = useWsStore((s) => s.modem);
   const refreshSpeedtestHistory = useWsStore((s) => s.refreshSpeedtestHistory);
   const resetSpeedtest = useWsStore((s) => s.resetSpeedtest);
 
@@ -277,6 +278,45 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
 
             {speedtest.error && (
               <div className="rounded-2xl bg-crimson-soft px-4 py-3 text-[13px] text-crimson-ink">{speedtest.error}</div>
+            )}
+
+            {/* Live Carrier Aggregation & SCC activation strip (1s refresh during test) */}
+            {modem && modem.carriers.length > 0 && (
+              <div className="rounded-2xl border border-line bg-sunk/50 px-3.5 py-2.5 space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px] font-semibold text-muted">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Radio className="h-3.5 w-3.5 text-ember-ink" />
+                    Live Radio · {modem.carriers.length}CA ·{" "}
+                    {Math.round(
+                      modem.carriers.reduce((acc, c) => acc + (c.bandwidthMhz ?? 0), 0)
+                    )}{" "}
+                    MHz
+                  </span>
+                  {modem.serving?.sinr != null && (
+                    <span className="font-mono qm-tabular text-ink-2">
+                      {modem.serving.rat} · SINR {modem.serving.sinr} dB
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {modem.carriers.map((c, idx) => {
+                    const isPcc = c.role === "PCC";
+                    const sccActive = !isPcc && c.pcellState === 2;
+                    const sccDormant = !isPcc && c.pcellState === 1;
+                    return (
+                      <Badge
+                        key={`${c.role}-${c.arfcn}-${idx}`}
+                        variant={isPcc ? "info" : sccActive ? "success" : "neutral"}
+                      >
+                        {c.role} {c.band}
+                        {c.bandwidthMhz ? ` ${c.bandwidthMhz}MHz` : ""}
+                        {c.dlMimoLayers ? ` ${c.dlMimoLayers}×${c.ulMimoLayers || 0}` : ""}
+                        {sccActive ? " · Active" : sccDormant ? " · Dormant" : ""}
+                      </Badge>
+                    );
+                  })}
+                </div>
+              </div>
             )}
 
             {/* Controls */}

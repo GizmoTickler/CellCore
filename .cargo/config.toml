@@ -5,4 +5,5 @@ rustflags = [
   "-C", "link-self-contained=yes",
   "-C", "target-cpu=cortex-a55",
   "-C", "target-feature=+aes,+sha2,+crc,+lse",
+  "-C", "relocation-model=pie",
 ]

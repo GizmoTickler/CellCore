@@ -7,6 +7,7 @@ import { Field } from "./parts";
 import { AcmeCertCard } from "./AcmeCertCard";
 import { ApiTokensCard } from "./ApiTokensCard";
 import { AuditLogCard } from "./AuditLogCard";
+import { SecurityPostureCard } from "./SecurityPostureCard";
 
 function PasswordInput({
   id,
@@ -151,6 +152,7 @@ export function SecurityView({ ctl }: { ctl: SystemController }) {
           </Card>
         </div>
       </div>
+      <SecurityPostureCard />
       <AcmeCertCard />
       <ApiTokensCard />
       <AuditLogCard />

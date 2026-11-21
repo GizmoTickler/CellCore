@@ -100,6 +100,7 @@ pub struct MetricsInput {
     pub dataplane: crate::dataplane::DataplaneMetricsView,
     pub phy: crate::radio_tuning::PhyDiagnostics,
     pub dsp: crate::qmi::dsp::DspTelemetrySnapshot,
+    pub tls_cert: crate::acme::ActiveCertInfo,
 }
 
 pub fn usage_view(u: &DataUsageState, today: Civil, secs: u32) -> UsageView {
@@ -191,6 +192,7 @@ pub async fn gather(state: &AppState) -> MetricsInput {
     let dataplane = crate::dataplane::metrics_view().await;
     let phy = state.phy_diag.read().await.clone();
     let dsp = state.dsp_telemetry.read().await.clone();
+    let tls_cert = state.tls_cert_info.read().await.clone();
 
     MetricsInput {
         version: state.version.clone(),
@@ -214,6 +216,7 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         dataplane,
         phy,
         dsp,
+        tls_cert,
     }
 }
 
@@ -623,6 +626,17 @@ pub fn render(m: &MetricsInput) -> String {
             }
         }
         p.opt_gauge("qmi_sar_state", "Current QMI SAR RF transmit backoff state (0 = no backoff).", dsp.sar_rf_state.map(f64::from));
+    }
+
+    // --- TLS certificate health -----------------------------------------
+    let cert = &m.tls_cert;
+    if !cert.source.is_empty() {
+        p.gauge("tls_cert_acme_active", "1 when HTTPS is serving an ACME-issued certificate.", b(cert.source == "acme"));
+        p.opt_gauge(
+            "tls_cert_days_remaining",
+            "Days remaining until the active HTTPS TLS certificate expires.",
+            cert.days_remaining.map(|d| d as f64),
+        );
     }
 
     p.out

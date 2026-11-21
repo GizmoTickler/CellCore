@@ -177,6 +177,17 @@ export function RadioTuningCard() {
     queryFn: () => apiFetch<TuningResp>("/api/v1/cellular/tuning"),
     staleTime: 15_000,
   });
+
+  async function forceReload() {
+    resetDraft();
+    try {
+      const fresh = await apiFetch<TuningResp>("/api/v1/cellular/tuning?refresh=1");
+      qc.setQueryData(KEY, fresh);
+    } catch {
+      void q.refetch();
+    }
+    void dspQ.refetch();
+  }
   const dspQ = useQuery({
     queryKey: DSP_KEY,
     queryFn: () => apiFetch<DspResp>("/api/v1/cellular/dsp"),
@@ -333,11 +344,7 @@ export function RadioTuningCard() {
             size="sm"
             variant="ghost"
             disabled={q.isFetching || dspQ.isFetching}
-            onClick={() => {
-              resetDraft();
-              void q.refetch();
-              void dspQ.refetch();
-            }}
+            onClick={() => void forceReload()}
           >
             <RefreshCw className={cn("h-3.5 w-3.5", (q.isFetching || dspQ.isFetching) && "animate-spin")} />
             Reload

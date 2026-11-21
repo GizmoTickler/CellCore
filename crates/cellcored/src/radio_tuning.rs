@@ -4,11 +4,11 @@
 //! diagnostics (`CSI`, `TX Power + HPUE Headroom`, `Pathloss`, `DL/UL MCS`, `SSB Beams`,
 //! `5QI / QoS`, `AMBR`, `Air Cipher / Integrity`, `RRC State`, `C-RNTI`, `MIMO layers`, `SFE`).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -983,14 +983,36 @@ pub async fn read_tuning_snapshot(app: &crate::state::AppState) -> Result<(Radio
     Ok((tuning, phy))
 }
 
-pub async fn get_tuning(State(ctx): State<HttpCtx>) -> Response {
+#[derive(Debug, Default, Deserialize)]
+pub struct TuningQuery {
+    pub refresh: Option<u8>,
+}
+
+const TUNING_CACHE_TTL: Duration = Duration::from_secs(20);
+
+pub async fn get_tuning(State(ctx): State<HttpCtx>, Query(q): Query<TuningQuery>) -> Response {
+    let force_refresh = q.refresh.unwrap_or(0) != 0;
+    if !force_refresh
+        && let Some((tuning, phy, ts)) = ctx.app.tuning_cache.read().await.as_ref()
+        && ts.elapsed() < TUNING_CACHE_TTL
+    {
+        return Json(serde_json::json!({
+            "status": "ok",
+            "tuning": tuning,
+            "phy": phy,
+            "cached": true,
+        }))
+        .into_response();
+    }
     let Ok((tuning, phy)) = read_tuning_snapshot(&ctx.app).await else {
         return bad_gateway("AT queue error", Vec::new());
     };
+    *ctx.app.tuning_cache.write().await = Some((tuning.clone(), phy.clone(), Instant::now()));
     Json(serde_json::json!({
         "status": "ok",
         "tuning": tuning,
         "phy": phy,
+        "cached": false,
     }))
     .into_response()
 }
@@ -1182,6 +1204,7 @@ pub async fn apply_tuning_patch(
         }
     }
 
+    *app.tuning_cache.write().await = None;
     let summary = applied.join(", ");
     app.push_daemon_log(format!("cellular: radio tuning updated ({summary})"));
     app.audit.event("cellular", "tuning", summary);

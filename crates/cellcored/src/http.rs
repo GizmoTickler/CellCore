@@ -372,6 +372,8 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/system/settings", get(handlers::get_settings).post(handlers::post_settings))
         .route("/api/v1/system/acme", get(crate::acme::get_acme).put(crate::acme::put_acme).delete(crate::acme::delete_acme))
         .route("/api/v1/system/acme/issue", post(crate::acme::post_acme_issue))
+        .route("/api/v1/security/audit", get(crate::hardening::get_security_audit))
+        .route("/api/v1/security/harden", post(crate::hardening::post_security_harden))
         .route("/api/v1/system/password", post(handlers::post_change_password))
         .route("/api/v1/auth/logout", post(handlers::post_logout))
         .merge(crate::admin::routes())
@@ -423,12 +425,13 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .merge(proxy_routes)
         .fallback_service(static_svc)
         .layer(middleware::from_fn(body_deadline_middleware))
-        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(ctx.clone(), security_headers_middleware))
         .with_state(ctx)
 }
 
-async fn security_headers_middleware(req: Request, next: Next) -> Response {
+async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
+    let hsts = ctx.app.settings.read().await.https_redirect;
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert(
@@ -439,6 +442,32 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("SAMEORIGIN"),
     );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), usb=(), payment=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    if !path.starts_with("/cgi-bin/luci") {
+        headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://server.arcgisonline.com https://services.arcgisonline.com; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+            ),
+        );
+    }
+    if hsts {
+        headers.insert(
+            HeaderName::from_static("strict-transport-security"),
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     if path.starts_with("/assets/") {
         headers.insert(
             header::CACHE_CONTROL,

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0 — Dataplane Offloads & IRQ Pinning, Security Posture Hardening & Live Speedtest CA
+
+- **Performance & Dataplane Tuning (`dataplane.rs`, `radio_tuning.rs`, `.cargo/config.toml`):**
+  - Enabled `rx-gro-list` and `rx-udp-gro-forwarding` offloads on `eth0` and active `rmnet_data*` plus `gro_flush_timeout=20000` & `napi_defer_hard_irqs=2` NAPI coalescing.
+  - Pinned all `eth0-*` PCIe MSI IRQs onto CPUs `2–3` (isolated from modem `ipcc_0` on CPU 0 and Qualcomm `gsi/IPA` on CPU 1).
+  - Enabled static-PIE ASLR (`-C relocation-model=pie`) alongside Cortex-A55 hardware ISA (`+aes,+sha2,+crc,+lse`).
+  - Added 20 s in-memory cache on `GET /api/v1/cellular/tuning` (`?refresh=1` forces live AT read; `POST` invalidates immediately) for <10 ms Bands & Tuning page loads.
+  - Guarded `r10-modem-ctl wan-restart` / `modem-reset` against invoking `ubus call network.interface.wan up/down` when the native dataplane is active so `netifd` never truncates `/tmp/resolv.conf.d/resolv.conf.auto`.
+- **Carrier Aggregation Visibility During Speedtests (`telemetry.rs`, `SpeedtestView.tsx`):**
+  - Boosted background RF polling to `1 s` during active speedtests and added a live **Carrier Aggregation & RF** bar inside the Speedtest view showing per-carrier bandwidth, MIMO layers, and real-time SCC `Dormant` → `Active` (`pcellState = 2`) transitions.
+- **Security & Hardening Suite (`hardening.rs`, `SecurityPostureCard.tsx`, `http.rs`, `reconcile.rs`, `obs/metrics.rs`):**
+  - Added `GET /api/v1/security/audit`, `POST /api/v1/security/harden`, `cellctl security <audit|harden>`, and the **Security Posture & Hardening** card under `System → Security & Units` (9 live checks + 1-click Dropbear LAN-only bind, kernel sysctls, 0600 secret permissions, and reversible USB gadget lockdown).
+  - Enforced modern HTTP security headers: `Strict-Transport-Security` (HSTS), `Content-Security-Policy` (CSP), `Referrer-Policy: no-referrer`, `Permissions-Policy`, and `Cross-Origin-Opener-Policy: same-origin`.
+  - Switched frontend WebSocket auth to cookie-only (`HttpOnly; SameSite=Strict`) — no more session tokens in `?token=` URLs.
+  - Added boot-time `rp_filter=2` & anti-redirect/source-route sysctls and exported `cellcore_tls_cert_days_remaining` + `cellcore_tls_cert_acme_active` Prometheus metrics.
+
 ## 1.2.1 — `cellctl acme` CLI, `DELETE /api/v1/system/acme` & Mobile Speedtest Polish
 
 - **ACME CLI (`cellctl acme` & `cellcored acme`):**

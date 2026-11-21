@@ -7,6 +7,7 @@ mod auth;
 mod cli;
 mod dataplane;
 mod handlers;
+mod hardening;
 mod http;
 mod ipc;
 mod netlink;
@@ -129,6 +130,10 @@ fn main() {
             let code = acme::run_cli(&args[2..]);
             process::exit(code);
         }
+        Some("security") => {
+            let code = hardening::run_cli(&args[2..]);
+            process::exit(code);
+        }
         Some("reconcile") => {
             let report = run_boot_reconcile(true);
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
@@ -224,6 +229,8 @@ async fn async_main() {
         align_notify: Arc::new(tokio::sync::Notify::new()),
         phy_diag: Arc::new(RwLock::new(Default::default())),
         dsp_telemetry: Arc::new(RwLock::new(Default::default())),
+        tls_cert_info: Arc::new(RwLock::new(Default::default())),
+        tuning_cache: Arc::new(RwLock::new(None)),
         settings: Arc::new(RwLock::new(settings)),
         quecwatch: Arc::new(RwLock::new(LinkWatchRuntime {
             status: "idle".into(),
@@ -290,7 +297,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.2.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.3.0");
     }
 
     #[test]

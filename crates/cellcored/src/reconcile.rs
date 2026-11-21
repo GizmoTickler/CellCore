@@ -109,6 +109,17 @@ pub fn run_boot_reconcile(enforce_uhttpd_loopback: bool) -> ReconcileReport {
         "nf_conntrack_udp_timeout_stream",
         &mut actions,
     );
+    // Security baseline sysctls (loose reverse-path filter + anti-redirect/source-route)
+    for (p, v, lbl) in [
+        ("/proc/sys/net/ipv4/conf/all/rp_filter", "2", "rp_filter"),
+        ("/proc/sys/net/ipv4/conf/default/rp_filter", "2", "default.rp_filter"),
+        ("/proc/sys/net/ipv4/conf/all/accept_source_route", "0", "accept_source_route"),
+        ("/proc/sys/net/ipv6/conf/all/accept_source_route", "0", "ipv6.accept_source_route"),
+        ("/proc/sys/net/ipv4/conf/all/accept_redirects", "0", "accept_redirects"),
+        ("/proc/sys/net/ipv6/conf/all/accept_redirects", "0", "ipv6.accept_redirects"),
+    ] {
+        set_sysctl_if_different(p, v, lbl, &mut actions);
+    }
     let conntrack_max = fs::read_to_string(crate::paths::p("/proc/sys/net/netfilter/nf_conntrack_max"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
