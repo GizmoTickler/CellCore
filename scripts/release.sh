@@ -56,6 +56,8 @@ cp -f "$ROOT/target/aarch64-unknown-linux-musl/release/cellcored" "$PKG_DIR/root
 chmod 0755 "$PKG_DIR/root/usr/sbin/cellcored"
 cp -f "$ROOT/scripts/etc/init.d/cellcored" "$PKG_DIR/root/etc/init.d/cellcored"
 chmod 0755 "$PKG_DIR/root/etc/init.d/cellcored"
+cp -f "$ROOT/scripts/etc/init.d/dropbear-lan-watchdog" "$PKG_DIR/root/etc/init.d/dropbear-lan-watchdog"
+chmod 0755 "$PKG_DIR/root/etc/init.d/dropbear-lan-watchdog"
 ln -sf cellcored "$PKG_DIR/root/usr/sbin/r10-modem-ctl"
 ln -sf cellcored "$PKG_DIR/root/usr/sbin/modem-ctl"
 ln -sf ../sbin/cellcored "$PKG_DIR/root/usr/bin/cellctl"

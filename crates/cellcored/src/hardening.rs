@@ -511,6 +511,15 @@ pub fn bind_dropbear_lan_only() -> Result<String, String> {
             "Dropbear failed to listen on port {port} after binding Interface='lan' — automatically rolled back to wildcard listening to prevent SSH lockout"
         ));
     }
+    // Ensure standalone POSIX S99 init safeguard is installed & enabled so Dropbear
+    // starts after boot even if cellcored itself is ever absent or stopped.
+    let wdog_init = Path::new("/etc/init.d/dropbear-lan-watchdog");
+    if Path::new(&crate::paths::p("/etc/init.d")).exists() {
+        let script = include_bytes!("../../../scripts/etc/init.d/dropbear-lan-watchdog");
+        if crate::state::atomic_write(wdog_init, script, 0o755).is_ok() {
+            let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear-lan-watchdog", &["enable"], Duration::from_secs(3));
+        }
+    }
     Ok(format!(
         "Bound Dropbear SSH to Interface='lan' and verified listening on port {port}"
     ))

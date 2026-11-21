@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.2 — UBIFS `postinst` `sync` Barrier & Standalone `S99dropbear-lan-watchdog`
+
+- **UBIFS Crash-Safe Package Install (`packaging/sdxpinn-cellcore/CONTROL/postinst`):**
+  - Added an explicit `sync` barrier before `/etc/init.d/cellcored restart` so OpenWrt UBIFS commits `/usr/sbin/cellcored` data blocks to NAND before daemon startup, preventing a power cut from replaying UBIFS to a 0-byte binary.
+- **Standalone POSIX Dropbear Boot Safeguard (`scripts/etc/init.d/dropbear-lan-watchdog`, `hardening.rs`):**
+  - Bundled and auto-enabled `/etc/init.d/dropbear-lan-watchdog` (`START=99`), an independent POSIX `/bin/sh` init script that starts Dropbear after `S11network` (and rolls back `Interface='lan'` if port 22 still fails to bind) even if `cellcored` is stopped or absent.
+
 ## 1.4.1 — Preserve Hardware IPAv5 / `ioss` Ring Config & Late `START=95` Init Ordering
 
 - **Preserve Qualcomm IPAv5 + `ioss` Hardware Offload Ring Parameters (`dataplane.rs`, `netlink.rs`):**

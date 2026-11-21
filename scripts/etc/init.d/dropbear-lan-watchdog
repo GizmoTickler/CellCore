@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# Standalone POSIX safeguard against OpenWrt's S11network -> S19dropbear BOOT=1
+# skip race when dropbear.@dropbear[0].Interface='lan' is configured.
+# Runs independently of cellcored so SSH always comes up even if cellcored is absent.
+
+START=99
+
+boot() {
+	(
+		for wait_s in 10 25; do
+			sleep "$wait_s"
+			pidof dropbear >/dev/null 2>&1 && exit 0
+			/etc/init.d/dropbear start >/dev/null 2>&1
+			sleep 2
+			pidof dropbear >/dev/null 2>&1 && exit 0
+		done
+		# Emergency anti-lockout fallback: clear Interface='lan' if Dropbear still refused to start
+		if ! pidof dropbear >/dev/null 2>&1; then
+			uci -q delete dropbear.@dropbear[0].Interface
+			uci -q commit dropbear
+			/etc/init.d/dropbear restart >/dev/null 2>&1
+		fi
+	) >/dev/null 2>&1 &
+}
+
+start() {
+	pidof dropbear >/dev/null 2>&1 || /etc/init.d/dropbear start >/dev/null 2>&1
+}

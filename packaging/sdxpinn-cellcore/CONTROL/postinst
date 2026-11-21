@@ -42,9 +42,20 @@ if [ -x /etc/init.d/quecmanagerd ]; then
     /etc/init.d/quecmanagerd disable 2>/dev/null || true
 fi
 
+# Enable standalone Dropbear LAN-only boot safeguard (independent of cellcored)
+if [ -x /etc/init.d/dropbear-lan-watchdog ]; then
+    /etc/init.d/dropbear-lan-watchdog enable 2>/dev/null || true
+    /etc/init.d/dropbear-lan-watchdog start 2>/dev/null || true
+fi
+
+# Commit extracted UBIFS binary/assets to NAND BEFORE starting cellcored so an
+# unexpected power loss can never replay UBIFS to a 0-byte /usr/sbin/cellcored.
+sync
+
 # Enable and restart cellcored (reconciles system, binds :443/:80, enforces uhttpd 127.0.0.1:8080)
 if [ -x /etc/init.d/cellcored ]; then
     /etc/init.d/cellcored enable 2>/dev/null || true
+    sync
     /etc/init.d/cellcored restart 2>/dev/null || /etc/init.d/cellcored start 2>/dev/null || true
 fi
 
