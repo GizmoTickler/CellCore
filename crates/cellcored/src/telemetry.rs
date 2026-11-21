@@ -175,6 +175,12 @@ pub(crate) async fn bypass_cell_lock_temporarily(state: &AppState, reason: &str)
     state.cell_lock_bypassed.store(true, Ordering::Release);
     state.push_daemon_log(reason);
     push_alert(state, "cell_lock_deadman", reason).await;
+    crate::obs::emit(
+        crate::obs::EventKind::CellLockBypassed,
+        crate::obs::Severity::Warning,
+        "Cell lock temporarily bypassed (dead-man's-switch)",
+        serde_json::json!({ "bypassed": true, "reason": reason }),
+    );
 }
 
 pub(crate) async fn restore_cell_lock_from_settings(
@@ -202,6 +208,12 @@ pub(crate) async fn restore_cell_lock_from_settings(
     let msg = "Cell-lock dead-man's-switch restored configured cell lock after target cell re-appeared";
     state.push_daemon_log(msg);
     push_alert(state, "cell_lock_deadman", msg).await;
+    crate::obs::emit(
+        crate::obs::EventKind::CellLockBypassed,
+        crate::obs::Severity::Info,
+        "Configured cell lock restored",
+        serde_json::json!({ "bypassed": false, "reason": msg }),
+    );
 }
 
 fn ssb_response_matches_pci(body: &str, want_pci: i32) -> bool {

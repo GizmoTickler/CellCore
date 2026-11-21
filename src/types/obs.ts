@@ -28,7 +28,8 @@ export type EventType =
   | "thermal_throttle"
   | "sar_backoff"
   | "air_cipher_null"
-  | "modem_ssr";
+  | "modem_ssr"
+  | "cell_lock_bypassed";
 
 export interface ObsEvent {
   id: number;

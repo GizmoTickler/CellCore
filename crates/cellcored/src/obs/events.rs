@@ -41,10 +41,11 @@ pub enum EventKind {
     SarBackoff,
     AirCipherNull,
     ModemSsr,
+    CellLockBypassed,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 26] = [
+    pub const ALL: [EventKind; 27] = [
         EventKind::Handover,
         EventKind::BandChange,
         EventKind::RatChange,
@@ -71,6 +72,7 @@ impl EventKind {
         EventKind::SarBackoff,
         EventKind::AirCipherNull,
         EventKind::ModemSsr,
+        EventKind::CellLockBypassed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -101,6 +103,7 @@ impl EventKind {
             EventKind::SarBackoff => "sar_backoff",
             EventKind::AirCipherNull => "air_cipher_null",
             EventKind::ModemSsr => "modem_ssr",
+            EventKind::CellLockBypassed => "cell_lock_bypassed",
         }
     }
 
@@ -127,6 +130,7 @@ impl EventKind {
                 | EventKind::ThermalThrottle
                 | EventKind::AirCipherNull
                 | EventKind::ModemSsr
+                | EventKind::CellLockBypassed
         )
     }
 }

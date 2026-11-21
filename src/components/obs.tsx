@@ -58,6 +58,7 @@ export const EVENT_META: Record<EventType, { label: string; group: EventGroup; i
   sar_backoff: { label: "SAR backoff", group: "radio", icon: Radio },
   air_cipher_null: { label: "Null air cipher", group: "link", icon: ShieldAlert },
   modem_ssr: { label: "Modem SSR", group: "recovery", icon: LifeBuoy },
+  cell_lock_bypassed: { label: "Cell lock deadman", group: "recovery", icon: LifeBuoy },
 };
 
 export const EVENT_GROUPS: Array<{ id: EventGroup; label: string }> = [

@@ -101,6 +101,8 @@ pub struct MetricsInput {
     pub phy: crate::radio_tuning::PhyDiagnostics,
     pub dsp: crate::qmi::dsp::DspTelemetrySnapshot,
     pub tls_cert: crate::acme::ActiveCertInfo,
+    pub cell_lock_active: bool,
+    pub cell_lock_bypassed: bool,
 }
 
 pub fn usage_view(u: &DataUsageState, today: Civil, secs: u32) -> UsageView {
@@ -142,7 +144,15 @@ pub async fn gather(state: &AppState) -> MetricsInput {
     let device_uptime = state.device_uptime.read().await.uptime_seconds;
     let session = state.session_uptime.read().await.clone();
     let session_uptime = (session.is_connected == Some(true)).then_some(session);
-    let quecwatch_enabled = state.settings.read().await.quecwatch_enabled;
+    let (quecwatch_enabled, has_cell_lock) = {
+        let cfg = state.settings.read().await;
+        (
+            cfg.quecwatch_enabled,
+            !cfg.cell_lock_nr5g.is_empty() || !cfg.cell_lock_lte.is_empty(),
+        )
+    };
+    let cell_lock_bypassed = state.cell_lock_bypassed.load(Ordering::Acquire);
+    let cell_lock_active = has_cell_lock && !cell_lock_bypassed;
     let quecwatch = state.quecwatch.read().await.clone();
     let last_speedtest = state.speedtest_history.read().await.iter().max_by_key(|r| r.ts).cloned();
     let usage_state = state.data_usage.read().await.clone();
@@ -220,6 +230,8 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         phy,
         dsp,
         tls_cert,
+        cell_lock_active,
+        cell_lock_bypassed,
     }
 }
 
@@ -560,6 +572,8 @@ pub fn render(m: &MetricsInput) -> String {
         p.sample("quecwatch_state", &[("state", s)], b(s == qs));
     }
     p.gauge("quecwatch_retry", "Current LinkWatch recovery attempt.", f64::from(m.quecwatch.retry));
+    p.gauge("cell_lock_active", "1 when a 4G/5G cell lock is configured and actively engaged.", b(m.cell_lock_active));
+    p.gauge("cell_lock_bypassed", "1 when the dead-man's-switch has temporarily bypassed a configured cell lock.", b(m.cell_lock_bypassed));
     if let Some(st) = m.last_speedtest.as_ref() {
         p.gauge("speedtest_last_timestamp_seconds", "When the last speedtest finished (unix).", (st.ts / if st.ts > 10_000_000_000 { 1000 } else { 1 }) as f64);
         p.gauge("speedtest_last_download_mbps", "Last speedtest download (Mbit/s).", st.download_mbps);
