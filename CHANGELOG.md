@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.1 — Lockout-Proof Dropbear LAN-Only Hardening & RM551E-GL `<ARFCN>:<SCS>` Frequency Steering
+
+- **Lockout-Proof Dropbear SSH LAN-Only Hardening (`hardening.rs`, `main.rs`):**
+  - Fixed the OpenWrt `S11network` → `S19dropbear` `BOOT=1` skip race where setting `dropbear.@dropbear[0].Interface='lan'` could prevent Dropbear from starting on reboot because static `br-lan` fires `interface.up` before `S19dropbear` runs.
+  - Added a post-boot **Dropbear Anti-Lockout Watchdog** (`t+12s` and `t+40s` after `cellcored` boot) that inspects `/proc/net/tcp` + `/proc/net/tcp6` on the configured SSH port; if Dropbear missed startup, it invokes `/etc/init.d/dropbear start` cleanly (without `BOOT=1`) so Dropbear binds strictly to the LAN IP, with automatic rollback to wildcard listening if it still fails to bind.
+  - Hardened `bind_dropbear_lan_only()` (`POST /api/v1/security/harden` / `cellctl security harden dropbear-lan`) with a live LAN-IP pre-check and a post-restart listener verification + automatic rollback if port 22 fails to come back up.
+  - Updated `check_dropbear_lan_only()` to verify both UCI `Interface='lan'` AND live `/proc/net/tcp*` listening state.
+- **RM551E-GL `nr5g_pref_freq_list` & `nr5g_earfcn_lock` `<ARFCN>:<SCS>` Syntax (`radio_tuning.rs`, `RadioTuningCard.tsx`):**
+  - Updated `AT+QNWCFG="nr5g_pref_freq_list"` and `AT+QNWCFG="nr5g_earfcn_lock"` writer & parser to use the real RM551E-GL colon-separated `<count>,<arfcn1>:<scs1>[:<arfcn2>:<scs2>...]` format (e.g. `1,501390:30` or `2,501390:30:521310:30`), with automatic 3GPP default SCS inference (`30` kHz for FR1 TDD, `15` kHz for FR1 FDD, `120` kHz for FR2) when `:scs` is omitted and full backward compatibility for numeric JSON inputs.
+  - Gracefully handles RM551E-GL returning `ERROR` when clearing an already-unlocked `nr5g_earfcn_lock`/`nr5g_pref_freq_list` (`0`) by verifying readback state.
+
 ## 1.3.0 — Dataplane Offloads & IRQ Pinning, Security Posture Hardening & Live Speedtest CA
 
 - **Performance & Dataplane Tuning (`dataplane.rs`, `radio_tuning.rs`, `.cargo/config.toml`):**

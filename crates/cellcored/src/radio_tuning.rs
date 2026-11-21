@@ -132,8 +132,8 @@ pub struct RadioTuningState {
     pub overheat_ind_enabled: Option<bool>,
     pub lte_band_priority: Vec<String>,
     pub nr5g_band_priority: Vec<String>,
-    pub nr5g_pref_freq_list: Vec<u32>,
-    pub nr5g_earfcn_lock: Vec<u32>,
+    pub nr5g_pref_freq_list: Vec<String>,
+    pub nr5g_earfcn_lock: Vec<String>,
     pub event_a3_enabled: Option<bool>,
     pub event_a3_offset: Option<u8>,
     pub sim_slot: Option<u8>,
@@ -162,6 +162,29 @@ pub struct PhyDiagnostics {
     pub sfe_enabled: Option<bool>,
 }
 
+/// Accept either `["501390:30", "521310:30"]`, `["501390"]`, or legacy `[501390]`.
+fn deserialize_opt_arfcn_list<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ArfcnEntry {
+        Str(String),
+        Num(u32),
+    }
+    let opt = Option::<Vec<ArfcnEntry>>::deserialize(de)?;
+    Ok(opt.map(|items| {
+        items
+            .into_iter()
+            .map(|e| match e {
+                ArfcnEntry::Str(s) => s,
+                ArfcnEntry::Num(n) => n.to_string(),
+            })
+            .collect()
+    }))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RadioTuningPatch {
@@ -181,8 +204,10 @@ pub struct RadioTuningPatch {
     pub overheat_ind_enabled: Option<bool>,
     pub lte_band_priority: Option<Vec<String>>,
     pub nr5g_band_priority: Option<Vec<String>>,
-    pub nr5g_pref_freq_list: Option<Vec<u32>>,
-    pub nr5g_earfcn_lock: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
+    pub nr5g_pref_freq_list: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
+    pub nr5g_earfcn_lock: Option<Vec<String>>,
     pub event_a3_enabled: Option<bool>,
     pub event_a3_offset: Option<u8>,
     pub sim_slot: Option<u8>,
@@ -311,19 +336,56 @@ fn parse_band_priority(body: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse `+QNWCFG: "<key>",<count>,<arfcn1>,<arfcn2>,...` (count=0 when unset).
-pub(crate) fn parse_arfcn_list(body: &str, key: &str) -> Vec<u32> {
+/// Default 3GPP NR subcarrier spacing (kHz) when an ARFCN is given without `:scs`.
+pub(crate) fn default_nr_scs_khz(arfcn: u32) -> u16 {
+    if arfcn >= 2_016_667 {
+        120 // FR2 mmWave
+    } else if arfcn >= 499_200 {
+        30 // FR1 mid-band TDD (n41, n48, n77, n78, n79)
+    } else {
+        15 // FR1 FDD low/mid bands (n71, n5, n12, n25, n66, n2)
+    }
+}
+
+/// Parse `+QNWCFG: "<key>",<count>,<arfcn1>:<scs1>[:<arfcn2>:<scs2>...]` (or legacy comma-separated ARFCNs; count=0 when unset).
+pub(crate) fn parse_arfcn_list(body: &str, key: &str) -> Vec<String> {
     let Some(tail) = extract_keyed_tail(body, key) else {
         return Vec::new();
     };
-    let mut toks = tail.split(',').filter_map(|s| s.trim().trim_matches('"').parse::<u32>().ok());
-    let Some(count) = toks.next() else {
+    let mut parts = tail.splitn(2, ',');
+    let Some(count) = parts
+        .next()
+        .and_then(|s| s.trim().trim_matches('"').parse::<usize>().ok())
+    else {
         return Vec::new();
     };
     if count == 0 {
         return Vec::new();
     }
-    toks.take((count as usize).min(32)).filter(|&v| v > 0 && v <= MAX_NR_ARFCN).collect()
+    let Some(rest) = parts.next().map(|s| s.trim().trim_matches('"')) else {
+        return Vec::new();
+    };
+    let limit = count.min(32);
+    if rest.contains(':') {
+        let nums: Vec<u32> = rest
+            .split([':', ','])
+            .filter_map(|s| s.trim().trim_matches('"').parse::<u32>().ok())
+            .collect();
+        let mut out = Vec::new();
+        for &[arfcn, scs] in nums.as_chunks::<2>().0.iter().take(limit) {
+            if arfcn > 0 && arfcn <= MAX_NR_ARFCN && matches!(scs, 15 | 30 | 60 | 120) {
+                out.push(format!("{arfcn}:{scs}"));
+            }
+        }
+        out
+    } else {
+        rest.split(',')
+            .filter_map(|s| s.trim().trim_matches('"').parse::<u32>().ok())
+            .filter(|&v| v > 0 && v <= MAX_NR_ARFCN)
+            .take(limit)
+            .map(|v| format!("{v}:{}", default_nr_scs_khz(v)))
+            .collect()
+    }
 }
 
 /// Parse `+QNWCFG: "event_a3_offset",<enable>,<offset>`.
@@ -731,25 +793,48 @@ pub fn validate_band_priority(list: &[String], label: &str) -> Result<String, St
     }
 }
 
-pub fn validate_arfcn_list(list: &[u32], label: &str) -> Result<String, String> {
+pub fn validate_arfcn_list(list: &[String], label: &str) -> Result<String, String> {
     if list.len() > 32 {
         return Err(format!("{label} accepts at most 32 ARFCNs"));
     }
-    let mut seen: Vec<u32> = Vec::with_capacity(list.len());
-    for &arfcn in list {
+    let mut seen_arfcns: Vec<u32> = Vec::with_capacity(list.len());
+    let mut pairs: Vec<String> = Vec::with_capacity(list.len());
+    for raw in list {
+        let clean = raw.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let (arfcn_s, scs_opt) = match clean.split_once(':') {
+            Some((a, s)) => (a.trim(), Some(s.trim())),
+            None => (clean, None),
+        };
+        let Ok(arfcn) = arfcn_s.parse::<u32>() else {
+            return Err(format!("invalid NR-ARFCN {raw:?} in {label} (expected e.g. 501390:30)"));
+        };
         if arfcn == 0 || arfcn > MAX_NR_ARFCN {
             return Err(format!("ARFCN {arfcn} out of range (1..={MAX_NR_ARFCN}) in {label}"));
         }
-        if seen.contains(&arfcn) {
+        let scs = match scs_opt {
+            Some(s) => match s.parse::<u16>() {
+                Ok(v) if matches!(v, 15 | 30 | 60 | 120) => v,
+                _ => {
+                    return Err(format!(
+                        "invalid SCS {s:?} for ARFCN {arfcn} in {label} (allowed: 15, 30, 60, 120 kHz)"
+                    ));
+                }
+            },
+            None => default_nr_scs_khz(arfcn),
+        };
+        if seen_arfcns.contains(&arfcn) {
             return Err(format!("duplicate ARFCN {arfcn} in {label}"));
         }
-        seen.push(arfcn);
+        seen_arfcns.push(arfcn);
+        pairs.push(format!("{arfcn}:{scs}"));
     }
-    if seen.is_empty() {
+    if pairs.is_empty() {
         Ok("0".into())
     } else {
-        let joined: Vec<String> = seen.iter().map(u32::to_string).collect();
-        Ok(format!("{},{}", seen.len(), joined.join(",")))
+        Ok(format!("{},{}", pairs.len(), pairs.join(":")))
     }
 }
 
@@ -1186,6 +1271,29 @@ pub async fn apply_tuning_patch(
         match app.smd.exec(&cmd, Priority::Interactive, WRITE_TIMEOUT).await {
             Ok(r) if r.ok => applied.push(label),
             Ok(r) => {
+                // RM551E-GL returns ERROR if clearing `nr5g_earfcn_lock` / `nr5g_pref_freq_list`
+                // with `,0` when it is already unset (0). Verify current readback before failing.
+                let already_cleared = if cmd == r#"AT+QNWCFG="nr5g_earfcn_lock",0"# {
+                    app.smd
+                        .exec(r#"AT+QNWCFG="nr5g_earfcn_lock""#, Priority::Interactive, READ_TIMEOUT)
+                        .await
+                        .ok()
+                        .filter(|q| q.ok)
+                        .is_some_and(|q| parse_arfcn_list(&q.body, "nr5g_earfcn_lock").is_empty())
+                } else if cmd == r#"AT+QNWCFG="nr5g_pref_freq_list",0"# {
+                    app.smd
+                        .exec(r#"AT+QNWCFG="nr5g_pref_freq_list""#, Priority::Interactive, READ_TIMEOUT)
+                        .await
+                        .ok()
+                        .filter(|q| q.ok)
+                        .is_some_and(|q| parse_arfcn_list(&q.body, "nr5g_pref_freq_list").is_empty())
+                } else {
+                    false
+                };
+                if already_cleared {
+                    applied.push(label);
+                    continue;
+                }
                 let err_msg = r.body.trim();
                 let detail = if err_msg.is_empty() { "ERROR" } else { err_msg };
                 return Err((
@@ -1282,8 +1390,8 @@ mod tests {
             Some(r#"+QNWCFG: "rrc_state",1,"NR5G",1"#.into()),
             Some(r#"+QNWCFG: "used_algo",1,12,0,0"#.into()),
             Some(r#"+QNWCFG: "c_rnti",1,12,47956"#.into()),
-            Some(r#"+QNWCFG: "nr5g_pref_freq_list",2,521310,632628"#.into()),
-            Some(r#"+QNWCFG: "nr5g_earfcn_lock",0"#.into()),
+            Some(r#"+QNWCFG: "nr5g_pref_freq_list",2,501390:30:632628:30"#.into()),
+            Some(r#"+QNWCFG: "nr5g_earfcn_lock",1,501390:30"#.into()),
             Some(r#"+QNWCFG: "event_a3_offset",0,5"#.into()),
             Some("+QUIMSLOT: 1".into()),
             Some("+QSIMDET: 0,1".into()),
@@ -1306,8 +1414,8 @@ mod tests {
         assert_eq!(tuning.overheat_ind_enabled, Some(true));
         assert_eq!(tuning.lte_band_priority, vec!["66", "2", "41"]);
         assert!(tuning.nr5g_band_priority.is_empty());
-        assert_eq!(tuning.nr5g_pref_freq_list, vec![521310, 632628]);
-        assert!(tuning.nr5g_earfcn_lock.is_empty());
+        assert_eq!(tuning.nr5g_pref_freq_list, vec!["501390:30", "632628:30"]);
+        assert_eq!(tuning.nr5g_earfcn_lock, vec!["501390:30"]);
         assert_eq!(tuning.event_a3_enabled, Some(false));
         assert_eq!(tuning.event_a3_offset, Some(5));
         assert_eq!(tuning.sim_slot, Some(1));
@@ -1372,10 +1480,18 @@ mod tests {
         assert!(validate_band_priority(&["41".into(), "41".into()], "nr5g").is_err());
 
         assert_eq!(validate_arfcn_list(&[], "pref").unwrap(), "0");
-        assert_eq!(validate_arfcn_list(&[521310, 632628], "pref").unwrap(), "2,521310,632628");
-        assert!(validate_arfcn_list(&[0], "pref").is_err());
-        assert!(validate_arfcn_list(&[4_000_000], "pref").is_err());
-        assert!(validate_arfcn_list(&[521310, 521310], "pref").is_err());
+        assert_eq!(
+            validate_arfcn_list(&["501390:30".into(), "632628".into()], "pref").unwrap(),
+            "2,501390:30:632628:30"
+        );
+        assert_eq!(
+            validate_arfcn_list(&["397470".into()], "pref").unwrap(),
+            "1,397470:15"
+        );
+        assert!(validate_arfcn_list(&["0".into()], "pref").is_err());
+        assert!(validate_arfcn_list(&["501390:45".into()], "pref").is_err());
+        assert!(validate_arfcn_list(&["4000000".into()], "pref").is_err());
+        assert!(validate_arfcn_list(&["521310:30".into(), "521310:30".into()], "pref").is_err());
     }
 
     fn socketpair() -> Result<(RawFd, RawFd), String> {
@@ -1501,7 +1617,7 @@ mod tests {
         assert!(cmds.contains(&r#"AT+QNWCFG="lte_cdrx",0,0"#.to_string()), "{cmds:?}");
         assert!(cmds.contains(&r#"AT+QNWCFG="overheat_ind",0"#.to_string()), "{cmds:?}");
         assert!(cmds.contains(&r#"AT+QNWCFG="nr5g_band_priority",41:77"#.to_string()), "{cmds:?}");
-        assert!(cmds.contains(&r#"AT+QNWCFG="nr5g_pref_freq_list",2,521310,632628"#.to_string()), "{cmds:?}");
+        assert!(cmds.contains(&r#"AT+QNWCFG="nr5g_pref_freq_list",2,521310:30:632628:30"#.to_string()), "{cmds:?}");
         assert!(cmds.contains(&r#"AT+QNWCFG="event_a3_offset",1,6"#.to_string()), "{cmds:?}");
         assert!(cmds.contains(&"AT+QUIMSLOT=2".to_string()), "{cmds:?}");
 

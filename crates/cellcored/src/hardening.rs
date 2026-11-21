@@ -81,16 +81,87 @@ fn read_proc_trimmed(path: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Evaluate whether `dropbear` is bound strictly to `lan` (not wildcard 0.0.0.0/::).
+/// Parse `/proc/net/tcp` or `/proc/net/tcp6` and report whether any socket is
+/// in `TCP_LISTEN` (`0A`) on `port`, plus whether it is bound to a wildcard address.
+pub(crate) fn inspect_proc_net_tcp_port(body: &str, port: u16) -> (bool, bool) {
+    let mut listening = false;
+    let mut wildcard = false;
+    for line in body.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let _sl = cols.next();
+        let Some(local) = cols.next() else { continue };
+        let _rem = cols.next();
+        let Some(state) = cols.next() else { continue };
+        if !state.eq_ignore_ascii_case("0A") {
+            continue;
+        }
+        let Some((ip_hex, port_hex)) = local.split_once(':') else {
+            continue;
+        };
+        if u16::from_str_radix(port_hex, 16).ok() == Some(port) {
+            listening = true;
+            if ip_hex.bytes().all(|b| b == b'0') {
+                wildcard = true;
+            }
+        }
+    }
+    (listening, wildcard)
+}
+
+/// Check live `/proc/net/tcp` and `/proc/net/tcp6` for a listening socket on `port`.
+/// Returns `None` if neither proc file can be read.
+pub fn probe_tcp_port_listener(port: u16) -> Option<(bool, bool)> {
+    let mut found_file = false;
+    let mut listening = false;
+    let mut wildcard = false;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(body) = fs::read_to_string(crate::paths::p(path)) {
+            found_file = true;
+            let (l, w) = inspect_proc_net_tcp_port(&body, port);
+            listening |= l;
+            wildcard |= w;
+        }
+    }
+    if found_file {
+        Some((listening, wildcard))
+    } else {
+        None
+    }
+}
+
+pub fn dropbear_configured_port() -> u16 {
+    uci_get_blocking("dropbear.@dropbear[0].Port")
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(22)
+}
+
+/// Evaluate whether `dropbear` is bound strictly to `lan` (not wildcard 0.0.0.0/::)
+/// and verify it is actually listening on its configured SSH port.
 fn check_dropbear_lan_only() -> SecurityCheck {
     let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
+    let port = dropbear_configured_port();
     let bound_lan = iface.trim().eq_ignore_ascii_case("lan");
+    let live = probe_tcp_port_listener(port);
     if bound_lan {
+        if matches!(live, Some((false, _))) {
+            return SecurityCheck {
+                id: "dropbear_lan_only".into(),
+                title: "SSH bound to LAN only".into(),
+                status: "fail".into(),
+                detail: format!(
+                    "Dropbear Interface='lan' is set, but port {port} is NOT listening — click Fix to recover"
+                ),
+                fix_action: Some("dropbear_lan_only".into()),
+            };
+        }
         SecurityCheck {
             id: "dropbear_lan_only".into(),
             title: "SSH bound to LAN only".into(),
             status: "pass".into(),
-            detail: "Dropbear Interface='lan' (never listens on cellular WAN)".into(),
+            detail: format!(
+                "Dropbear Interface='lan' · listening on LAN port {port} (boot anti-lockout watchdog active)"
+            ),
             fix_action: None,
         }
     } else {
@@ -98,7 +169,9 @@ fn check_dropbear_lan_only() -> SecurityCheck {
             id: "dropbear_lan_only".into(),
             title: "SSH bound to LAN only".into(),
             status: "warn".into(),
-            detail: "Dropbear listens on wildcard 0.0.0.0:22 (relying solely on WAN firewall)".into(),
+            detail: format!(
+                "Dropbear listens on wildcard 0.0.0.0:{port} (relying solely on WAN firewall)"
+            ),
             fix_action: Some("dropbear_lan_only".into()),
         }
     }
@@ -388,11 +461,116 @@ pub fn tighten_sensitive_permissions() -> Vec<String> {
     fixed
 }
 
+fn lan_has_live_ip() -> bool {
+    if crate::netlink::get_iface_ipv4("br-lan").is_some() {
+        return true;
+    }
+    run_cmd_blocking_timeout(
+        "ubus",
+        &["call", "network.interface.lan", "status"],
+        Duration::from_secs(2),
+    )
+    .map(|out| out.contains("\"address\""))
+    .unwrap_or(false)
+}
+
+fn wait_for_tcp_port_listening(port: u16, attempts: usize, step: Duration) -> bool {
+    for _ in 0..attempts {
+        if matches!(probe_tcp_port_listener(port), Some((true, _))) {
+            return true;
+        }
+        std::thread::sleep(step);
+    }
+    matches!(probe_tcp_port_listener(port), Some((true, _)))
+}
+
+fn rollback_dropbear_interface() {
+    let _ = run_cmd_blocking_timeout("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
+    let _ = run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3));
+    let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
+}
+
 pub fn bind_dropbear_lan_only() -> Result<String, String> {
+    if !lan_has_live_ip() {
+        return Err(
+            "LAN interface has no active IP address — refusing to bind Dropbear to 'lan' to prevent SSH lockout"
+                .into(),
+        );
+    }
+    let port = dropbear_configured_port();
     run_cmd_blocking_timeout("uci", &["set", "dropbear.@dropbear[0].Interface=lan"], Duration::from_secs(3))?;
     run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3))?;
     let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
-    Ok("Bound Dropbear SSH to Interface='lan' and restarted".into())
+
+    // Verify Dropbear actually came back up on its SSH port; auto-rollback if not.
+    if probe_tcp_port_listener(port).is_some()
+        && !wait_for_tcp_port_listening(port, 10, Duration::from_millis(250))
+    {
+        rollback_dropbear_interface();
+        return Err(format!(
+            "Dropbear failed to listen on port {port} after binding Interface='lan' — automatically rolled back to wildcard listening to prevent SSH lockout"
+        ));
+    }
+    Ok(format!(
+        "Bound Dropbear SSH to Interface='lan' and verified listening on port {port}"
+    ))
+}
+
+/// Reconcile Dropbear after OpenWrt boot.
+///
+/// OpenWrt's `/etc/init.d/dropbear` skips starting when `Interface` is set and
+/// `BOOT=1` (waiting for a hotplug `interface.*` event that already fired when
+/// `S11network` brought up static `br-lan` before `S19dropbear`). Invoking
+/// `/etc/init.d/dropbear start` cleanly after boot starts it bound to `lan`,
+/// with an automatic rollback to wildcard listening if it still fails to bind.
+pub fn reconcile_dropbear_listener() -> Option<String> {
+    if !Path::new(&crate::paths::p("/etc/init.d/dropbear")).exists() {
+        return None;
+    }
+    let enabled = uci_get_blocking("dropbear.@dropbear[0].enable").unwrap_or_default();
+    if enabled.trim() == "0" {
+        return None;
+    }
+    let port = dropbear_configured_port();
+    if !matches!(probe_tcp_port_listener(port), Some((false, _))) {
+        return None;
+    }
+
+    let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
+    let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
+    if wait_for_tcp_port_listening(port, 10, Duration::from_millis(250)) {
+        return Some(format!(
+            "Dropbear was not listening on port {port} after boot (OpenWrt BOOT=1 race); started cleanly (Interface='{}')",
+            iface.trim()
+        ));
+    }
+
+    if !iface.trim().is_empty() {
+        rollback_dropbear_interface();
+        let recovered = wait_for_tcp_port_listening(port, 8, Duration::from_millis(250));
+        return Some(format!(
+            "Dropbear failed to bind Interface='{}' on port {port}; auto-rolled back to wildcard listening (listening={recovered})",
+            iface.trim()
+        ));
+    }
+    Some(format!(
+        "Dropbear not listening on port {port} after boot start attempt"
+    ))
+}
+
+/// Spawn a lightweight post-boot watchdog at t+12s and t+40s so Dropbear pinned
+/// to `Interface='lan'` can never suffer the OpenWrt `S11network -> S19dropbear`
+/// boot-time SSH lockout bug.
+pub fn spawn_dropbear_boot_watchdog(app: AppState) {
+    tokio::spawn(async move {
+        for delay_secs in [12u64, 28u64] {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            if let Ok(Some(msg)) = tokio::task::spawn_blocking(reconcile_dropbear_listener).await {
+                app.push_daemon_log(format!("security: {msg}"));
+                app.audit.event("security", "dropbear-watchdog", msg);
+            }
+        }
+    });
 }
 
 pub fn set_usb_lockdown(lock: bool) -> Result<String, String> {
@@ -606,5 +784,37 @@ mod tests {
     #[test]
     fn validates_unknown_hardening_action() {
         assert!(execute_hardening_action("rm_rf").is_err());
+    }
+
+    #[test]
+    fn inspects_proc_net_tcp_for_dropbear_listener_and_wildcard() {
+        let lan_only = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 01E4A8C0:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1234
+   1: 01E4A8C0:01BB 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1235
+";
+        assert_eq!(inspect_proc_net_tcp_port(lan_only, 22), (true, false));
+        assert_eq!(inspect_proc_net_tcp_port(lan_only, 2222), (false, false));
+
+        let wildcard = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1234
+";
+        assert_eq!(inspect_proc_net_tcp_port(wildcard, 22), (true, true));
+
+        let established_only = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 01E4A8C0:0016 32E4A8C0:C123 01 00000000:00000000 00:00000000 00000000     0        0 1234
+";
+        assert_eq!(inspect_proc_net_tcp_port(established_only, 22), (false, false));
+
+        let sbx = TestSandbox::new("hardening-proc-tcp");
+        let p = sbx.root.join("proc/net/tcp");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, lan_only).unwrap();
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            assert_eq!(probe_tcp_port_listener(22), Some((true, false)));
+            assert_eq!(probe_tcp_port_listener(2222), Some((false, false)));
+        });
     }
 }

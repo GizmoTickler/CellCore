@@ -253,6 +253,7 @@ async fn async_main() {
     vpn::start(&state);
     dataplane::start(&state);
     acme::spawn_renewal_task();
+    hardening::spawn_dropbear_boot_watchdog(state.clone());
     spawn_background_tasks(state.clone(), rf_refresh_rx);
     ipc::spawn_ipc_server(state.clone(), enforce_uhttpd_loopback);
 
@@ -297,7 +298,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.3.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.3.1");
     }
 
     #[test]

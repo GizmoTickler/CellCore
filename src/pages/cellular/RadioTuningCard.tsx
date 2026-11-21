@@ -83,8 +83,8 @@ interface RadioTuningState {
   overheatIndEnabled: boolean | null;
   lteBandPriority: string[];
   nr5gBandPriority: string[];
-  nr5gPrefFreqList: number[];
-  nr5gEarfcnLock: number[];
+  nr5gPrefFreqList: string[];
+  nr5gEarfcnLock: string[];
   eventA3Enabled: boolean | null;
   eventA3Offset: number | null;
   simSlot: number | null;
@@ -162,11 +162,11 @@ function parseBandText(raw: string): string[] {
     .filter(Boolean);
 }
 
-function parseArfcnText(raw: string): number[] {
+function parseArfcnText(raw: string): string[] {
   return raw
-    .split(/[\s,:]+/)
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isInteger(n) && n > 0);
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter((s) => /^\d+(?::(?:15|30|60|120))?$/.test(s));
 }
 
 export function RadioTuningCard() {
@@ -665,20 +665,20 @@ export function RadioTuningCard() {
               </label>
               <label className="qm-subcard p-3.5 min-w-0 block">
                 <div className="text-[13px] font-semibold text-ink">Preferred 5G NR-ARFCN list</div>
-                <div className="text-[12px] text-muted mt-0.5 mb-2">Up to 32 preferred NR-ARFCNs scanned first without hard-locking</div>
+                <div className="text-[12px] text-muted mt-0.5 mb-2">Up to 32 preferred ARFCN:SCS pairs (e.g. 501390:30; SCS auto-defaults if omitted)</div>
                 <Input
                   className="font-mono"
-                  placeholder="521310, 632628"
+                  placeholder="501390:30, 521310:30"
                   value={prefFreqText}
                   onChange={(e) => setPrefFreqText(e.target.value)}
                 />
               </label>
               <label className="qm-subcard p-3.5 min-w-0 block">
                 <div className="text-[13px] font-semibold text-ink">Multi-ARFCN 5G frequency lock</div>
-                <div className="text-[12px] text-muted mt-0.5 mb-2">Restrict 5G NR attach to up to 32 ARFCNs; leave blank to unlock</div>
+                <div className="text-[12px] text-muted mt-0.5 mb-2">Lock PCC attach to ARFCN:SCS pairs (still aggregates SCCs); leave blank to unlock</div>
                 <Input
                   className="font-mono"
-                  placeholder="521310, 509490"
+                  placeholder="501390:30"
                   value={earfcnLockText}
                   onChange={(e) => setEarfcnLockText(e.target.value)}
                 />
