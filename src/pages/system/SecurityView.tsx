@@ -4,6 +4,7 @@ import { cn } from "../../lib/utils";
 import { Button, Card, CardHeader, Input, SegmentedTabs, Switch } from "../../components/ui";
 import type { SystemController } from "./useSystemController";
 import { Field } from "./parts";
+import { AcmeCertCard } from "./AcmeCertCard";
 import { ApiTokensCard } from "./ApiTokensCard";
 import { AuditLogCard } from "./AuditLogCard";
 
@@ -150,6 +151,7 @@ export function SecurityView({ ctl }: { ctl: SystemController }) {
           </Card>
         </div>
       </div>
+      <AcmeCertCard />
       <ApiTokensCard />
       <AuditLogCard />
     </div>

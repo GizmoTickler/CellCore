@@ -11,7 +11,7 @@
 
 **CellCore** replaces legacy shell CGIs, `socat` AT bridges, `websocat` sidecars, and `sms-tool` with a single static `aarch64-unknown-linux-musl` Rust binary (`/usr/sbin/cellcored`) paired with a precompressed (Brotli + Gzip) React 19 + TypeScript + Tailwind CSS v4 SPA:
 
-- **HTTP/2 + TLS Web & API Server (`:443` / `:80` redirect):** Serves the dashboard SPA, `/api/v1/*` REST API, `/api/v1/ws` real-time WebSocket stream, scoped Bearer API tokens, CSRF protection, structured audit log, and optional loopback LuCI reverse proxy.
+- **HTTP/2 + TLS Web & API Server (`:443` / `:80` redirect) + Native ACME:** Serves the dashboard SPA, `/api/v1/*` REST API, `/api/v1/ws` WebSocket stream, scoped Bearer API tokens, CSRF protection, structured audit log, automatic ECDSA P-256 self-signed bootstrap cert, and built-in **RFC 8555 ACME** (**Let's Encrypt**, **ZeroSSL**, **Google Public CA**, Custom CA; **HTTP-01** + **9 native DNS-01 providers** incl. Cloudflare, Route 53, DigitalOcean, Hetzner, Porkbun, DuckDNS, deSEC, RFC 2136 TSIG, Webhook) with zero-downtime TLS hot-reload.
 - **Interactive AT Actor (`/dev/smd11`):** Serialized AT command multiplexer with priority preemption, latency histograms, health tracking, and automatic recovery.
 - **Native Rust Data Plane (`docs/DATAPLANE.md`):**
   - `coexist` mode observes QRTR (`AF_QIPCRTR`) QMI services (`DMS`, `NAS`, `UIM`, `WDA`, `WDS`) and `RTNETLINK` alongside the vendor connection manager.

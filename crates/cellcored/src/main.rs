@@ -1,3 +1,4 @@
+mod acme;
 mod admin;
 mod appbackup;
 mod atguard;
@@ -237,6 +238,7 @@ async fn async_main() {
     obs::start(&state);
     vpn::start(&state);
     dataplane::start(&state);
+    acme::spawn_renewal_task();
     spawn_background_tasks(state.clone(), rf_refresh_rx);
     ipc::spawn_ipc_server(state.clone(), enforce_uhttpd_loopback);
 
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.0");
     }
 
     #[test]

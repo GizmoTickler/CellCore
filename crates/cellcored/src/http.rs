@@ -138,10 +138,12 @@ pub async fn serve_http_and_https(
                 let _permit = permit;
                 let redir = st.settings.read().await.https_redirect;
                 if redir {
-                    let redirect_svc = Router::new().fallback(move |req: Request| {
-                        let fb = Arc::clone(&fb);
-                        async move { http_redirect_handler(req, &fb).await }
-                    });
+                    let redirect_svc = Router::new()
+                        .route("/.well-known/acme-challenge/{token}", get(acme_http01_handler))
+                        .fallback(move |req: Request| {
+                            let fb = Arc::clone(&fb);
+                            async move { http_redirect_handler(req, &fb).await }
+                        });
                     serve_connection_with(stream, redirect_svc, peer, limits, false).await;
                 } else {
                     serve_connection_with(stream, r_fb, peer, limits, false).await;
@@ -286,6 +288,18 @@ where
     }
 }
 
+async fn acme_http01_handler(axum::extract::Path(token): axum::extract::Path<String>) -> Response {
+    match crate::acme::lookup_http01_token(&token).await {
+        Some(key_auth) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            key_auth,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn http_redirect_handler(req: Request, fallback_host: &str) -> Response {
     let host = req
         .headers()
@@ -355,6 +369,8 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/system/reboot", post(handlers::post_reboot))
         .route("/api/v1/system/ota", get(handlers::get_ota).post(handlers::post_ota))
         .route("/api/v1/system/settings", get(handlers::get_settings).post(handlers::post_settings))
+        .route("/api/v1/system/acme", get(crate::acme::get_acme).put(crate::acme::put_acme))
+        .route("/api/v1/system/acme/issue", post(crate::acme::post_acme_issue))
         .route("/api/v1/system/password", post(handlers::post_change_password))
         .route("/api/v1/auth/logout", post(handlers::post_logout))
         .merge(crate::admin::routes())
@@ -371,6 +387,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route_layer(middleware::from_fn_with_state(ctx.clone(), auth_middleware));
 
     let public = Router::new()
+        .route("/.well-known/acme-challenge/{token}", get(acme_http01_handler))
         .route("/api/v1/auth/status", get(handlers::get_auth_status))
         .route(
             "/api/v1/auth/login",
