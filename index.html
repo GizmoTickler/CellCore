@@ -6,18 +6,7 @@
     <title>CellCore</title>
     <meta name="theme-color" content="#fbf3e8" />
     <link rel="icon" type="image/svg+xml" href="./login-logo.svg" />
-    <script>
-      document.documentElement.setAttribute("data-skin", "midnight");
-      (function () {
-        try {
-          var s = localStorage.getItem("qm-skin") || "midnight";
-          document.documentElement.setAttribute("data-skin", s);
-          var t = localStorage.getItem("qm-theme-v32") || "light";
-          if (t === "dark") document.documentElement.classList.add("dark");
-          else document.documentElement.classList.remove("dark");
-        } catch (e) {}
-      })();
-    </script>
+    <script src="./theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>
