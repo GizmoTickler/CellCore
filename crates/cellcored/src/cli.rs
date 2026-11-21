@@ -416,6 +416,7 @@ pub fn run_cellctl(args: &[String]) -> i32 {
             println!("cellcored {} (RM551E-GL SDX75)", env!("CARGO_PKG_VERSION"));
             0
         }
+        "overlay" => crate::overlay::run_cli(&args[1..]),
         "reconcile" => {
             if let Ok(resp) = call_daemon_sync(&IpcRequest::Reconcile)
                 && resp.ok

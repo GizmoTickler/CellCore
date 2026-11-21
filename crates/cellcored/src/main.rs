@@ -11,6 +11,7 @@ mod ipc;
 mod netlink;
 mod obs;
 mod ota;
+mod overlay;
 mod parsers;
 mod paths;
 mod profiles;
@@ -117,6 +118,10 @@ fn main() {
         }
         Some("verify" | "upgrade") => {
             let code = cli::run_cellctl(&args[1..]);
+            process::exit(code);
+        }
+        Some("overlay") => {
+            let code = overlay::run_cli(&args[2..]);
             process::exit(code);
         }
         Some("reconcile") => {

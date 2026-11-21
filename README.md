@@ -28,6 +28,20 @@
 
 ## Quick Install (SDX75 / SDXPINN)
 
+### Brand-New Out-of-the-Box Modem (Clean-Room Reversible Bootstrap)
+```bash
+# Dry-run preflight first (no changes written)
+./bootstrap.sh --adb --dry-run
+
+# Full bootstrap over USB ADB (installs reversible Rust overlay, SSH key, signed feed & CellCore)
+./bootstrap.sh --adb --ssh-key ~/.ssh/id_ed25519.pub
+
+# 1-command reversible rollback back to stock factory rootfs
+./bootstrap.sh --adb --revert --purge
+```
+See **[`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md)** for complete out-of-the-box instructions, offline `--ipk` installs, and rollback details.
+
+### Modem With Existing Writable Overlay
 ```sh
 curl -fsSL https://raw.githubusercontent.com/GizmoTickler/CellCore/main/install.sh | sh
 ```
