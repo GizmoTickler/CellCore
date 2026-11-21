@@ -1,0 +1,14 @@
+system.cfg01e48a=system
+system.cfg01e48a.hostname='gateway-test'
+system.cfg01e48a.timezone='EST5EDT,M3.2.0,M11.1.0'
+system.cfg01e48a.ttylogin='0'
+system.cfg01e48a.log_size='64'
+system.cfg01e48a.urandom_seed='0'
+system.cfg01e48a.zonename='America/New York'
+system.ntp=timeserver
+system.ntp.enabled='1'
+system.ntp.enable_server='0'
+system.ntp.server='0.openwrt.pool.ntp.org' '1.openwrt.pool.ntp.org' '2.openwrt.pool.ntp.org' '3.openwrt.pool.ntp.org'
+system.cfg037450=rngd
+system.cfg037450.enabled='0'
+system.cfg037450.device='/dev/urandom'

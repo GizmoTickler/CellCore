@@ -1,0 +1,42 @@
+{
+  "Version": "1.104.7-tc8a9b7f00-g1234567",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"],
+  "Self": {
+    "ID": "n1",
+    "HostName": "mgateway1",
+    "DNSName": "mgateway1.tail1234.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"],
+    "Online": true,
+    "Active": false,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "LastSeen": "0001-01-01T00:00:00Z"
+  },
+  "Health": ["Some peers are advertising routes but --accept-routes is false"],
+  "MagicDNSSuffix": "tail1234.ts.net",
+  "CurrentTailnet": { "Name": "example.github", "MagicDNSSuffix": "tail1234.ts.net", "MagicDNSEnabled": true },
+  "Peer": {
+    "nodekey:aa": {
+      "HostName": "nas01", "DNSName": "nas01.tail1234.ts.net.", "OS": "linux",
+      "TailscaleIPs": ["100.64.0.7"], "Online": true, "Active": true, "ExitNode": false, "ExitNodeOption": true,
+      "RxBytes": 1200, "TxBytes": 3400, "LastSeen": "0001-01-01T00:00:00Z"
+    },
+    "nodekey:bb": {
+      "HostName": "phone", "DNSName": "phone.tail1234.ts.net.", "OS": "iOS",
+      "TailscaleIPs": ["100.64.0.9"], "Online": false, "Active": false, "ExitNode": false, "ExitNodeOption": false,
+      "RxBytes": 0, "TxBytes": 0, "LastSeen": "2026-11-17T21:04:11Z"
+    },
+    "nodekey:cc": {
+      "HostName": "laptop", "DNSName": "laptop.tail1234.ts.net.", "OS": "macOS",
+      "TailscaleIPs": ["100.64.0.8"], "Online": true, "Active": false, "ExitNode": false, "ExitNodeOption": false,
+      "RxBytes": 10, "TxBytes": 20, "LastSeen": "0001-01-01T00:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,66 @@
+name: CI & Release Build
+
+on:
+  push:
+    branches: ["integ/*", "main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust Check, Test & aarch64-musl Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain & musl target
+        run: |
+          set -euo pipefail
+          rustup component add clippy
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build aarch64-unknown-linux-musl release
+        run: cargo build --release --target aarch64-unknown-linux-musl --locked
+
+      - name: Upload daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: quecmanagerd-aarch64-musl
+          path: target/aarch64-unknown-linux-musl/release/quecmanagerd
+          if-no-files-found: error
+
+  frontend:
+    name: TypeScript & Vite Dist Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install & Build
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: quecmanager-dist
+          path: dist/
+          if-no-files-found: error

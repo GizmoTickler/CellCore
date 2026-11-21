@@ -1,0 +1,33 @@
+2026/11/18 10:02:11 Using config file: /etc/cellcore/vpn/wgcf-account.toml
+2026/11/18 10:02:12 Printing account details:
+
+================================================================
+Account
+================================================================
+Id           : 7c1d4b0e-3f2a-4e55-b1c2-9a8d7e6f5a40
+Account type : limited
+Premium data : 24 GB
+Quota        : 24 GB
+Role         : child
+
+================================================================
+Devices
+================================================================
+Id        : 0f2b6e1c-7a0e-4f0e-9a7e-2d6c8b1e5a11 (current)
+Type      : Android
+Model     : PC
+Name      : 5F3A21
+Active    : true
+Created   : 2026-11-18T10:01:58.123456Z
+Activated : 2026-11-18T10:02:03.654321Z
+Role      : child
+
+Id        : 9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4
+Type      : Android
+Model     : Pixel 9
+Name      : Pixel
+Active    : false
+Created   : 2025-02-01T08:00:00Z
+Activated : 2025-02-01T08:00:01Z
+Role      : parent
+

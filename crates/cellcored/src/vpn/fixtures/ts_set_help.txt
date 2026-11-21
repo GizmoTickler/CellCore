@@ -1,0 +1,38 @@
+USAGE
+  tailscale set [flags]
+
+"tailscale set" allows changing specific preferences.
+
+Unlike "tailscale up", this command does not require the complete set of desired settings.
+
+Only settings explicitly mentioned will be set. There are no default values.
+
+FLAGS
+  --accept-routes, --accept-routes=false
+    	accept routes advertised by other Tailscale nodes (default false)
+  --advertise-connector, --advertise-connector=false
+    	offer to be an app connector for domain specific internet traffic for the tailnet (default false)
+  --advertise-exit-node, --advertise-exit-node=false
+    	offer to be an exit node for internet traffic for the tailnet (default false)
+  --advertise-routes string
+    	routes to advertise to other nodes (comma-separated, e.g. "10.0.0.0/8,192.168.0.0/24") or empty string to not advertise routes
+  --auto-update, --auto-update=false
+    	automatically update to the latest available version
+  --exit-node string
+    	Tailscale exit node (IP, base name, or auto:any) for internet traffic, or empty string to not use an exit node
+  --exit-node-allow-lan-access, --exit-node-allow-lan-access=false
+    	Allow direct access to the local network when routing traffic via an exit node (default false)
+  --hostname string
+    	hostname to use instead of the one provided by the OS
+  --nickname string
+    	nickname for the current account
+  --relay-server-port string
+    	UDP port number (0 will pick a random unused port) for the relay server to bind to, on all interfaces, or empty string to disable relay server functionality
+  --shields-up, --shields-up=false
+    	don't allow incoming connections (default false)
+  --snat-subnet-routes, --snat-subnet-routes=true
+    	source NAT traffic to local routes advertised with --advertise-routes (default true)
+  --ssh, --ssh=false
+    	run an SSH server, permitting access per tailnet admin's declared policy (default false)
+  --stateful-filtering, --stateful-filtering=false
+    	apply stateful filtering to forwarded packets (subnet routers, exit nodes, etc.) (default false)

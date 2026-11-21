@@ -1,0 +1,197 @@
+{
+	"interfaces": {
+		"waneth": {
+			"age": 0,
+			"online": 0,
+			"offline": 0,
+			"uptime": 0,
+			"score": 0,
+			"lost": 0,
+			"turn": 0,
+			"status": "notracking",
+			"enabled": false,
+			"running": false,
+			"up": false,
+			"track_ip": [
+				
+			]
+		},
+		"waneth_v6": {
+			"age": 0,
+			"online": 0,
+			"offline": 0,
+			"uptime": 0,
+			"score": 0,
+			"lost": 0,
+			"turn": 0,
+			"status": "notracking",
+			"enabled": false,
+			"running": false,
+			"up": false,
+			"track_ip": [
+				
+			]
+		},
+		"wanusb": {
+			"age": 0,
+			"online": 0,
+			"offline": 0,
+			"uptime": 0,
+			"score": 0,
+			"lost": 0,
+			"turn": 0,
+			"status": "notracking",
+			"enabled": false,
+			"running": false,
+			"up": false,
+			"track_ip": [
+				
+			]
+		},
+		"wanusb_v6": {
+			"age": 0,
+			"online": 0,
+			"offline": 0,
+			"uptime": 0,
+			"score": 0,
+			"lost": 0,
+			"turn": 0,
+			"status": "notracking",
+			"enabled": false,
+			"running": false,
+			"up": false,
+			"track_ip": [
+				
+			]
+		},
+		"wan": {
+			"age": 7,
+			"online": 40694,
+			"offline": 0,
+			"uptime": 40697,
+			"score": 10,
+			"lost": 0,
+			"turn": 4061,
+			"status": "online",
+			"enabled": true,
+			"running": true,
+			"up": true,
+			"track_ip": [
+				{
+					"ip": "208.67.220.220",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "208.67.222.222",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "8.8.4.4",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "8.8.8.8",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				}
+			]
+		},
+		"wan_v6": {
+			"age": 4,
+			"online": 40692,
+			"offline": 0,
+			"uptime": 40696,
+			"score": 10,
+			"lost": 0,
+			"turn": 4061,
+			"status": "online",
+			"enabled": true,
+			"running": true,
+			"up": true,
+			"track_ip": [
+				{
+					"ip": "2001:4860:4860::8844",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "2001:4860:4860::8888",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "2620:0:ccc::2",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				},
+				{
+					"ip": "2620:0:ccd::2",
+					"status": "skipped",
+					"latency": 0,
+					"packetloss": 0
+				}
+			]
+		}
+	},
+	"connected": {
+		"ipv4": [
+			"192.168.227.255",
+			"169.254.21.255",
+			"169.254.22.0/24",
+			"224.0.0.0/3",
+			"127.0.0.1",
+			"169.254.21.1",
+			"192.0.0.31",
+			"192.0.0.30",
+			"169.254.22.1",
+			"169.254.21.0/24",
+			"192.0.0.2",
+			"192.168.224.0/22",
+			"127.0.0.0/8",
+			"192.168.224.1",
+			"127.255.255.255",
+			"169.254.22.255",
+			"192.0.0.0/27"
+		],
+		"ipv6": [
+			"fe80::/64",
+			"fd00:976a::10",
+			"fd00:976a::9",
+			"2001:db8:1600:2468::/64"
+		]
+	},
+	"policies": {
+		"ipv4": {
+			"backhaul_pref": [
+				{
+					"interface": "wan",
+					"percent": 100
+				}
+			],
+			"backhaul_pref6": [
+				
+			]
+		},
+		"ipv6": {
+			"backhaul_pref": [
+				
+			],
+			"backhaul_pref6": [
+				{
+					"interface": "wan_v6",
+					"percent": 100
+				}
+			]
+		}
+	}
+}

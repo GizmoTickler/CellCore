@@ -1,0 +1,29 @@
+2001:db8:1600:2468::/64 dev br-lan table 6 proto kernel metric 256 pref medium
+fd00:976a::9 dev rmnet_data1 table 6 proto static metric 1024 pref medium
+fd00:976a::10 dev rmnet_data1 table 6 proto static metric 1024 pref medium
+fe80::/64 dev rmnet_data1 table 6 proto kernel metric 256 pref medium
+default via fe80::1 dev rmnet_data1 table 6 proto static metric 1024 mtu lock 1500 pref medium
+fd00:976a::9 dev rmnet_data1 table 301 proto static metric 1024 pref medium
+fd00:976a::10 dev rmnet_data1 table 301 proto static metric 1024 pref medium
+default dev rmnet_data1 table 301 proto static metric 1024 pref medium
+2001:db8:1600:2468::/64 dev br-lan proto kernel metric 256 pref medium
+fd00:976a::9 dev rmnet_data1 proto static metric 1024 pref medium
+fd00:976a::10 dev rmnet_data1 proto static metric 1024 pref medium
+fe80::/64 dev eth0 proto kernel metric 256 pref medium
+fe80::/64 dev br-lan proto kernel metric 256 pref medium
+fe80::/64 dev rmnet_data1 proto kernel metric 256 pref medium
+default via fe80::1 dev rmnet_data1 proto static metric 1024 mtu lock 1500 pref medium
+local ::1 dev lo table local proto kernel metric 0 pref medium
+anycast 2001:db8:1600:2468:: dev rmnet_data1 table local proto kernel metric 0 pref medium
+anycast 2001:db8:1600:2468:: dev br-lan table local proto kernel metric 0 pref medium
+local 2001:db8:1600:2468::1 dev br-lan table local proto kernel metric 0 pref medium
+local 2001:db8:1600:2468:60a8:dbd0:c524:195a dev rmnet_data1 table local proto kernel metric 0 pref medium
+anycast fe80:: dev br-lan table local proto kernel metric 0 pref medium
+anycast fe80:: dev eth0 table local proto kernel metric 0 pref medium
+anycast fe80:: dev rmnet_data1 table local proto kernel metric 0 pref medium
+local fe80::200:ff:fe00:a1 dev rmnet_data1 table local proto kernel metric 0 pref medium
+local fe80::200:ff:fe00:b2 dev br-lan table local proto kernel metric 0 pref medium
+local fe80::200:ff:fe00:b2 dev eth0 table local proto kernel metric 0 pref medium
+multicast ff00::/8 dev eth0 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev br-lan table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev rmnet_data1 table local proto kernel metric 256 pref medium

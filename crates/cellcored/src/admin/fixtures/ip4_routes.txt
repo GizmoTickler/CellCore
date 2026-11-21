@@ -1,0 +1,26 @@
+default via 192.0.0.1 dev rmnet_data1 table 5 proto static src 192.0.0.2 metric 256 mtu lock 1472 
+169.254.21.0/24 dev ecm0 table 5 proto kernel scope link src 169.254.21.1 linkdown 
+169.254.22.0/24 dev eth0 table 5 proto kernel scope link src 169.254.22.1 
+192.0.0.0/27 dev rmnet_data1 table 5 proto kernel scope link src 192.0.0.2 
+192.0.0.30 dev rmnet_data1 table 5 proto static scope link 
+192.168.224.0/22 dev br-lan table 5 proto kernel scope link src 192.168.224.1 
+default dev rmnet_data1 table 301 proto static scope link 
+192.0.0.30 dev rmnet_data1 table 301 proto static scope link 
+192.168.224.0/22 dev br-lan table 301 proto static scope link 
+default via 192.0.0.1 dev rmnet_data1 proto static src 192.0.0.2 metric 256 mtu lock 1472 
+169.254.21.0/24 dev ecm0 proto kernel scope link src 169.254.21.1 linkdown 
+169.254.22.0/24 dev eth0 proto kernel scope link src 169.254.22.1 
+192.0.0.0/27 dev rmnet_data1 proto kernel scope link src 192.0.0.2 
+192.0.0.30 dev rmnet_data1 proto static scope link 
+192.168.224.0/22 dev br-lan proto kernel scope link src 192.168.224.1 
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+local 169.254.21.1 dev ecm0 table local proto kernel scope host src 169.254.21.1 
+broadcast 169.254.21.255 dev ecm0 table local proto kernel scope link src 169.254.21.1 linkdown 
+local 169.254.22.1 dev eth0 table local proto kernel scope host src 169.254.22.1 
+broadcast 169.254.22.255 dev eth0 table local proto kernel scope link src 169.254.22.1 
+local 192.0.0.2 dev rmnet_data1 table local proto kernel scope host src 192.0.0.2 
+broadcast 192.0.0.31 dev rmnet_data1 table local proto kernel scope link src 192.0.0.2 
+local 192.168.224.1 dev br-lan table local proto kernel scope host src 192.168.224.1 
+broadcast 192.168.227.255 dev br-lan table local proto kernel scope link src 192.168.224.1 

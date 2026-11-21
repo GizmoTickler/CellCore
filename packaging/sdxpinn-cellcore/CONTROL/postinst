@@ -1,0 +1,51 @@
+#!/bin/ash
+
+# Preserve stock LuCI index.html fallback only if still missing, then install Vite SPA as /www/index.html
+[ -f /www/index.html.old ] || [ ! -f /www/index.html ] || grep -qiE 'cellcore|quecmanager' /www/index.html 2>/dev/null || cp -p /www/index.html /www/index.html.old 2>/dev/null || true
+[ -f /www/login.html ] && cp -f /www/login.html /www/index.html
+
+# Purge legacy CGI scripts, v2.x/v3.x caches, and websocat artifacts
+rm -rf /www/_next /www/dashboard /www/experimental /www/legal /www/login /www/404 /www/utils \
+       /www/404.html /www/index.txt /www/rm551e.png \
+       /www/cgi-bin/quecmanager /www/cgi-bin/services /www/signal_graphs
+
+mkdir -p /etc/cellcore /tmp/cellcore/signal_graphs /var/run
+chmod 755 /tmp/cellcore/signal_graphs 2>/dev/null || true
+
+# Zero-loss migration from legacy QuecManager (/etc/quecmanager -> /etc/cellcore)
+if [ -d /etc/quecmanager ]; then
+    for item in /etc/quecmanager/*; do
+        [ -e "$item" ] || continue
+        base=$(basename "$item")
+        if [ ! -e "/etc/cellcore/$base" ]; then
+            cp -a "$item" "/etc/cellcore/$base" 2>/dev/null || true
+        fi
+    done
+fi
+
+if [ -f /etc/config/quecmanager ] && [ ! -f /etc/config/cellcore ]; then
+    cp -p /etc/config/quecmanager /etc/config/cellcore 2>/dev/null || true
+fi
+if [ -f /etc/config/quecprofiles ] && [ ! -f /etc/config/cellprofiles ]; then
+    cp -p /etc/config/quecprofiles /etc/config/cellprofiles 2>/dev/null || true
+fi
+if [ -f /etc/quecmanager_alert_recipient ] && [ ! -f /etc/cellcore_alert_recipient ]; then
+    cp -p /etc/quecmanager_alert_recipient /etc/cellcore_alert_recipient 2>/dev/null || true
+fi
+
+[ -f /etc/config/cellcore ] || touch /etc/config/cellcore
+[ -f /etc/config/cellprofiles ] || touch /etc/config/cellprofiles
+
+# Disable legacy quecmanagerd init script if still present
+if [ -x /etc/init.d/quecmanagerd ]; then
+    /etc/init.d/quecmanagerd stop 2>/dev/null || true
+    /etc/init.d/quecmanagerd disable 2>/dev/null || true
+fi
+
+# Enable and restart cellcored (reconciles system, binds :443/:80, enforces uhttpd 127.0.0.1:8080)
+if [ -x /etc/init.d/cellcored ]; then
+    /etc/init.d/cellcored enable 2>/dev/null || true
+    /etc/init.d/cellcored restart 2>/dev/null || /etc/init.d/cellcored start 2>/dev/null || true
+fi
+
+exit 0

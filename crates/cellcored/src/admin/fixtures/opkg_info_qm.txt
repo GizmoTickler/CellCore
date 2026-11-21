@@ -1,0 +1,23 @@
+Package: sdxpinn-cellcore
+Version: 4.1.0-1
+Depends: libc, uci, ubus, uhttpd, ookla-speedtest, msmtp, ca-bundle, ca-certificates
+Replaces: sdxpinn-patch, socat-at-bridge, sdxpinn-console-menu
+Conflicts: sdxpinn-cellcore, sdxpinn-console-menu
+Status: install user installed
+Section: admin
+Architecture: sdxpinn
+Maintainer: example
+MD5Sum: d09c8ef88590fa6168971dfc2ab94ede
+Size: 2027357
+Filename: sdxpinn-cellcore_4.1.0-1_sdxpinn.ipk
+Source: github.com/GizmoTickler/CellCore-JS
+Description: Rust-powered local appliance daemon (cellcored) and React 19 UI with switchable themes for Quectel RM55x SDX75 gateways
+Installed-Time: 1795008625
+
+Package: sdxpinn-cellcore
+Version: 3.0.0
+Depends: sdxpinn-patch (>= 3.4), libc, inotifywait, coreutils-timeout, uhttpd, sms-tool (>= 2025.1.19-APmod-iamromulan), jq, ookla-speedtest, websocat, msmtp, ca-bundle, ca-certificates, openssl-util
+Conflicts: sdxpinn-cellcore
+Status: install prefer,user not-installed
+Architecture: sdxpinn
+

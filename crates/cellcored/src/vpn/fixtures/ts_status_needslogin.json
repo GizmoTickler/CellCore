@@ -1,0 +1,10 @@
+{
+  "Version": "1.104.7-tc8a9b7f00",
+  "BackendState": "NeedsLogin",
+  "AuthURL": "https://login.tailscale.com/a/1a2b3c4d5e6f",
+  "TailscaleIPs": null,
+  "Self": { "HostName": "mgateway1", "DNSName": "", "OS": "linux", "TailscaleIPs": null, "Online": false },
+  "Health": ["You are logged out."],
+  "CurrentTailnet": null,
+  "Peer": null
+}

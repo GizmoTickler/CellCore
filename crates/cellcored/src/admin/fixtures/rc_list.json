@@ -1,0 +1,630 @@
+{
+	"log": {
+		"start": 12,
+		"stop": 89,
+		"enabled": true,
+		"running": true
+	},
+	"ql-remotefs-daemon.init": {
+		"start": 20,
+		"stop": 90,
+		"enabled": true,
+		"running": true
+	},
+	"r8125_ioss.init": {
+		"start": 91,
+		"stop": 97,
+		"enabled": true
+	},
+	"ql-nw-service.init": {
+		"start": 99,
+		"stop": 93,
+		"enabled": true
+	},
+	"r8168.init": {
+		"start": 40,
+		"stop": 50,
+		"enabled": true
+	},
+	"rmtstorage.init": {
+		"start": 12,
+		"stop": 87,
+		"enabled": true,
+		"running": false
+	},
+	"quectel-daemon.init": {
+		"start": 16,
+		"stop": 90,
+		"enabled": true,
+		"running": true
+	},
+	"cron": {
+		"start": 50,
+		"enabled": true,
+		"running": true
+	},
+	"init_audio.init": {
+		"start": 29,
+		"stop": 70,
+		"enabled": false
+	},
+	"msdc": {
+		"start": 95,
+		"stop": 1,
+		"enabled": false,
+		"running": false
+	},
+	"rngd": {
+		"start": 0,
+		"enabled": true,
+		"running": false
+	},
+	"rpcd": {
+		"start": 12,
+		"enabled": true,
+		"running": true
+	},
+	"tlpd": {
+		"start": 72,
+		"stop": 70,
+		"enabled": true,
+		"running": true
+	},
+	"sysntpd": {
+		"start": 98,
+		"enabled": true,
+		"running": false
+	},
+	"qwesd.init": {
+		"start": 0,
+		"enabled": false,
+		"running": true
+	},
+	"sysstat": {
+		"start": 90,
+		"stop": 10,
+		"enabled": true,
+		"running": false
+	},
+	"netmgrd": {
+		"start": 22,
+		"stop": 77,
+		"enabled": true,
+		"running": true
+	},
+	"qdss_config.init": {
+		"start": 98,
+		"stop": 1,
+		"enabled": true,
+		"running": false
+	},
+	"network": {
+		"start": 11,
+		"stop": 88,
+		"enabled": true,
+		"running": true
+	},
+	"rpmb.init": {
+		"start": 2,
+		"enabled": true
+	},
+	"time_serviced.init": {
+		"start": 0,
+		"stop": 90,
+		"enabled": false,
+		"running": true
+	},
+	"QCMAP_ConnectionManagerd.init": {
+		"start": 10,
+		"stop": 89,
+		"enabled": true,
+		"running": true
+	},
+	"ipa_fws_le": {
+		"enabled": false
+	},
+	"ipacmdiag.init": {
+		"start": 11,
+		"stop": 88,
+		"enabled": true,
+		"running": true
+	},
+	"subsystem-ramdump.init": {
+		"start": 98,
+		"stop": 99,
+		"enabled": true,
+		"running": true
+	},
+	"pcie-diag.init": {
+		"start": 10,
+		"stop": 89,
+		"enabled": true,
+		"running": false
+	},
+	"ucitrack": {
+		"start": 80,
+		"enabled": true,
+		"running": false
+	},
+	"r8152.init": {
+		"start": 40,
+		"stop": 50,
+		"enabled": true
+	},
+	"mount-fix": {
+		"start": 3,
+		"enabled": true
+	},
+	"openssl": {
+		"start": 13,
+		"enabled": true
+	},
+	"dropbear": {
+		"start": 19,
+		"stop": 50,
+		"enabled": true,
+		"running": true
+	},
+	"quectel-voice-server.init": {
+		"start": 15,
+		"stop": 95,
+		"enabled": false,
+		"running": false
+	},
+	"dataipa.init": {
+		"start": 3,
+		"stop": 96,
+		"enabled": true
+	},
+	"qseecomd.init": {
+		"start": 0,
+		"enabled": false,
+		"running": true
+	},
+	"avahi-daemon": {
+		"start": 61,
+		"enabled": false,
+		"running": false
+	},
+	"mka-supplicant.init": {
+		"enabled": false,
+		"running": false
+	},
+	"leproperties.init": {
+		"start": 10,
+		"stop": 89,
+		"enabled": true,
+		"running": true
+	},
+	"create-firmwarelinks-ab.init": {
+		"start": 3,
+		"stop": 96,
+		"enabled": true
+	},
+	"reboot-daemon.init": {
+		"enabled": false
+	},
+	"cellular_device_manager.init": {
+		"start": 35,
+		"stop": 89,
+		"enabled": true,
+		"running": true
+	},
+	"qce50.init": {
+		"start": 4,
+		"stop": 95,
+		"enabled": true,
+		"running": false
+	},
+	"create_qwes_ipc": {
+		"enabled": false
+	},
+	"agm_server.init": {
+		"start": 34,
+		"stop": 65,
+		"enabled": false,
+		"running": false
+	},
+	"emergencyalert_daemon": {
+		"start": 99,
+		"stop": 1,
+		"enabled": false,
+		"running": false
+	},
+	"postboot.init": {
+		"enabled": false
+	},
+	"ab-updater.init": {
+		"start": 97,
+		"stop": 2,
+		"enabled": true,
+		"running": false
+	},
+	"smcinvoke.init": {
+		"start": 6,
+		"stop": 93,
+		"enabled": true,
+		"running": false
+	},
+	"qcedev.init": {
+		"start": 7,
+		"stop": 92,
+		"enabled": true,
+		"running": false
+	},
+	"smem-mailbox.init": {
+		"start": 3,
+		"stop": 96,
+		"enabled": true
+	},
+	"cellcored": {
+		"start": 14,
+		"stop": 85,
+		"enabled": true,
+		"running": true
+	},
+	"tftp-server.init": {
+		"start": 3,
+		"stop": 96,
+		"enabled": true,
+		"running": true
+	},
+	"location-hal-daemon.init": {
+		"start": 77,
+		"stop": 72,
+		"enabled": true,
+		"running": true
+	},
+	"mount-fix-final": {
+		"start": 13,
+		"enabled": true
+	},
+	"thermal-eth-netlink.init": {
+		"start": 95,
+		"stop": 93,
+		"enabled": true,
+		"running": true
+	},
+	"odhcpd": {
+		"start": 21,
+		"stop": 78,
+		"enabled": true,
+		"running": true
+	},
+	"datarmnet-ext.init": {
+		"start": 31,
+		"stop": 68,
+		"enabled": true,
+		"running": false
+	},
+	"qrng.init": {
+		"start": 5,
+		"stop": 94,
+		"enabled": true,
+		"running": false
+	},
+	"start_quectel_slic_daemon": {
+		"enabled": false
+	},
+	"csd_server.init": {
+		"start": 30,
+		"stop": 69,
+		"enabled": false
+	},
+	"port-bridged": {
+		"start": 10,
+		"stop": 88,
+		"enabled": true
+	},
+	"diag-router.init": {
+		"start": 5,
+		"stop": 94,
+		"enabled": true,
+		"running": false
+	},
+	"msdc_daemon": {
+		"start": 99,
+		"stop": 1,
+		"enabled": false,
+		"running": false
+	},
+	"ipacm.init": {
+		"start": 11,
+		"stop": 88,
+		"enabled": true,
+		"running": true
+	},
+	"miniupnpd": {
+		"start": 94,
+		"stop": 15,
+		"enabled": false,
+		"running": false
+	},
+	"tz_log.init": {
+		"start": 5,
+		"stop": 94,
+		"enabled": true,
+		"running": false
+	},
+	"iemac_ioss.init": {
+		"start": 76,
+		"stop": 70,
+		"enabled": true,
+		"running": false
+	},
+	"qti_ethphy.init": {
+		"enabled": false
+	},
+	"sfe.init": {
+		"start": 98,
+		"stop": 94,
+		"enabled": true
+	},
+	"qmi_shutdown_modem.init": {
+		"start": 90,
+		"stop": 1,
+		"enabled": true,
+		"running": true
+	},
+	"diag-reboot-app.init": {
+		"start": 16,
+		"stop": 83,
+		"enabled": true,
+		"running": true
+	},
+	"r8125.init": {
+		"start": 10,
+		"stop": 50,
+		"enabled": true
+	},
+	"aqc_ioss.init": {
+		"start": 91,
+		"stop": 97,
+		"enabled": true
+	},
+	"ipsec": {
+		"start": 90,
+		"stop": 10,
+		"enabled": false,
+		"running": false
+	},
+	"qms.init": {
+		"start": 72,
+		"stop": 70,
+		"enabled": true,
+		"running": true
+	},
+	"qwes_license_store": {
+		"enabled": false
+	},
+	"mwan3": {
+		"start": 19,
+		"enabled": true,
+		"running": true
+	},
+	"ssreq-server.init": {
+		"start": 12,
+		"stop": 90,
+		"enabled": true,
+		"running": true
+	},
+	"sfsconfig.init": {
+		"start": 7,
+		"enabled": true,
+		"running": false
+	},
+	"socat": {
+		"start": 99,
+		"stop": 99,
+		"enabled": true,
+		"running": false
+	},
+	"stmfd": {
+		"start": 31,
+		"stop": 68,
+		"enabled": true,
+		"running": true
+	},
+	"mka-authenticator.init": {
+		"enabled": false,
+		"running": false
+	},
+	"urngd": {
+		"start": 0,
+		"enabled": true,
+		"running": true
+	},
+	"ethagent.init": {
+		"start": 72,
+		"stop": 70,
+		"enabled": true,
+		"running": true
+	},
+	"qti_pppd.init": {
+		"start": 79,
+		"stop": 89,
+		"enabled": true,
+		"running": false
+	},
+	"r8168_ioss.init": {
+		"start": 80,
+		"stop": 87,
+		"enabled": true
+	},
+	"mbimd.init": {
+		"start": 6,
+		"stop": 93,
+		"enabled": true,
+		"running": true
+	},
+	"user_permissions.init": {
+		"enabled": false
+	},
+	"ql_start_mbim_license_store": {
+		"enabled": false
+	},
+	"rproc_tracing.init": {
+		"start": 10,
+		"stop": 89,
+		"enabled": false,
+		"running": false
+	},
+	"adbd.init": {
+		"enabled": false
+	},
+	"rtl8251.init": {
+		"start": 10,
+		"stop": 50,
+		"enabled": true
+	},
+	"dnsmasq": {
+		"start": 10,
+		"enabled": true,
+		"running": true
+	},
+	"usb.init": {
+		"enabled": false
+	},
+	"qmuxbridge.init": {
+		"start": 16,
+		"stop": 83,
+		"enabled": true,
+		"running": true
+	},
+	"uhttpd": {
+		"start": 50,
+		"enabled": true,
+		"running": true
+	},
+	"servicemanager.init": {
+		"start": 14,
+		"stop": 85,
+		"enabled": true,
+		"running": true
+	},
+	"binderfs.init": {
+		"start": 14,
+		"stop": 85,
+		"enabled": true,
+		"running": false
+	},
+	"quectel-monitor-daemon.init": {
+		"start": 16,
+		"stop": 90,
+		"enabled": true,
+		"running": true
+	},
+	"loc-launcher.init": {
+		"start": 76,
+		"stop": 72,
+		"enabled": true,
+		"running": true
+	},
+	"firewall": {
+		"start": 19,
+		"enabled": true,
+		"running": false
+	},
+	"fs-scrub-daemon.init": {
+		"start": 14,
+		"stop": 85,
+		"enabled": true,
+		"running": true
+	},
+	"quectel-slic-daemon.init": {
+		"start": 20,
+		"stop": 90,
+		"enabled": false
+	},
+	"mirror_copy.init": {
+		"enabled": false
+	},
+	"qti_adpld.init": {
+		"start": 80,
+		"stop": 90,
+		"enabled": true,
+		"running": true
+	},
+	"stmmac.init": {
+		"start": 79,
+		"stop": 97,
+		"enabled": true
+	},
+	"atfwd-daemon": {
+		"start": 16,
+		"stop": 95,
+		"enabled": true,
+		"running": true
+	},
+	"ioss.init": {
+		"start": 80,
+		"stop": 97,
+		"enabled": true
+	},
+	"ipa_fws.init": {
+		"start": 3,
+		"stop": 97,
+		"enabled": true,
+		"running": false
+	},
+	"swanctl": {
+		"start": 90,
+		"stop": 10,
+		"enabled": false,
+		"running": false
+	},
+	"msmirqbalance.init": {
+		"start": 5,
+		"stop": 94,
+		"enabled": true,
+		"running": true
+	},
+	"data_tmpfiles.init": {
+		"start": 0,
+		"enabled": false
+	},
+	"pcie.init": {
+		"start": 4,
+		"stop": 95,
+		"enabled": true
+	},
+	"ssgtzd.init": {
+		"start": 0,
+		"enabled": false,
+		"running": true
+	},
+	"init-mss.init": {
+		"enabled": false
+	},
+	"modem-ssr-kpi.init": {
+		"start": 15,
+		"stop": 99,
+		"enabled": true,
+		"running": true
+	},
+	"datarmnet.init": {
+		"start": 10,
+		"stop": 89,
+		"enabled": true,
+		"running": false
+	},
+	"conntrackd": {
+		"start": 21,
+		"stop": 89,
+		"enabled": true,
+		"running": false
+	},
+	"partition-symlinks.init": {
+		"start": 1,
+		"stop": 97,
+		"enabled": true
+	},
+	"init_qcom_audio": {
+		"enabled": false
+	},
+	"rtl8367.init": {
+		"start": 10,
+		"stop": 50,
+		"enabled": true
+	}
+}

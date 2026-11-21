@@ -1,0 +1,34 @@
+#!/bin/ash
+
+# Preserve stock LuCI /www/index.html BEFORE unpack only on initial install
+if [ ! -f /www/index.html.old ] && [ -f /www/index.html ] && ! grep -qiE 'cellcore|quecmanager' /www/index.html 2>/dev/null; then
+    cp -p /www/index.html /www/index.html.old 2>/dev/null || true
+fi
+
+echo "Stopping CellCore / legacy daemons before install..."
+
+for svc in cellcored quecmanagerd; do
+    if [ -x "/etc/init.d/$svc" ]; then
+        "/etc/init.d/$svc" stop 2>/dev/null || true
+    fi
+done
+
+for svc in \
+    socat-at-bridge \
+    sdxpinn-patch \
+    quecmanager_cell_locking \
+    quecmanager_connection_monitor \
+    quecmanager_services \
+    quecmanager_websocat \
+    quecmanager_logging \
+    quecprofiles \
+    quecwatch \
+    eth_link_limit \
+    quecmanager_ttl; do
+    if [ -x "/etc/init.d/$svc" ]; then
+        service "$svc" stop 2>/dev/null || true
+        service "$svc" disable 2>/dev/null || true
+    fi
+done
+
+exit 0

@@ -1,0 +1,39 @@
+{
+  "name": "cellcore",
+  "version": "1.0.0",
+  "license": "GPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && node scripts/precompress-dist.mjs",
+    "preview": "vite preview",
+    "build-package-linux": "rm -rf dist root && npm run build && mkdir -p root/www root/etc/init.d root/usr/sbin root/usr/bin && cp -a dist/. root/www/ && mv root/www/index.html root/www/login.html && cp -f target/aarch64-unknown-linux-musl/release/cellcored root/usr/sbin/cellcored && chmod 0755 root/usr/sbin/cellcored && cp -f scripts/etc/init.d/cellcored root/etc/init.d/cellcored && chmod 0755 root/etc/init.d/cellcored && ln -sf cellcored root/usr/sbin/r10-modem-ctl && ln -sf ../sbin/cellcored root/usr/bin/cellctl && ln -sf ../sbin/cellcored root/usr/bin/menu"
+  },
+  "dependencies": {
+    "@fontsource-variable/figtree": "^5.3.0",
+    "@fontsource-variable/fraunces": "^5.3.0",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/inter-tight": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@fontsource-variable/plus-jakarta-sans": "^5.3.0",
+    "@fontsource-variable/space-grotesk": "^5.3.0",
+    "@fontsource-variable/unbounded": "^5.3.0",
+    "@tanstack/react-query": "^5.66.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^3.0.2",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.9",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.9",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0"
+  }
+}

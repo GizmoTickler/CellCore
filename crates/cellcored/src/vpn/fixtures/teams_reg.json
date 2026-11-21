@@ -1,0 +1,20 @@
+{
+  "id": "t.1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+  "type": "Android",
+  "model": "CellCore",
+  "name": "mgateway1",
+  "key": "zR1v3mF9KQZtqk0kQ0hKxw3Q3d6Q2wqk1zZ3m4p5r6A=",
+  "account": { "id": "acc-1", "account_type": "team", "organization": "acme", "managed": "true" },
+  "token": "DEVICE-API-TOKEN-0123456789abcdef0123456789abcdef",
+  "warp_enabled": true,
+  "policy": { "tunnel_protocol": "wireguard" },
+  "config": {
+    "client_id": "AbCd",
+    "peers": [
+      { "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+        "endpoint": { "v4": "162.159.193.5:0", "v6": "[2606:4700:100::a29f:c105]:0", "host": "engage.cloudflareclient.com:2408" } }
+    ],
+    "interface": { "addresses": { "v4": "172.16.0.7", "v6": "2606:4700:cf1:1000::7" } },
+    "services": { "http_proxy": "172.16.0.1:2480" }
+  }
+}

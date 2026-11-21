@@ -1,0 +1,72 @@
+Package: ookla-speedtest
+Version: 1.2.0
+Architecture: aarch64_cortex-a53
+Maintainer: Ookla speedtest.net https://www.speedtest.net/apps/cli
+Source: speedtest.net
+Depends: libc
+MD5Sum: b26e1909599f73cab40ea0281c5a6283
+SHA256sum: ebe16686e6cf4e0753679d0bbb6e7010e37df61d58690a22c0f421002dfdda82
+Size: 1075696
+Filename: ookla-speedtest_1.2.0_aarch64_cortex-a53.ipk
+Description: Allows you to test your internet speed with speedtest.net
+
+
+Package: kmod-wireguard
+Depends: sdxpinn-patch
+Version: 1
+Architecture: sdxpinn
+Maintainer: Cameron Thompson iamromulan@github.com
+Source: github.com/iamromulan
+MD5Sum: 98e77b68c2f1b5ff46ef7713b4f63a94
+SHA256sum: fc2f24bfdaf9245ca2809d7a2b20a4bc9a789ab08a835ea54ed84fabfaafd1ac
+Size: 789
+Filename: kmod-wireguard_1_sdxpinn.ipk
+Description: Wireguard is compiled into the kernel
+
+
+Package: tailscale-tiny
+Version: 1.104.7
+Depends: ca-bundle, kmod-tun
+Conflicts: tailscale, tailscaled
+Source: feeds/packages/net/tailscale
+SourceName: tailscale-tiny
+License: BSD-3-Clause
+Section: net
+Maintainer: Cameron Thompson <iamromulan@github>
+Architecture: aarch64_cortex-a53
+MD5Sum: ca8f5a9664c8f06020090c5d8e8d498a
+SHA256sum: 8b513f2395c60e104063d115468645cab2cf2ef83afe1248f6e84e66cf3ebd70
+Size: 7687602
+Filename: tailscale-tiny_1.104.7_aarch64_cortex-a53.ipk
+Description: Zero config VPN. Stripped combined binary from tiny-tailscale with 25 features kept. Static, no libc dependency.
+
+
+Package: wgcf
+Depends: libc
+Version: 2.3.1
+Architecture: aarch64_generic
+Maintainer: ViRb3
+Source: github.com/ViRb3/wgcf/releases
+MD5Sum: 9b6255f130699886d9dc60aefca28001
+SHA256sum: 4d519459b278a1d5e1f0262c678b585ce776fb1e87d7e95929486c7724653a67
+Size: 5187850
+Filename: wgcf_2.3.1_aarch64_generic.ipk
+Description: wgcf is an unofficial, cross-platform CLI for Cloudflare Warp
+
+
+Package: sdxpinn-cellcore
+Version: 1.0.0-1
+Architecture: sdxpinn
+Maintainer: GizmoTickler <gizmotickler@users.noreply.github.com>
+Source: github.com/GizmoTickler/CellCore
+Depends: libc, uci, ubus, uhttpd, ookla-speedtest, msmtp, ca-bundle, ca-certificates
+Conflicts: sdxpinn-quecmanager, sdxpinn-quecmanager-beta, sdxpinn-console-menu
+Replaces: sdxpinn-quecmanager-beta, sdxpinn-quecmanager, sdxpinn-patch, socat-at-bridge, sdxpinn-console-menu
+Provides: sdxpinn-quecmanager-beta
+MD5Sum: 2747e82a27dbbb1c86483a02e0c18337
+SHA256sum: 62405606731d83b03cdf6079a84233123a64a086870251d929dbf85e576ad0bf
+Size: 4725681
+Filename: sdxpinn-cellcore_1.0.0-1_sdxpinn.ipk
+Description: CellCore — static Rust cellular gateway daemon (cellcored) and React 19 UI with native QRTR/QMI data plane for Quectel RM55x SDX75 modems
+
+

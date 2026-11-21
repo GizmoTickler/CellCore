@@ -1,0 +1,8 @@
+#!/bin/ash
+
+if [ -x /etc/init.d/cellcored ]; then
+    /etc/init.d/cellcored stop 2>/dev/null || true
+    /etc/init.d/cellcored disable 2>/dev/null || true
+fi
+
+exit 0

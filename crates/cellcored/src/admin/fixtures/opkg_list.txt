@@ -1,0 +1,80 @@
+464xlat - 13 - 464xlat provides support to deploy limited IPv4 access services to mobile and wireline IPv6-only edge networks without encapsulation (RFC6877)
+6in4 - 28 - Provides support for 6in4 tunnels in /etc/config/network. Refer to http://wiki.openwrt.org/doc/uci/network for configuration details.
+6rd - 12 - Provides support for 6rd tunnels in /etc/config/network. Refer to http://wiki.openwrt.org/doc/uci/network for configuration details.
+6to4 - 13 - Provides support for 6to4 tunnels in /etc/config/network. Refer to https://openwrt.org/docs/guide-user/base-system/basic-networking configuration details.
+LwM2M_Client - 1-1
+LwM2M_Client_App - 1-1
+QCMAP_ApInterface - 1-1
+QCMAP_CLI - 1-1
+QCMAP_ConnectionManager - 1-1
+QCMAP_StaInterface - 1-1
+UDPspeeder - 20230206.0-1 - A Tunnel which Improves your Network Quality on a High-latency Lossy Link by using Forward Error Correction,for All Traffics(TCP/UDP/ICMP)
+aardvark-dns - 1.11.0-1 - Aardvark-dns is an authoritative dns server for A/AAAA container records. It can forward other requests to configured resolvers.  It is mostly intended to be used with Netavark which will launch it automatically if both are installed.
+abctl - 1.0-1
+acdb - 1
+acdbdata - 1
+ack - 3.8.2+perl5.28-1 - A grep-like source code search tool
+acl - 2.3.1-2 - Access control list support This package provides ACL manipulation utilities - chacl - getfacl - setfacl
+acme - 4.0.0 - Shorthand package for acme-acmesh.
+acme-acmesh - 3.0.7-2 - A client for issuing ACME (e.g, Letsencrypt) certificates.
+acme-acmesh-dnsapi - 3.0.7-2 - This package provides DNS API integration for ACME (Letsencrypt) client.
+acme-common - 1.0.4-2 - ACME client wrapper common files.
+acpid - 2.0.34-1 - The ACPI Daemon (acpid) With Netlink Support
+acsccid - 1.1.8-2 - PCSC driver for ACS USB CCID (Chip/Smart Card Interface Devices) smart card readers and ICCD (Integrated Circuit(s) Card Devices).
+adb - android.5.0.2_r1-3 - Android Debug Bridge (adb) is a versatile command line tool that lets you communicate with an emulator instance or connected Android-powered device.
+adb-enablemodem - 2017-03-05-1 - Enable modem via adb
+adbd - 1.0-1
+adblock - 4.2.3-3 - Powerful adblock solution to block ad/abuse domains via dnsmasq, unbound, named or kresd. The script supports many domain blacklist sites plus manual black- and whitelist overrides. Please see https://github.com/openwrt/packages/blob/master/net/adblock/files/README.md for further information.
+adblock-fast - 1.1.2-20 - Fast AdBlocking script to block ad or abuse/malware domains with Dnsmasq, SmartDNS or Unbound. Script supports local/remote list of domains and hosts-files for both block-listing and allow-listing. Please see https://docs.openwrt.melmac.net/adblock-fast/ for more information.
+addrwatch - 1.0.2-3 - This is a tool similar to arpwatch. It main purpose is to monitor network and log discovered ethernet/ip pairings. Addrwatch is extremely useful in networks with IPv6 autoconfiguration (RFC4862) enabled. It allows to track IPv6 addresses of hosts using IPv6 privacy extensions (RFC4941).  This contains the main addrwatch program.
+addrwatch-mysql - 1.0.2-3 - This is a tool similar to arpwatch. It main purpose is to monitor network and log discovered ethernet/ip pairings. Addrwatch is extremely useful in networks with IPv6 autoconfiguration (RFC4862) enabled. It allows to track IPv6 addresses of hosts using IPv6 privacy extensions (RFC4941).  This contains the MySQL output module.
+addrwatch-stdout - 1.0.2-3 - This is a tool similar to arpwatch. It main purpose is to monitor network and log discovered ethernet/ip pairings. Addrwatch is extremely useful in networks with IPv6 autoconfiguration (RFC4862) enabled. It allows to track IPv6 addresses of hosts using IPv6 privacy extensions (RFC4941).  This contains the stdout output module.
+addrwatch-syslog - 1.0.2-3 - This is a tool similar to arpwatch. It main purpose is to monitor network and log discovered ethernet/ip pairings. Addrwatch is extremely useful in networks with IPv6 autoconfiguration (RFC4862) enabled. It allows to track IPv6 addresses of hosts using IPv6 privacy extensions (RFC4941).  This contains the syslog output module.
+adguardhome - 0.107.46-1 - Free and open source, powerful network-wide ads and trackers blocking DNS server.
+afuse - 0.4.1-1 - Automounting file system implemented in user-space using FUSE. It implements the most basic functionality that can be expected by an automounter; that is it manages a directory of virtual directories. If one of these virtual directories is accessed and is not already automounted, afuse will attempt to mount a filesystem onto that directory. If the mount succeeds the requested access proceeds as normal, otherwise it will fail with an error.
+agetty - 2.39-2 - agetty opens a tty port, prompts for a login name and invokes the /bin/login command
+aggregate - 1.6-2 - takes a list of prefixes in conventional format on stdin, and performs two optimisations to reduce the length of the prefix list. It removes any supplied prefixes which are supurfluous because they are already included in another supplied prefix (e.g., 203.97.2.0/24 would be removed if 203.97.0.0/17 was also supplied), and identifies adjacent prefixes that can be combined under a single, shorter-length prefix (e.g., 203.97.2.0/24 and 203.97.3.0/24 can be combined into the single prefix 203.97.2.0/23).
+agm - 1
+agm-sw-binder-client - 1
+agm-sw-binder-server - 1
+agmplugin - 1
+agmplugintest - 1
+ahcpd - 0.53-3 - Ahcpd is a daemon for configuring an IPv6 network using the Ad-Hoc Configuration Protocol (AHCP).  AHCP is designed for wireless mesh networks, where IPv6 autoconfiguration and DHCPv6 do not work, but may also be used on wired networks.
+air-firmware - 1-1
+aircard-pcmcia-firmware - 20230804-1 - Sierra Wireless Aircard 555/7xx/8x0 firmware
+aircrack-ng - 1.7-1 - WLAN tools for breaking 802.11 WEP/WPA keys
+airmon-ng - 1.7-1 - Bash script designed to turn wireless cards into monitor mode.
+airos-dfs-reset - 1-1 - Companion app for Ubiquity AirOS Gear to enforce fallback to original frequency after DFS event is over. It works by soft-rebooting if running-frequency doesnt match the configured frequency.
+alfred - 2023.1-1 - alfred is a user space daemon for distributing arbitrary local information over the mesh/network in a decentralized fashion. This data can be anything which appears to be useful - originally designed to replace the batman-adv visualization (vis), you may distribute hostnames, phone books, administration information, DNS information, the local weather forecast ...  alfred runs as daemon in the background of the system. A user may insert information by using the alfred binary on the command line, or use special programs to communicate with alfred (done via unix sockets). alfred then takes care of distributing the local information to other alfred servers on other nodes. This is done via IPv6 link-local multicast, and does not require any configuration. A user can request data from alfred, and will receive the information available from all alfred servers in the network.
+alpine - 2.25-3 - Alpine (Alternatively Licensed Program for Internet News and Email) is a free software email client developed at the University of Washington. It is suitable for both the inexperienced email user as well as for the most demanding power user. This package is built with OpenSSL support.
+alpine-keys - 2.14.0-1 - Alpine apk public signing keys
+alpine-repositories - 2.14.0-1 - Official Alpine repositories
+alsa-lib - 1.2.9-1 - This is the library package for alsa, needed by some userspace programs. You must have enabled the ALSA support in the kernel.
+alsa-ucm-conf - 1.2.9-1 - This is a set of configuration files needed for some ALS utilities like alsactl.
+alsa-utils - 1.2.9-1 - ALSA (Advanced Linux Sound Architecture) utilities
+alsa-utils-seq - 1.2.9-1 - ALSA sequencer utilities
+alsa-utils-tests - 1.2.9-1 - ALSA utilities test data (adds ~1.3M to image)
+amdgpu-firmware - 20230804-1 - AMDGPU Video Driver firmware
+announce - 1.0.1-1 - Announce services on the network with Zeroconf/Bonjour. This announces services such as ssh, sftp, and http running on the local machine to the network.
+ap51-flash - 2022.0-2 - A tool for flashing (nearly) all ap51/ap61 based routers
+apache - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  This package contains the Apache web server and utility programs.
+apache-ab - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  Apache server benchmarking utility.
+apache-error - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  Apache multi language custom error documents.
+apache-icons - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  This package contains the icons from Apache.
+apache-mod-deflate - 2.4.57-2 - Deflate support for the Apache HTTP server.
+apache-mod-http2 - 2.4.57-2 - HTTP/2 transport layer for the Apache HTTP Server.
+apache-mod-ldap - 2.4.57-2 - LDAP authentication/authorization module for the Apache HTTP Server.
+apache-mod-lua - 2.4.57-2 - Lua support for the Apache HTTP server.
+apache-mod-md - 2.4.57-2 - Managed Domain handling.
+apache-mod-php8 - 8.2.29-1 - PHP is a widely-used general-purpose scripting language that is especially suited for Web development and can be embedded into HTML. This package contains the PHP module for the Apache Web Server.
+apache-mod-proxy - 2.4.57-2 - Proxy modules for the Apache HTTP Server.
+apache-mod-proxy-html - 2.4.57-2 - HTML and XML content filters for the Apache HTTP Server.
+apache-mod-session-crypto - 2.4.57-2 - Session encryption support for the Apache HTTP Server.
+apache-mod-ssl - 2.4.57-2 - SSL/TLS module for the Apache HTTP Server.
+apache-mod-suexec - 2.4.57-2 - suEXEC module for the Apache HTTP Server.
+apache-mod-webdav - 2.4.57-2 - WebDAV support for the Apache HTTP Server.
+apache-suexec - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  This package contains the suEXEC utility from Apache.
+apache-utils - 2.4.57-2 - The Apache HTTP Server Project is a collaborative software development effort aimed at creating a robust, commercial-grade, featureful, and freely-available source code implementation of an HTTP (Web) server.  Apache utility programs for webservers.
+apcupsd - 3.14.14-4 - UPS control software
+apcupsd-cgi - 3.14.14-4 - UPS control software CGI module
+apfree-wifidog - 7.08.2035-1 - The ApFree Wifidog project is a complete and embeddable captive portal solution for wireless community groups or individuals who wish to open a free Hotspot while still preventing abuse of their Internet connection. It's enhanced wifidog

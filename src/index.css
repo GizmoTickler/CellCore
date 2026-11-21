@@ -1,0 +1,1348 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ───────────────────────── Fonts (latin subsets only, bundled) ───────────────────────── */
+@font-face {
+  font-family: "Fraunces";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../node_modules/@fontsource-variable/fraunces/files/fraunces-latin-soft-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Figtree";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 900;
+  src: url("../node_modules/@fontsource-variable/figtree/files/figtree-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url("../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url("../node_modules/@fontsource-variable/space-grotesk/files/space-grotesk-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Inter Tight";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../node_modules/@fontsource-variable/inter-tight/files/inter-tight-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Plus Jakarta Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 800;
+  src: url("../node_modules/@fontsource-variable/plus-jakarta-sans/files/plus-jakarta-sans-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+@font-face {
+  font-family: "Unbounded";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url("../node_modules/@fontsource-variable/unbounded/files/unbounded-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+/* ───────────────────────── Ember design tokens ─────────────────────────
+   Light = "golden hour": cream paper, espresso ink, ember/saffron/berry glow.
+   Dark  = "hearth": cocoa night, ember highlights, pastel inks.
+   Each hue has three roles: X (fill, white text OK), X-ink (text-safe), X-soft (tint). */
+:root {
+  --qm-font-sans: "Figtree", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --qm-font-display: "Fraunces", "Iowan Old Style", Georgia, serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1.4rem;
+  --qm-radius-sub: 1rem;
+  --qm-card-bg: var(--qm-surface);
+  --qm-card-blur: none;
+  --qm-grain-opacity: 0.22;
+  --qm-bg-image:
+    radial-gradient(1100px 520px at 8% -12%, rgba(255, 182, 39, 0.16), transparent 62%),
+    radial-gradient(900px 480px at 96% -10%, rgba(224, 51, 111, 0.10), transparent 60%);
+  --qm-on-ember: #ffffff;
+  --qm-dial-a: #e0336f;
+  --qm-dial-b: #ff6a2c;
+  --qm-dial-c: #ffb627;
+  --qm-paper: #fbf3e8;
+  --qm-surface: #fffbf6;
+  --qm-raised: #ffffff;
+  --qm-sunk: #f7ecdf;
+  --qm-line: #eedfcc;
+  --qm-line-strong: #e0c9ae;
+  --qm-ink: #2a1a10;
+  --qm-ink-2: #5d4535;
+  --qm-muted: #7b6454;
+
+  --qm-ember: #cb4513;
+  --qm-ember-ink: #b53c0d;
+  --qm-ember-soft: #ffe6d6;
+  --qm-saffron: #f2a30f;
+  --qm-saffron-ink: #9a5800;
+  --qm-saffron-soft: #fff0cf;
+  --qm-berry: #c42a6c;
+  --qm-berry-ink: #a11f58;
+  --qm-berry-soft: #fde2ee;
+  --qm-jade: #10916f;
+  --qm-jade-ink: #0a7055;
+  --qm-jade-soft: #d9f3e8;
+  --qm-crimson: #d22b3f;
+  --qm-crimson-ink: #b0182c;
+  --qm-crimson-soft: #fde3e5;
+
+  --qm-sun: linear-gradient(118deg, #ffb627 0%, #ff6a2c 46%, #e0336f 100%);
+  --qm-sun-soft: linear-gradient(118deg, #fff1d6 0%, #ffe3d4 50%, #fde0ea 100%);
+  --qm-shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset, 0 1px 2px rgba(92, 48, 18, 0.05), 0 18px 40px -28px rgba(120, 58, 18, 0.35);
+  --qm-shadow-pop: 0 24px 60px -24px rgba(170, 64, 16, 0.45);
+  color-scheme: light;
+  --qm-on-crimson: #ffffff;
+  --qm-on-jade: #06140d;
+}
+
+.dark {
+  --qm-paper: #160f0b;
+  --qm-surface: #201611;
+  --qm-raised: #2a1e17;
+  --qm-sunk: #281c15;
+  --qm-line: #3a2a20;
+  --qm-line-strong: #503a2b;
+  --qm-ink: #f9ebdc;
+  --qm-ink-2: #dcc3ac;
+  --qm-muted: #ab917c;
+
+  --qm-ember: #ff6a33;
+  --qm-ember-ink: #ff9363;
+  --qm-ember-soft: rgba(255, 106, 51, 0.15);
+  --qm-saffron: #ffb22e;
+  --qm-saffron-ink: #ffc75e;
+  --qm-saffron-soft: rgba(255, 178, 46, 0.14);
+  --qm-berry: #e8478b;
+  --qm-berry-ink: #ff86bb;
+  --qm-berry-soft: rgba(255, 105, 170, 0.14);
+  --qm-jade: #1fae85;
+  --qm-jade-ink: #48dcae;
+  --qm-jade-soft: rgba(72, 220, 174, 0.13);
+  --qm-crimson: #ec4258;
+  --qm-crimson-ink: #ff7a8b;
+  --qm-crimson-soft: rgba(255, 107, 125, 0.14);
+
+  --qm-sun: linear-gradient(118deg, #ffb22e 0%, #ff6a33 46%, #e8478b 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(255, 178, 46, 0.14) 0%, rgba(255, 106, 51, 0.14) 50%, rgba(232, 71, 139, 0.14) 100%);
+  --qm-shadow: 0 1px 0 rgba(255, 220, 190, 0.04) inset, 0 20px 44px -26px rgba(0, 0, 0, 0.8);
+  --qm-shadow-pop: 0 24px 60px -20px rgba(255, 90, 30, 0.28);
+  --qm-bg-image:
+    radial-gradient(1000px 520px at 6% -14%, rgba(255, 106, 51, 0.16), transparent 62%),
+    radial-gradient(900px 480px at 96% -10%, rgba(232, 71, 139, 0.10), transparent 60%);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0508;
+}
+
+/* Ember is the default skin; its light tokens live on :root and its dark tokens on .dark. Values that
+   must not leak into the other skins' modes are scoped to data-skin="ember". */
+:root[data-skin="ember"]:not(.dark) {
+  /* Text-bearing sun surfaces: same golden-hour hues, deepened so white text clears 4.5:1 at every stop. */
+  --qm-sun-ink: linear-gradient(118deg, #9f6900 0%, #d43e00 46%, #de2464 100%);
+}
+:root[data-skin="ember"].dark {
+  /* Hearth: the glowing ember fill carries dark text (white on #ff6a33 is 2.85:1). */
+  --qm-on-ember: #1f0d05;
+}
+
+/* ───────────────────────── Skin: Midnight Signal ───────────────────────── */
+:root[data-skin="midnight"] {
+  --qm-dial-a: #8b5cf6;
+  --qm-dial-b: #3b82f6;
+  --qm-dial-c: #22d3ee;
+  --qm-font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1rem;
+  --qm-radius-sub: 0.75rem;
+  --qm-grain-opacity: 0;
+  --qm-paper: #f2f5fb;
+  --qm-surface: #ffffff;
+  --qm-raised: #ffffff;
+  --qm-sunk: #eef2f9;
+  --qm-line: #dfe5f0;
+  --qm-line-strong: #c7d0e2;
+  --qm-ink: #0b1224;
+  --qm-ink-2: #36415e;
+  --qm-muted: #5c6785;
+  --qm-ember: #5b4bff;
+  --qm-ember-ink: #4636e0;
+  --qm-ember-soft: #e8e6ff;
+  --qm-saffron: #f59e0b;
+  --qm-saffron-ink: #9c5a00;
+  --qm-saffron-soft: #fff3d6;
+  --qm-berry: #0891b2;
+  --qm-berry-ink: #0a6078;
+  --qm-berry-soft: #dcf5fb;
+  --qm-jade: #059669;
+  --qm-jade-ink: #047857;
+  --qm-jade-soft: #d9f6ea;
+  --qm-crimson: #e11d48;
+  --qm-crimson-ink: #be123c;
+  --qm-crimson-soft: #ffe2e8;
+  --qm-sun: linear-gradient(118deg, #22d3ee 0%, #3b82f6 48%, #8b5cf6 100%);
+  --qm-sun-soft: linear-gradient(118deg, #dff9fd 0%, #e2ecff 50%, #efe7ff 100%);
+  --qm-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 12px 32px -22px rgba(30, 50, 120, 0.3);
+  --qm-shadow-pop: 0 24px 60px -24px rgba(59, 130, 246, 0.45);
+  --qm-bg-image:
+    radial-gradient(1000px 500px at 10% -14%, rgba(34, 211, 238, 0.12), transparent 62%),
+    radial-gradient(900px 480px at 96% -10%, rgba(139, 92, 246, 0.10), transparent 60%);
+  --qm-sun-ink: linear-gradient(118deg, #0b8092 0%, #196cf4 48%, #8452f5 100%);
+}
+:root[data-skin="midnight"].dark {
+  --qm-paper: #080c17;
+  --qm-surface: #0f1628;
+  --qm-raised: #152038;
+  --qm-sunk: #0c1324;
+  --qm-line: #1c2843;
+  --qm-line-strong: #2a3a5f;
+  --qm-ink: #e8eeff;
+  --qm-ink-2: #b3c0e2;
+  --qm-muted: #8391b5;
+  --qm-ember: #6d5cff;
+  --qm-ember-ink: #7dd8f5;
+  --qm-ember-soft: rgba(103, 232, 249, 0.10);
+  --qm-saffron: #f59e0b;
+  --qm-saffron-ink: #fcd34d;
+  --qm-saffron-soft: rgba(252, 211, 77, 0.12);
+  --qm-berry: #a78bfa;
+  --qm-berry-ink: #c4b5fd;
+  --qm-berry-soft: rgba(167, 139, 250, 0.14);
+  --qm-jade: #10b981;
+  --qm-jade-ink: #4ade80;
+  --qm-jade-soft: rgba(74, 222, 128, 0.11);
+  --qm-crimson: #f43f5e;
+  --qm-crimson-ink: #fb7185;
+  --qm-crimson-soft: rgba(251, 113, 133, 0.13);
+  --qm-sun-soft: linear-gradient(118deg, rgba(34, 211, 238, 0.12) 0%, rgba(59, 130, 246, 0.12) 50%, rgba(139, 92, 246, 0.12) 100%);
+  --qm-shadow: 0 1px 0 rgba(160, 190, 255, 0.05) inset, 0 0 0 1px rgba(80, 120, 255, 0.04), 0 20px 44px -26px rgba(0, 0, 0, 0.9);
+  --qm-shadow-pop: 0 0 50px -12px rgba(59, 130, 246, 0.5);
+  --qm-bg-image:
+    radial-gradient(1000px 520px at 8% -14%, rgba(34, 211, 238, 0.13), transparent 62%),
+    radial-gradient(900px 480px at 96% -10%, rgba(139, 92, 246, 0.16), transparent 60%);
+}
+
+/* ───────────────────────── Skin: Swiss Mono ───────────────────────── */
+:root[data-skin="swiss"] {
+  --qm-dial-a: #ff3b1f;
+  --qm-dial-b: #ff3b1f;
+  --qm-dial-c: #ff3b1f;
+  --qm-font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Inter Tight", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 700;
+  --qm-radius-card: 0.5rem;
+  --qm-radius-sub: 0.375rem;
+  --qm-grain-opacity: 0;
+  --qm-paper: #f4f4f2;
+  --qm-surface: #ffffff;
+  --qm-raised: #ffffff;
+  --qm-sunk: #f4f4f2;
+  --qm-line: #e3e3e0;
+  --qm-line-strong: #c9c9c5;
+  --qm-ink: #0a0a0a;
+  --qm-ink-2: #3a3a3a;
+  --qm-muted: #6a6a6a;
+  --qm-ember: #e61d00;
+  --qm-ember-ink: #c8270d;
+  --qm-ember-soft: #ffe8e3;
+  --qm-saffron: #f2a900;
+  --qm-saffron-ink: #946200;
+  --qm-saffron-soft: #fff2cc;
+  --qm-berry: #1d1d1d;
+  --qm-berry-ink: #1d1d1d;
+  --qm-berry-soft: #ececea;
+  --qm-jade: #00a362;
+  --qm-jade-ink: #007b4a;
+  --qm-jade-soft: #dcf4e8;
+  --qm-crimson: #e0102b;
+  --qm-crimson-ink: #c00a22;
+  --qm-crimson-soft: #ffe1e4;
+  --qm-sun: linear-gradient(0deg, #e61d00, #e61d00);
+  --qm-sun-soft: linear-gradient(0deg, #ffe8e3, #ffe8e3);
+  --qm-shadow: none;
+  --qm-shadow-pop: 0 18px 50px -20px rgba(0, 0, 0, 0.35);
+  --qm-bg-image: none;
+}
+:root[data-skin="swiss"].dark {
+  --qm-paper: #000000;
+  --qm-surface: #0e0e0e;
+  --qm-raised: #161616;
+  --qm-sunk: #141414;
+  --qm-line: #262626;
+  --qm-line-strong: #3a3a3a;
+  --qm-ink: #fafafa;
+  --qm-ink-2: #cfcfcf;
+  --qm-muted: #8c8c8c;
+  --qm-ember: #ff4b2e;
+  --qm-ember-ink: #ff6a50;
+  --qm-ember-soft: rgba(255, 75, 46, 0.14);
+  --qm-saffron-ink: #ffc933;
+  --qm-saffron-soft: rgba(255, 201, 51, 0.12);
+  --qm-berry: #e5e5e5;
+  --qm-berry-ink: #e5e5e5;
+  --qm-berry-soft: rgba(255, 255, 255, 0.08);
+  --qm-jade: #1fbf75;
+  --qm-jade-ink: #3ddc8c;
+  --qm-jade-soft: rgba(61, 220, 140, 0.12);
+  --qm-crimson: #ff2d47;
+  --qm-crimson-ink: #ff5c70;
+  --qm-crimson-soft: rgba(255, 92, 112, 0.13);
+  --qm-sun: linear-gradient(0deg, #ff4b2e, #ff4b2e);
+  --qm-sun-soft: linear-gradient(0deg, rgba(255, 75, 46, 0.14), rgba(255, 75, 46, 0.14));
+  --qm-shadow: none;
+  --qm-shadow-pop: 0 18px 50px -20px rgba(0, 0, 0, 0.9);
+  --qm-bg-image: none;
+  --qm-on-ember: #0a0a0a;
+}
+
+/* ───────────────────────── Skin: Aurora Glass ───────────────────────── */
+:root[data-skin="aurora"] {
+  --qm-dial-a: #ec4899;
+  --qm-dial-b: #6366f1;
+  --qm-dial-c: #14b8a6;
+  --qm-font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --qm-display-weight: 750;
+  --qm-radius-card: 1.6rem;
+  --qm-radius-sub: 1.1rem;
+  --qm-grain-opacity: 0;
+  --qm-card-bg: rgba(255, 255, 255, 0.62);
+  --qm-card-blur: blur(22px) saturate(1.5);
+  --qm-paper: #f3f5fb;
+  --qm-surface: #ffffff;
+  --qm-raised: #ffffff;
+  --qm-sunk: rgba(238, 242, 255, 0.72);
+  --qm-line: rgba(140, 155, 200, 0.26);
+  --qm-line-strong: rgba(120, 135, 190, 0.42);
+  --qm-ink: #0f172a;
+  --qm-ink-2: #334155;
+  --qm-muted: #5c6b80;
+  --qm-ember: #5b5ef0;
+  --qm-ember-ink: #4f46e5;
+  --qm-ember-soft: rgba(99, 102, 241, 0.12);
+  --qm-saffron: #f59e0b;
+  --qm-saffron-ink: #a94e08;
+  --qm-saffron-soft: rgba(245, 158, 11, 0.14);
+  --qm-berry: #ec4899;
+  --qm-berry-ink: #be185d;
+  --qm-berry-soft: rgba(236, 72, 153, 0.12);
+  --qm-jade: #0d9488;
+  --qm-jade-ink: #0d6b63;
+  --qm-jade-soft: rgba(20, 184, 166, 0.14);
+  --qm-crimson: #dc2626;
+  --qm-crimson-ink: #b91c1c;
+  --qm-crimson-soft: rgba(239, 68, 68, 0.12);
+  --qm-sun: linear-gradient(118deg, #14b8a6 0%, #6366f1 52%, #ec4899 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(20, 184, 166, 0.14), rgba(99, 102, 241, 0.14), rgba(236, 72, 153, 0.14));
+  --qm-shadow: 0 1px 0 rgba(255, 255, 255, 0.8) inset, 0 20px 50px -30px rgba(70, 70, 160, 0.4);
+  --qm-shadow-pop: 0 30px 70px -28px rgba(99, 102, 241, 0.55);
+  --qm-bg-image:
+    radial-gradient(700px 520px at 6% 0%, rgba(20, 184, 166, 0.30), transparent 60%),
+    radial-gradient(760px 560px at 55% -10%, rgba(99, 102, 241, 0.28), transparent 62%),
+    radial-gradient(700px 560px at 100% 18%, rgba(236, 72, 153, 0.24), transparent 60%),
+    radial-gradient(900px 600px at 40% 110%, rgba(56, 189, 248, 0.18), transparent 60%);
+  --qm-sun-ink: linear-gradient(118deg, #0e8376 0%, #5e61f1 52%, #dd1779 100%);
+}
+:root[data-skin="aurora"].dark {
+  --qm-card-bg: rgba(22, 22, 52, 0.55);
+  --qm-paper: #090a1c;
+  --qm-surface: #15163a;
+  --qm-raised: #1d1f4a;
+  --qm-sunk: rgba(30, 32, 78, 0.55);
+  --qm-line: rgba(140, 150, 255, 0.16);
+  --qm-line-strong: rgba(140, 150, 255, 0.3);
+  --qm-ink: #eef0ff;
+  --qm-ink-2: #c3c8f0;
+  --qm-muted: #979dcc;
+  --qm-ember: #7c7ff7;
+  --qm-ember-ink: #a5b4fc;
+  --qm-ember-soft: rgba(129, 140, 248, 0.16);
+  --qm-saffron-ink: #fcd34d;
+  --qm-berry-ink: #f9a8d4;
+  --qm-berry-soft: rgba(244, 114, 182, 0.15);
+  --qm-jade: #14b8a6;
+  --qm-jade-ink: #5eead4;
+  --qm-jade-soft: rgba(45, 212, 191, 0.13);
+  --qm-crimson-ink: #fca5a5;
+  --qm-crimson-soft: rgba(248, 113, 113, 0.14);
+  --qm-sun-soft: linear-gradient(118deg, rgba(20, 184, 166, 0.16), rgba(99, 102, 241, 0.16), rgba(236, 72, 153, 0.16));
+  --qm-shadow: 0 1px 0 rgba(200, 200, 255, 0.07) inset, 0 24px 60px -30px rgba(0, 0, 0, 0.9);
+  --qm-bg-image:
+    radial-gradient(700px 520px at 6% 0%, rgba(20, 184, 166, 0.22), transparent 60%),
+    radial-gradient(760px 560px at 55% -10%, rgba(99, 102, 241, 0.26), transparent 62%),
+    radial-gradient(700px 560px at 100% 18%, rgba(236, 72, 153, 0.18), transparent 60%);
+  --qm-on-ember: #0b0c2a;
+  --qm-crimson: #f87171;
+  --qm-sun-ink: linear-gradient(118deg, #14b8a6 0%, #6a6df2 52%, #ec4899 100%);
+}
+
+/* ───────────────────────── Skin: Phosphor (CRT terminal, dark-only) ───────────────────────── */
+:root[data-skin="phosphor"],
+:root[data-skin="phosphor"].dark {
+  --qm-font-sans: "JetBrains Mono", ui-monospace, monospace;
+  --qm-font-display: "JetBrains Mono", ui-monospace, monospace;
+  --qm-display-weight: 700;
+  --qm-radius-card: 0.25rem;
+  --qm-radius-sub: 0.15rem;
+  --qm-grain-opacity: 0;
+  --qm-on-ember: #021a08;
+  --qm-dial-a: #1fbf4a;
+  --qm-dial-b: #39ff6a;
+  --qm-dial-c: #c8ff6a;
+  --qm-paper: #030703;
+  --qm-surface: #071107;
+  --qm-raised: #0b1a0c;
+  --qm-sunk: #050e06;
+  --qm-line: #16401d;
+  --qm-line-strong: #24682f;
+  --qm-ink: #b9ffc4;
+  --qm-ink-2: #7fe08f;
+  --qm-muted: #4c9a59;
+  --qm-ember: #39ff6a;
+  --qm-ember-ink: #5dff86;
+  --qm-ember-soft: rgba(57, 255, 106, 0.1);
+  --qm-saffron: #ffb000;
+  --qm-saffron-ink: #ffc23d;
+  --qm-saffron-soft: rgba(255, 176, 0, 0.12);
+  --qm-berry: #ffb000;
+  --qm-berry-ink: #ffc23d;
+  --qm-berry-soft: rgba(255, 176, 0, 0.1);
+  --qm-jade: #39ff6a;
+  --qm-jade-ink: #5dff86;
+  --qm-jade-soft: rgba(57, 255, 106, 0.1);
+  --qm-crimson: #ff4d4d;
+  --qm-crimson-ink: #ff7373;
+  --qm-crimson-soft: rgba(255, 77, 77, 0.12);
+  --qm-sun: linear-gradient(90deg, #1fbf4a, #39ff6a 55%, #c8ff6a);
+  --qm-sun-soft: linear-gradient(90deg, rgba(57, 255, 106, 0.08), rgba(200, 255, 106, 0.08));
+  --qm-shadow: 0 0 0 1px rgba(57, 255, 106, 0.05), 0 0 28px -14px rgba(57, 255, 106, 0.5);
+  --qm-shadow-pop: 0 0 50px -10px rgba(57, 255, 106, 0.45);
+  --qm-bg-image:
+    repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.28) 0 1px, transparent 1px 3px),
+    radial-gradient(1200px 700px at 50% 0%, rgba(57, 255, 106, 0.08), transparent 70%);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0508;
+  --qm-on-jade: #06140d;
+}
+[data-skin="phosphor"] .qm-display {
+  text-shadow: 0 0 14px rgba(57, 255, 106, 0.45);
+  letter-spacing: -0.04em;
+}
+[data-skin="phosphor"] body {
+  font-size: 13px;
+}
+
+/* ───────────────────────── Skin: Blueprint (drafting sheet, dark-only) ───────────────────────── */
+:root[data-skin="blueprint"],
+:root[data-skin="blueprint"].dark {
+  --qm-font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 500;
+  --qm-radius-card: 0.2rem;
+  --qm-radius-sub: 0.15rem;
+  --qm-grain-opacity: 0;
+  --qm-card-bg: rgba(8, 40, 92, 0.72);
+  --qm-on-ember: #0a2b5c;
+  --qm-dial-a: #ffcf4a;
+  --qm-dial-b: #ffe27a;
+  --qm-dial-c: #fff6c8;
+  --qm-paper: #0d3874;
+  --qm-surface: #0b3069;
+  --qm-raised: #12407f;
+  --qm-sunk: rgba(5, 25, 62, 0.45);
+  --qm-line: rgba(200, 225, 255, 0.28);
+  --qm-line-strong: rgba(220, 235, 255, 0.5);
+  --qm-ink: #f2f7ff;
+  --qm-ink-2: #c4daf7;
+  --qm-muted: #a6c2e6;
+  --qm-ember: #ffcf4a;
+  --qm-ember-ink: #ffd968;
+  --qm-ember-soft: rgba(255, 207, 74, 0.15);
+  --qm-saffron: #ff9f43;
+  --qm-saffron-ink: #ffb46b;
+  --qm-saffron-soft: rgba(255, 159, 67, 0.16);
+  --qm-berry: #8fd3ff;
+  --qm-berry-ink: #a9ddff;
+  --qm-berry-soft: rgba(143, 211, 255, 0.15);
+  --qm-jade: #5ef2c0;
+  --qm-jade-ink: #7cf5cd;
+  --qm-jade-soft: rgba(94, 242, 192, 0.14);
+  --qm-crimson: #ff6b81;
+  --qm-crimson-ink: #ff8a9b;
+  --qm-crimson-soft: rgba(255, 107, 129, 0.16);
+  --qm-sun: linear-gradient(90deg, #ffcf4a, #ffe27a);
+  --qm-sun-soft: linear-gradient(90deg, rgba(255, 207, 74, 0.14), rgba(255, 226, 122, 0.14));
+  --qm-shadow: none;
+  --qm-shadow-pop: 0 20px 50px -20px rgba(0, 0, 0, 0.6);
+  --qm-bg-image:
+    linear-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0508;
+  --qm-on-jade: #06140d;
+}
+[data-skin="blueprint"] body {
+  background-size: 96px 96px, 96px 96px, 16px 16px, 16px 16px;
+}
+[data-skin="blueprint"] .qm-card {
+  border-style: solid;
+  outline: 1px dashed rgba(200, 225, 255, 0.16);
+  outline-offset: 4px;
+}
+[data-skin="blueprint"] .qm-eyebrow {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  letter-spacing: 0.08em;
+  color: var(--qm-ember-ink);
+}
+
+/* ───────────────────────── Skin: Neo-Brutal ───────────────────────── */
+:root[data-skin="brutal"] {
+  --qm-font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Unbounded", "Space Grotesk", ui-sans-serif, sans-serif;
+  --qm-display-weight: 700;
+  --qm-radius-card: 1rem;
+  --qm-radius-sub: 0.7rem;
+  --qm-grain-opacity: 0;
+  --qm-on-ember: #111111;
+  --qm-hard: #111111;
+  --qm-dial-a: #ff4fa3;
+  --qm-dial-b: #ff8a3d;
+  --qm-dial-c: #ffd400;
+  --qm-paper: #c9ecff;
+  --qm-surface: #ffffff;
+  --qm-raised: #ffffff;
+  --qm-sunk: #fff6d1;
+  --qm-line: #111111;
+  --qm-line-strong: #111111;
+  --qm-ink: #111111;
+  --qm-ink-2: #2b2b2b;
+  --qm-muted: #555555;
+  --qm-ember: #ff4fa3;
+  --qm-ember-ink: #c20065;
+  --qm-ember-soft: #ffd6ea;
+  --qm-saffron: #ffd400;
+  --qm-saffron-ink: #7f6200;
+  --qm-saffron-soft: #fff1a8;
+  --qm-berry: #3d5afe;
+  --qm-berry-ink: #2a40d6;
+  --qm-berry-soft: #dbe1ff;
+  --qm-jade: #00c46a;
+  --qm-jade-ink: #006c3a;
+  --qm-jade-soft: #c9f7df;
+  --qm-crimson: #ff3b30;
+  --qm-crimson-ink: #c4180f;
+  --qm-crimson-soft: #ffd9d6;
+  --qm-sun: linear-gradient(100deg, #ffd400 0%, #ff8a3d 50%, #ff4fa3 100%);
+  --qm-sun-soft: linear-gradient(100deg, #fff1a8, #ffd6ea);
+  --qm-shadow: 5px 5px 0 0 var(--qm-hard);
+  --qm-shadow-pop: 8px 8px 0 0 var(--qm-hard);
+  --qm-bg-image: radial-gradient(rgba(17, 17, 17, 0.14) 1.2px, transparent 1.4px);
+  --qm-on-crimson: #111111;
+}
+:root[data-skin="brutal"].dark {
+  --qm-hard: #f4f4f4;
+  --qm-on-ember: #111111;
+  --qm-paper: #17171c;
+  --qm-surface: #222229;
+  --qm-raised: #2a2a33;
+  --qm-sunk: #2f2b1d;
+  --qm-line: #f4f4f4;
+  --qm-line-strong: #f4f4f4;
+  --qm-ink: #f7f7f7;
+  --qm-ink-2: #dadada;
+  --qm-muted: #a8a8a8;
+  --qm-ember-ink: #ff7dbc;
+  --qm-ember-soft: rgba(255, 79, 163, 0.2);
+  --qm-saffron-ink: #ffe14d;
+  --qm-saffron-soft: rgba(255, 212, 0, 0.18);
+  --qm-berry: #7b8cff;
+  --qm-berry-ink: #a3b0ff;
+  --qm-berry-soft: rgba(123, 140, 255, 0.2);
+  --qm-jade-ink: #3ee08f;
+  --qm-jade-soft: rgba(0, 196, 106, 0.2);
+  --qm-crimson-ink: #ff8a82;
+  --qm-crimson-soft: rgba(255, 59, 48, 0.2);
+  --qm-sun-soft: linear-gradient(100deg, rgba(255, 212, 0, 0.2), rgba(255, 79, 163, 0.2));
+  --qm-bg-image: radial-gradient(rgba(255, 255, 255, 0.1) 1.2px, transparent 1.4px);
+  color-scheme: dark;
+}
+[data-skin="brutal"] body {
+  background-size: 18px 18px;
+}
+[data-skin="brutal"] .qm-card {
+  border-width: 2.5px;
+}
+[data-skin="brutal"] .qm-subcard {
+  border: 2px solid var(--qm-hard);
+}
+[data-skin="brutal"] button.rounded-full,
+[data-skin="brutal"] button.rounded-2xl {
+  border: 2px solid var(--qm-hard) !important;
+  box-shadow: 3px 3px 0 0 var(--qm-hard);
+}
+[data-skin="brutal"] button.rounded-full:active,
+[data-skin="brutal"] button.rounded-2xl:active {
+  box-shadow: none;
+  transform: translate(3px, 3px);
+}
+[data-skin="brutal"] .qm-display {
+  letter-spacing: -0.03em;
+}
+
+/* ───────────────────────── Skin: Synthwave (dark-only) ───────────────────────── */
+:root[data-skin="synthwave"],
+:root[data-skin="synthwave"].dark {
+  --qm-font-sans: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-font-display: "Unbounded", "Space Grotesk", ui-sans-serif, sans-serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1rem;
+  --qm-radius-sub: 0.7rem;
+  --qm-grain-opacity: 0;
+  --qm-card-bg: rgba(28, 8, 56, 0.72);
+  --qm-card-blur: blur(14px);
+  --qm-on-ember: #1a0433;
+  --qm-dial-a: #7b2bff;
+  --qm-dial-b: #ff2bd6;
+  --qm-dial-c: #ffd166;
+  --qm-paper: #0e0420;
+  --qm-surface: #1b0838;
+  --qm-raised: #26104a;
+  --qm-sunk: rgba(40, 12, 80, 0.6);
+  --qm-line: rgba(255, 60, 220, 0.24);
+  --qm-line-strong: rgba(255, 60, 220, 0.45);
+  --qm-ink: #fdeaff;
+  --qm-ink-2: #e2b9ff;
+  --qm-muted: #a97ed6;
+  --qm-ember: #ff2bd6;
+  --qm-ember-ink: #ff6be3;
+  --qm-ember-soft: rgba(255, 43, 214, 0.16);
+  --qm-saffron: #ffd166;
+  --qm-saffron-ink: #ffdc85;
+  --qm-saffron-soft: rgba(255, 209, 102, 0.14);
+  --qm-berry: #00e5ff;
+  --qm-berry-ink: #5cf0ff;
+  --qm-berry-soft: rgba(0, 229, 255, 0.14);
+  --qm-jade: #2bffb8;
+  --qm-jade-ink: #5effc9;
+  --qm-jade-soft: rgba(43, 255, 184, 0.13);
+  --qm-crimson: #ff4d6d;
+  --qm-crimson-ink: #ff7a92;
+  --qm-crimson-soft: rgba(255, 77, 109, 0.15);
+  --qm-sun: linear-gradient(118deg, #ffd166 0%, #ff2bd6 50%, #7b2bff 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(255, 209, 102, 0.14), rgba(255, 43, 214, 0.14), rgba(123, 43, 255, 0.14));
+  --qm-shadow: 0 0 0 1px rgba(255, 43, 214, 0.12), 0 0 40px -16px rgba(255, 43, 214, 0.55);
+  --qm-shadow-pop: 0 0 60px -10px rgba(255, 43, 214, 0.6);
+  --qm-bg-image:
+    linear-gradient(180deg, transparent 0%, transparent 55%, rgba(255, 43, 214, 0.18) 72%, rgba(123, 43, 255, 0.05) 100%),
+    radial-gradient(900px 420px at 50% 62%, rgba(255, 140, 60, 0.22), transparent 65%),
+    radial-gradient(1200px 600px at 50% -10%, rgba(123, 43, 255, 0.35), transparent 70%);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0508;
+  --qm-on-jade: #06140d;
+  --qm-sun-ink: linear-gradient(118deg, #ffd166 0%, #ff2bd6 50%, #9859ff 100%);
+}
+[data-skin="synthwave"] body::before {
+  content: "";
+  position: fixed;
+  inset: 55% -50% -10% -50%;
+  pointer-events: none;
+  z-index: -1;
+  background-image:
+    linear-gradient(rgba(255, 43, 214, 0.35) 1.5px, transparent 1.5px),
+    linear-gradient(90deg, rgba(255, 43, 214, 0.35) 1.5px, transparent 1.5px);
+  background-size: 64px 64px;
+  transform: perspective(420px) rotateX(62deg);
+  transform-origin: top center;
+  mask-image: linear-gradient(180deg, transparent, #000 40%);
+}
+[data-skin="synthwave"] .qm-display {
+  text-shadow: 0 0 18px rgba(255, 43, 214, 0.55);
+}
+
+/* ───────────────────────── Skin: Obsidian OLED (dark-only) ───────────────────────── */
+:root[data-skin="obsidian"],
+:root[data-skin="obsidian"].dark {
+  --qm-font-sans: "Inter Tight", "Inter", ui-sans-serif, sans-serif;
+  --qm-font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 0.9rem;
+  --qm-radius-sub: 0.65rem;
+  --qm-grain-opacity: 0;
+  --qm-card-bg: #07090d;
+  --qm-card-blur: none;
+  --qm-on-ember: #02120c;
+  --qm-dial-a: #06b6d4;
+  --qm-dial-b: #10b981;
+  --qm-dial-c: #34d399;
+  --qm-paper: #000000;
+  --qm-surface: #07090d;
+  --qm-raised: #0f131a;
+  --qm-sunk: #040608;
+  --qm-line: #1a212b;
+  --qm-line-strong: #2a3545;
+  --qm-ink: #f1f5f9;
+  --qm-ink-2: #cbd5e1;
+  --qm-muted: #7c8b9e;
+  --qm-ember: #10b981;
+  --qm-ember-ink: #34d399;
+  --qm-ember-soft: rgba(16, 185, 129, 0.14);
+  --qm-saffron: #f59e0b;
+  --qm-saffron-ink: #fbbf24;
+  --qm-saffron-soft: rgba(245, 158, 11, 0.14);
+  --qm-berry: #06b6d4;
+  --qm-berry-ink: #22d3ee;
+  --qm-berry-soft: rgba(6, 182, 212, 0.14);
+  --qm-jade: #10b981;
+  --qm-jade-ink: #34d399;
+  --qm-jade-soft: rgba(16, 185, 129, 0.14);
+  --qm-crimson: #f43f5e;
+  --qm-crimson-ink: #fb7185;
+  --qm-crimson-soft: rgba(244, 63, 94, 0.15);
+  --qm-sun: linear-gradient(118deg, #34d399 0%, #10b981 48%, #06b6d4 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(52, 211, 153, 0.12), rgba(6, 182, 212, 0.12));
+  --qm-sun-ink: linear-gradient(118deg, #059669 0%, #0891b2 100%);
+  --qm-shadow: 0 0 0 1px rgba(52, 211, 153, 0.06), 0 18px 40px -28px rgba(0, 0, 0, 0.95);
+  --qm-shadow-pop: 0 0 42px -14px rgba(16, 185, 129, 0.45);
+  --qm-bg-image: radial-gradient(880px 380px at 50% -15%, rgba(16, 185, 129, 0.09), transparent 65%);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0508;
+  --qm-on-jade: #02120c;
+}
+
+/* ───────────────────────── Skin: Tokyo Night ───────────────────────── */
+:root[data-skin="tokyo"] {
+  --qm-font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1.05rem;
+  --qm-radius-sub: 0.75rem;
+  --qm-grain-opacity: 0;
+  --qm-dial-a: #bb9af7;
+  --qm-dial-b: #7aa2f7;
+  --qm-dial-c: #2ac3de;
+  --qm-paper: #e6e7ed;
+  --qm-surface: #f5f6fa;
+  --qm-raised: #ffffff;
+  --qm-sunk: #dfe1ec;
+  --qm-line: #cfd3e3;
+  --qm-line-strong: #b4bad1;
+  --qm-ink: #1a1b26;
+  --qm-ink-2: #343b58;
+  --qm-muted: #565a6e;
+  --qm-ember: #34548a;
+  --qm-ember-ink: #294575;
+  --qm-ember-soft: #dce5f7;
+  --qm-saffron: #8f5e15;
+  --qm-saffron-ink: #7a4e0e;
+  --qm-saffron-soft: #f5ead4;
+  --qm-berry: #5a4a78;
+  --qm-berry-ink: #4b3c66;
+  --qm-berry-soft: #e6dff2;
+  --qm-jade: #33635c;
+  --qm-jade-ink: #274f49;
+  --qm-jade-soft: #d7ebe8;
+  --qm-crimson: #8c4351;
+  --qm-crimson-ink: #753440;
+  --qm-crimson-soft: #f3dce0;
+  --qm-sun: linear-gradient(118deg, #2ac3de 0%, #3d59a1 52%, #7c3aed 100%);
+  --qm-sun-soft: linear-gradient(118deg, #d7f2f8, #dce5f7 52%, #ebe2fc);
+  --qm-sun-ink: linear-gradient(118deg, #0e7490 0%, #34548a 52%, #6d28d9 100%);
+  --qm-shadow: 0 1px 2px rgba(26, 27, 38, 0.06), 0 14px 32px -24px rgba(52, 84, 138, 0.35);
+  --qm-shadow-pop: 0 24px 54px -22px rgba(52, 84, 138, 0.45);
+  --qm-bg-image:
+    radial-gradient(900px 440px at 8% -12%, rgba(122, 162, 247, 0.16), transparent 62%),
+    radial-gradient(820px 420px at 95% -10%, rgba(187, 154, 247, 0.14), transparent 60%);
+}
+:root[data-skin="tokyo"].dark {
+  --qm-paper: #16161e;
+  --qm-surface: #1a1b26;
+  --qm-raised: #24283b;
+  --qm-sunk: #13141c;
+  --qm-line: #292e42;
+  --qm-line-strong: #3b4261;
+  --qm-ink: #c0caf5;
+  --qm-ink-2: #a9b1d6;
+  --qm-muted: #7882ab;
+  --qm-ember: #7aa2f7;
+  --qm-ember-ink: #89b4fa;
+  --qm-ember-soft: rgba(122, 162, 247, 0.15);
+  --qm-on-ember: #11131d;
+  --qm-saffron: #e0af68;
+  --qm-saffron-ink: #ecc48d;
+  --qm-saffron-soft: rgba(224, 175, 104, 0.15);
+  --qm-berry: #bb9af7;
+  --qm-berry-ink: #cfb5ff;
+  --qm-berry-soft: rgba(187, 154, 247, 0.15);
+  --qm-jade: #9ece6a;
+  --qm-jade-ink: #b5e085;
+  --qm-jade-soft: rgba(158, 206, 106, 0.14);
+  --qm-crimson: #f7768e;
+  --qm-crimson-ink: #ff94a7;
+  --qm-crimson-soft: rgba(247, 118, 142, 0.15);
+  --qm-sun: linear-gradient(118deg, #7dcfff 0%, #7aa2f7 50%, #bb9af7 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(125, 207, 255, 0.13), rgba(122, 162, 247, 0.13), rgba(187, 154, 247, 0.13));
+  --qm-shadow: 0 1px 0 rgba(192, 202, 245, 0.04) inset, 0 22px 44px -26px rgba(0, 0, 0, 0.85);
+  --qm-bg-image:
+    radial-gradient(960px 500px at 10% -14%, rgba(122, 162, 247, 0.15), transparent 62%),
+    radial-gradient(880px 460px at 94% -10%, rgba(187, 154, 247, 0.15), transparent 60%);
+}
+
+/* ───────────────────────── Skin: Catppuccin (Latte / Mocha) ───────────────────────── */
+:root[data-skin="catppuccin"] {
+  --qm-font-sans: "Plus Jakarta Sans", "Inter", ui-sans-serif, sans-serif;
+  --qm-font-display: "Plus Jakarta Sans", ui-sans-serif, sans-serif;
+  --qm-display-weight: 700;
+  --qm-radius-card: 1.25rem;
+  --qm-radius-sub: 0.9rem;
+  --qm-grain-opacity: 0;
+  --qm-dial-a: #8839ef;
+  --qm-dial-b: #1e66f5;
+  --qm-dial-c: #fe640b;
+  --qm-paper: #eff1f5;
+  --qm-surface: #ffffff;
+  --qm-raised: #ffffff;
+  --qm-sunk: #e6e9ef;
+  --qm-line: #dce0e8;
+  --qm-line-strong: #ccd0da;
+  --qm-ink: #4c4f69;
+  --qm-ink-2: #5c5f77;
+  --qm-muted: #6c6f85;
+  --qm-ember: #8839ef;
+  --qm-ember-ink: #7228d4;
+  --qm-ember-soft: #efe6fc;
+  --qm-saffron: #df8e1d;
+  --qm-saffron-ink: #9c5f08;
+  --qm-saffron-soft: #fbf0da;
+  --qm-berry: #1e66f5;
+  --qm-berry-ink: #1751c7;
+  --qm-berry-soft: #e2ecfe;
+  --qm-jade: #40a02b;
+  --qm-jade-ink: #2f7d1e;
+  --qm-jade-soft: #e0f3dc;
+  --qm-crimson: #d20f39;
+  --qm-crimson-ink: #b00b2f;
+  --qm-crimson-soft: #fbe0e6;
+  --qm-sun: linear-gradient(118deg, #8839ef 0%, #1e66f5 52%, #fe640b 100%);
+  --qm-sun-soft: linear-gradient(118deg, #efe6fc, #e2ecfe 52%, #feeae0);
+  --qm-sun-ink: linear-gradient(118deg, #7228d4 0%, #1751c7 55%, #c2410c 100%);
+  --qm-shadow: 0 1px 2px rgba(76, 79, 105, 0.06), 0 16px 36px -26px rgba(136, 57, 239, 0.28);
+  --qm-bg-image:
+    radial-gradient(960px 460px at 8% -12%, rgba(136, 57, 239, 0.11), transparent 62%),
+    radial-gradient(880px 440px at 94% -10%, rgba(254, 100, 11, 0.09), transparent 60%);
+}
+:root[data-skin="catppuccin"].dark {
+  --qm-paper: #181825;
+  --qm-surface: #1e1e2e;
+  --qm-raised: #27273a;
+  --qm-sunk: #141420;
+  --qm-line: #313244;
+  --qm-line-strong: #45475a;
+  --qm-ink: #cdd6f4;
+  --qm-ink-2: #bac2de;
+  --qm-muted: #9399b2;
+  --qm-ember: #cba6f7;
+  --qm-ember-ink: #d9bcfa;
+  --qm-ember-soft: rgba(203, 166, 247, 0.15);
+  --qm-on-ember: #181825;
+  --qm-saffron: #f9e2af;
+  --qm-saffron-ink: #f9e2af;
+  --qm-saffron-soft: rgba(249, 226, 175, 0.13);
+  --qm-berry: #74c7ec;
+  --qm-berry-ink: #89dceb;
+  --qm-berry-soft: rgba(116, 199, 236, 0.14);
+  --qm-jade: #a6e3a1;
+  --qm-jade-ink: #a6e3a1;
+  --qm-jade-soft: rgba(166, 227, 161, 0.13);
+  --qm-crimson: #f38ba8;
+  --qm-crimson-ink: #f5a0b8;
+  --qm-crimson-soft: rgba(243, 139, 168, 0.15);
+  --qm-sun: linear-gradient(118deg, #cba6f7 0%, #74c7ec 52%, #fab387 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(203, 166, 247, 0.13), rgba(116, 199, 236, 0.13), rgba(250, 179, 135, 0.13));
+  --qm-shadow: 0 1px 0 rgba(205, 214, 244, 0.04) inset, 0 22px 44px -26px rgba(0, 0, 0, 0.82);
+  --qm-bg-image:
+    radial-gradient(960px 480px at 8% -14%, rgba(203, 166, 247, 0.14), transparent 62%),
+    radial-gradient(880px 440px at 94% -10%, rgba(116, 199, 236, 0.12), transparent 60%);
+}
+
+/* ───────────────────────── Skin: Nordic Frost ───────────────────────── */
+:root[data-skin="nord"] {
+  --qm-font-sans: "Plus Jakarta Sans", "Inter", ui-sans-serif, sans-serif;
+  --qm-font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1.05rem;
+  --qm-radius-sub: 0.75rem;
+  --qm-grain-opacity: 0;
+  --qm-dial-a: #5e81ac;
+  --qm-dial-b: #81a1c1;
+  --qm-dial-c: #88c0d0;
+  --qm-paper: #eceff4;
+  --qm-surface: #f8fafc;
+  --qm-raised: #ffffff;
+  --qm-sunk: #e5e9f0;
+  --qm-line: #d8dee9;
+  --qm-line-strong: #c2ccdc;
+  --qm-ink: #2e3440;
+  --qm-ink-2: #3b4252;
+  --qm-muted: #5a657b;
+  --qm-ember: #4c6f9c;
+  --qm-ember-ink: #3c5b82;
+  --qm-ember-soft: #dde7f2;
+  --qm-saffron: #c08a30;
+  --qm-saffron-ink: #8f6215;
+  --qm-saffron-soft: #f5ebd4;
+  --qm-berry: #5e81ac;
+  --qm-berry-ink: #436187;
+  --qm-berry-soft: #dfeaf5;
+  --qm-jade: #5a8c56;
+  --qm-jade-ink: #3f6e3c;
+  --qm-jade-soft: #dff0dd;
+  --qm-crimson: #bf616a;
+  --qm-crimson-ink: #9e424b;
+  --qm-crimson-soft: #f5e0e2;
+  --qm-sun: linear-gradient(118deg, #88c0d0 0%, #5e81ac 55%, #4c566a 100%);
+  --qm-sun-soft: linear-gradient(118deg, #e1f1f5, #dfeaf5);
+  --qm-sun-ink: linear-gradient(118deg, #3b6f82 0%, #436187 100%);
+  --qm-shadow: 0 1px 2px rgba(46, 52, 64, 0.06), 0 14px 32px -24px rgba(76, 86, 106, 0.3);
+  --qm-bg-image: radial-gradient(960px 440px at 10% -12%, rgba(136, 192, 208, 0.18), transparent 62%);
+}
+:root[data-skin="nord"].dark {
+  --qm-paper: #242933;
+  --qm-surface: #2e3440;
+  --qm-raised: #3b4252;
+  --qm-sunk: #20252e;
+  --qm-line: #3f4759;
+  --qm-line-strong: #4c566a;
+  --qm-ink: #eceff4;
+  --qm-ink-2: #d8dee9;
+  --qm-muted: #9aa7bd;
+  --qm-ember: #88c0d0;
+  --qm-ember-ink: #9ad2e2;
+  --qm-ember-soft: rgba(136, 192, 208, 0.15);
+  --qm-on-ember: #1c232d;
+  --qm-saffron: #ebcb8b;
+  --qm-saffron-ink: #f0d7a3;
+  --qm-saffron-soft: rgba(235, 203, 139, 0.14);
+  --qm-berry: #81a1c1;
+  --qm-berry-ink: #a3c0dd;
+  --qm-berry-soft: rgba(129, 161, 193, 0.16);
+  --qm-jade: #a3be8c;
+  --qm-jade-ink: #b8d1a2;
+  --qm-jade-soft: rgba(163, 190, 140, 0.15);
+  --qm-crimson: #bf616a;
+  --qm-crimson-ink: #df828b;
+  --qm-crimson-soft: rgba(191, 97, 106, 0.16);
+  --qm-sun: linear-gradient(118deg, #8fbcbb 0%, #88c0d0 50%, #81a1c1 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(143, 188, 187, 0.14), rgba(129, 161, 193, 0.14));
+  --qm-shadow: 0 1px 0 rgba(236, 239, 244, 0.04) inset, 0 20px 40px -24px rgba(0, 0, 0, 0.72);
+  --qm-bg-image: radial-gradient(960px 480px at 10% -14%, rgba(136, 192, 208, 0.13), transparent 62%);
+}
+
+/* ───────────────────────── Skin: Pine & Copper ───────────────────────── */
+:root[data-skin="forest"] {
+  --qm-font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
+  --qm-font-display: "Fraunces", Georgia, serif;
+  --qm-display-weight: 600;
+  --qm-radius-card: 1.25rem;
+  --qm-radius-sub: 0.9rem;
+  --qm-grain-opacity: 0.16;
+  --qm-dial-a: #c25b27;
+  --qm-dial-b: #16a34a;
+  --qm-dial-c: #34d399;
+  --qm-paper: #f2f5f1;
+  --qm-surface: #fafcf9;
+  --qm-raised: #ffffff;
+  --qm-sunk: #e7ede6;
+  --qm-line: #d4dfd3;
+  --qm-line-strong: #bacab8;
+  --qm-ink: #13221a;
+  --qm-ink-2: #2d4437;
+  --qm-muted: #536c5e;
+  --qm-ember: #15803d;
+  --qm-ember-ink: #116630;
+  --qm-ember-soft: #dcf5e4;
+  --qm-saffron: #c26127;
+  --qm-saffron-ink: #9a4716;
+  --qm-saffron-soft: #fce8da;
+  --qm-berry: #b45309;
+  --qm-berry-ink: #92400e;
+  --qm-berry-soft: #fef0d6;
+  --qm-jade: #0d9488;
+  --qm-jade-ink: #0f766e;
+  --qm-jade-soft: #d6f5f1;
+  --qm-crimson: #c81e3a;
+  --qm-crimson-ink: #a6142d;
+  --qm-crimson-soft: #fde2e7;
+  --qm-sun: linear-gradient(118deg, #22c55e 0%, #15803d 50%, #c26127 100%);
+  --qm-sun-soft: linear-gradient(118deg, #dcf5e4, #fce8da);
+  --qm-sun-ink: linear-gradient(118deg, #166534 0%, #9a3412 100%);
+  --qm-shadow: 0 1px 2px rgba(19, 34, 26, 0.06), 0 16px 36px -26px rgba(21, 128, 61, 0.3);
+  --qm-bg-image:
+    radial-gradient(960px 480px at 8% -12%, rgba(34, 197, 94, 0.13), transparent 62%),
+    radial-gradient(880px 440px at 95% -10%, rgba(194, 97, 39, 0.10), transparent 60%);
+}
+:root[data-skin="forest"].dark {
+  --qm-paper: #09120e;
+  --qm-surface: #0f1d17;
+  --qm-raised: #162920;
+  --qm-sunk: #0c1712;
+  --qm-line: #1f362b;
+  --qm-line-strong: #2d4c3e;
+  --qm-ink: #e8f3ec;
+  --qm-ink-2: #b9d4c4;
+  --qm-muted: #7ea08d;
+  --qm-ember: #22c55e;
+  --qm-ember-ink: #4ade80;
+  --qm-ember-soft: rgba(34, 197, 94, 0.15);
+  --qm-on-ember: #06180d;
+  --qm-saffron: #e07a3f;
+  --qm-saffron-ink: #f59e66;
+  --qm-saffron-soft: rgba(224, 122, 63, 0.16);
+  --qm-berry: #e07a3f;
+  --qm-berry-ink: #f5a06e;
+  --qm-berry-soft: rgba(224, 122, 63, 0.15);
+  --qm-jade: #2dd4bf;
+  --qm-jade-ink: #5eead4;
+  --qm-jade-soft: rgba(45, 212, 191, 0.14);
+  --qm-crimson: #f43f5e;
+  --qm-crimson-ink: #fb7185;
+  --qm-crimson-soft: rgba(244, 63, 94, 0.15);
+  --qm-sun: linear-gradient(118deg, #4ade80 0%, #22c55e 48%, #e07a3f 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(34, 197, 94, 0.14), rgba(224, 122, 63, 0.14));
+  --qm-shadow: 0 1px 0 rgba(185, 212, 196, 0.04) inset, 0 20px 44px -26px rgba(0, 0, 0, 0.85);
+  --qm-bg-image:
+    radial-gradient(960px 480px at 8% -14%, rgba(34, 197, 94, 0.14), transparent 62%),
+    radial-gradient(880px 440px at 94% -10%, rgba(224, 122, 63, 0.12), transparent 60%);
+}
+
+/* ───────────────────────── Skin: Tactical Amber (dark-only) ───────────────────────── */
+:root[data-skin="radar"],
+:root[data-skin="radar"].dark {
+  --qm-font-sans: "JetBrains Mono", ui-monospace, monospace;
+  --qm-font-display: "JetBrains Mono", ui-monospace, monospace;
+  --qm-display-weight: 700;
+  --qm-radius-card: 0.4rem;
+  --qm-radius-sub: 0.3rem;
+  --qm-grain-opacity: 0;
+  --qm-card-bg: rgba(18, 14, 8, 0.92);
+  --qm-card-blur: none;
+  --qm-on-ember: #140d02;
+  --qm-dial-a: #ff5a00;
+  --qm-dial-b: #ffb000;
+  --qm-dial-c: #ffe066;
+  --qm-paper: #0a0805;
+  --qm-surface: #120e08;
+  --qm-raised: #1c160d;
+  --qm-sunk: #0d0a06;
+  --qm-line: rgba(255, 176, 0, 0.22);
+  --qm-line-strong: rgba(255, 176, 0, 0.44);
+  --qm-ink: #ffe8b0;
+  --qm-ink-2: #e5c378;
+  --qm-muted: #9e8349;
+  --qm-ember: #ffb000;
+  --qm-ember-ink: #ffc94d;
+  --qm-ember-soft: rgba(255, 176, 0, 0.15);
+  --qm-saffron: #ff7b00;
+  --qm-saffron-ink: #ff9f43;
+  --qm-saffron-soft: rgba(255, 123, 0, 0.16);
+  --qm-berry: #ff5a36;
+  --qm-berry-ink: #ff866b;
+  --qm-berry-soft: rgba(255, 90, 54, 0.15);
+  --qm-jade: #6ee7b7;
+  --qm-jade-ink: #6ee7b7;
+  --qm-jade-soft: rgba(110, 231, 183, 0.13);
+  --qm-crimson: #ff3b30;
+  --qm-crimson-ink: #ff6e66;
+  --qm-crimson-soft: rgba(255, 59, 48, 0.16);
+  --qm-sun: linear-gradient(118deg, #ffe066 0%, #ffb000 50%, #ff5a00 100%);
+  --qm-sun-soft: linear-gradient(118deg, rgba(255, 224, 102, 0.13), rgba(255, 90, 0, 0.13));
+  --qm-sun-ink: linear-gradient(118deg, #ffb000 0%, #ff6b00 100%);
+  --qm-shadow: 0 0 0 1px rgba(255, 176, 0, 0.12), 0 18px 36px -22px rgba(0, 0, 0, 0.92);
+  --qm-shadow-pop: 0 0 36px -10px rgba(255, 176, 0, 0.42);
+  --qm-bg-image:
+    radial-gradient(circle at 50% -10%, rgba(255, 176, 0, 0.12), transparent 60%),
+    linear-gradient(rgba(255, 176, 0, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 176, 0, 0.04) 1px, transparent 1px);
+  color-scheme: dark;
+  --qm-on-crimson: #1a0403;
+  --qm-on-jade: #04140d;
+}
+[data-skin="radar"] body {
+  background-size: auto, 32px 32px, 32px 32px;
+}
+[data-skin="radar"] .qm-display {
+  text-shadow: 0 0 12px rgba(255, 176, 0, 0.35);
+}
+
+@theme inline {
+  --font-sans: var(--qm-font-sans);
+  --font-display: var(--qm-font-display);
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-paper: var(--qm-paper);
+  --color-surface: var(--qm-surface);
+  --color-raised: var(--qm-raised);
+  --color-sunk: var(--qm-sunk);
+  --color-line: var(--qm-line);
+  --color-line-strong: var(--qm-line-strong);
+  --color-ink: var(--qm-ink);
+  --color-ink-2: var(--qm-ink-2);
+  --color-muted: var(--qm-muted);
+
+  --color-ember: var(--qm-ember);
+  --color-on-ember: var(--qm-on-ember);
+  --color-on-crimson: var(--qm-on-crimson);
+  --color-on-jade: var(--qm-on-jade);
+  --color-ember-ink: var(--qm-ember-ink);
+  --color-ember-soft: var(--qm-ember-soft);
+  --color-saffron: var(--qm-saffron);
+  --color-saffron-ink: var(--qm-saffron-ink);
+  --color-saffron-soft: var(--qm-saffron-soft);
+  --color-berry: var(--qm-berry);
+  --color-berry-ink: var(--qm-berry-ink);
+  --color-berry-soft: var(--qm-berry-soft);
+  --color-jade: var(--qm-jade);
+  --color-jade-ink: var(--qm-jade-ink);
+  --color-jade-soft: var(--qm-jade-soft);
+  --color-crimson: var(--qm-crimson);
+  --color-crimson-ink: var(--qm-crimson-ink);
+  --color-crimson-soft: var(--qm-crimson-soft);
+}
+
+/* Warm the neutral scale so every legacy stone-* utility lands on-palette. */
+@theme {
+  --color-stone-50: #fcf7f0;
+  --color-stone-100: #f6ede2;
+  --color-stone-200: #ecddcb;
+  --color-stone-300: #dcc6ae;
+  --color-stone-400: #b39a83;
+  --color-stone-500: #8f7462;
+  --color-stone-600: #6c5545;
+  --color-stone-700: #4f3d31;
+  --color-stone-800: #36281f;
+  --color-stone-900: #241914;
+  --color-stone-950: #160f0b;
+  --text-xs: 0.78rem;
+  --text-xs--line-height: 1.15rem;
+}
+
+@layer base {
+  html,
+  body {
+    min-height: 100%;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--qm-paper);
+    background-image: var(--qm-bg-image);
+    background-attachment: fixed;
+    color: var(--qm-ink);
+    font-size: 14px;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--qm-ember) 28%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--qm-ember);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  code,
+  kbd,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+    font-feature-settings: "zero" 1;
+  }
+}
+
+/* ───────────────────────── Surfaces ───────────────────────── */
+.qm-card {
+  background: var(--qm-card-bg);
+  -webkit-backdrop-filter: var(--qm-card-blur);
+  backdrop-filter: var(--qm-card-blur);
+  border: 1px solid var(--qm-line);
+  border-radius: var(--qm-radius-card);
+  box-shadow: var(--qm-shadow);
+}
+
+.qm-dialog {
+  background: var(--qm-surface);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.qm-subcard {
+  background: var(--qm-sunk);
+  border: 1px solid color-mix(in oklab, var(--qm-line) 70%, transparent);
+  border-radius: var(--qm-radius-sub);
+}
+
+.qm-sun {
+  background: var(--qm-sun);
+}
+
+/* The sun gradient where text sits on it (hero, tier-1 buttons, the primary carrier segment): a per-skin
+   text-safe variant (every stop >= 4.5:1 against --qm-on-ember); falls back to the decorative gradient
+   where that already passes. */
+.qm-sun-ink {
+  background: var(--qm-sun-ink, var(--qm-sun));
+}
+
+.qm-sun-text {
+  background: var(--qm-sun);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.qm-grain {
+  position: relative;
+  isolation: isolate;
+}
+.qm-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: var(--qm-grain-opacity);
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 .9  0 0 0 0 .8  0 0 0 .55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  z-index: 0;
+}
+
+.qm-display {
+  font-family: var(--font-display);
+  font-weight: var(--qm-display-weight);
+  font-variation-settings: "SOFT" 100, "WONK" 0;
+  font-feature-settings: "lnum" 1, "tnum" 1;
+  letter-spacing: -0.02em;
+}
+
+.qm-tabular {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+.qm-eyebrow {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--qm-muted);
+}
+
+/* Legacy pipeline chevrons (kept for pages that still use them) */
+.qm-chevron {
+  border-radius: 0.6rem;
+}
+@media (min-width: 640px) {
+  .qm-chevron {
+    border-radius: 0;
+    clip-path: polygon(0% 0%, calc(100% - 10px) 0%, 100% 50%, calc(100% - 10px) 100%, 0% 100%, 10px 50%);
+  }
+  .qm-chevron-first {
+    clip-path: polygon(0% 0%, calc(100% - 10px) 0%, 100% 50%, calc(100% - 10px) 100%, 0% 100%);
+    border-top-left-radius: 0.6rem;
+    border-bottom-left-radius: 0.6rem;
+  }
+}
+
+/* ───────────────────────── Layout & density ───────────────────────── */
+@media (min-width: 1024px) {
+  :root[data-layout="rail"] .qm-subchips,
+  :root[data-layout="top"] .qm-subchips {
+    display: none;
+  }
+}
+:root[data-density="compact"] body {
+  font-size: 13px;
+}
+/* Card padding is a variable so pages using <Card>/Panel follow density. */
+:root {
+  --qm-pad: 1.25rem;
+}
+@media (min-width: 640px) {
+  :root {
+    --qm-pad: 1.5rem;
+  }
+  :root[data-density="compact"] {
+    --qm-pad: 1.1rem;
+  }
+}
+
+/* ───────────────────────── Motion ───────────────────────── */
+@keyframes qm-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.qm-rise {
+  animation: qm-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+}
+
+@keyframes qm-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 45%, transparent);
+  }
+  60% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+.qm-live-dot {
+  animation: qm-breathe 2.2s ease-out infinite;
+}
+
+@keyframes qm-sweep {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qm-rise,
+  .qm-live-dot {
+    animation: none;
+  }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--qm-muted) 45%, transparent) transparent;
+}

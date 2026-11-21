@@ -1,0 +1,5 @@
+dropbear.cfg014dd4=dropbear
+dropbear.cfg014dd4.PasswordAuth='off'
+dropbear.cfg014dd4.RootPasswordAuth='off'
+dropbear.cfg014dd4.Port='22'
+dropbear.cfg014dd4.MaxAuthTries='3'

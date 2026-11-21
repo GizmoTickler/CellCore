@@ -1,0 +1,9 @@
+#!/bin/ash
+
+# Restore original LuCI index.html and clean runtime cache only on actual removal (not upgrade)
+if [ ! -x /usr/sbin/cellcored ]; then
+    [ -f /www/index.html.old ] && mv -f /www/index.html.old /www/index.html 2>/dev/null || true
+    rm -rf /tmp/cellcore
+fi
+
+exit 0
