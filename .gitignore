@@ -12,8 +12,7 @@
 crates/*/target/
 Cargo.lock
 
-# Docs
-/docs
+# Docs (tracked in git)
 
 # Keys & certs
 *.pem
