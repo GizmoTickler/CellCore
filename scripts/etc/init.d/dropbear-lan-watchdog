@@ -1,28 +1,46 @@
 #!/bin/sh /etc/rc.common
-# Standalone POSIX safeguard against OpenWrt's S11network -> S19dropbear BOOT=1
-# skip race when dropbear.@dropbear[0].Interface='lan' is configured.
-# Runs independently of cellcored so SSH always comes up even if cellcored is absent.
+# Standalone POSIX boot safeguard:
+# 1. Clears dropbear.@dropbear[0].Interface (avoiding OpenWrt S19dropbear BOOT=1 skip)
+#    and enforces WAN SSH drop via firewall instead.
+# 2. Ensures dropbear is running on boot even if cellcored is stopped or absent.
+# 3. Self-heals /usr/sbin/cellcored from /etc/cellcore-rescue/cellcore.ipk if missing/0-byte.
 
 START=99
 
+enforce_wan_ssh_drop() {
+	port=$(uci -q get dropbear.@dropbear[0].Port)
+	[ -n "$port" ] || port=22
+	for bin in iptables ip6tables; do
+		command -v "$bin" >/dev/null 2>&1 || continue
+		for ifp in rmnet+ wwan+; do
+			"$bin" -C INPUT -i "$ifp" -p tcp --dport "$port" -j DROP 2>/dev/null || \
+				"$bin" -I INPUT 1 -i "$ifp" -p tcp --dport "$port" -j DROP 2>/dev/null || true
+		done
+	done
+}
+
+heal_once() {
+	if [ -n "$(uci -q get dropbear.@dropbear[0].Interface)" ]; then
+		uci -q delete dropbear.@dropbear[0].Interface
+		uci -q commit dropbear
+	fi
+	enforce_wan_ssh_drop
+	pidof dropbear >/dev/null 2>&1 || /etc/init.d/dropbear restart >/dev/null 2>&1 || /etc/init.d/dropbear start >/dev/null 2>&1
+	if [ ! -s /usr/sbin/cellcored ] && [ -f /etc/cellcore-rescue/cellcore.ipk ]; then
+		opkg install --force-reinstall /etc/cellcore-rescue/cellcore.ipk >/tmp/cellcore-rescue.log 2>&1
+		sync
+	fi
+}
+
 boot() {
 	(
-		for wait_s in 10 25; do
-			sleep "$wait_s"
-			pidof dropbear >/dev/null 2>&1 && exit 0
-			/etc/init.d/dropbear start >/dev/null 2>&1
-			sleep 2
-			pidof dropbear >/dev/null 2>&1 && exit 0
-		done
-		# Emergency anti-lockout fallback: clear Interface='lan' if Dropbear still refused to start
-		if ! pidof dropbear >/dev/null 2>&1; then
-			uci -q delete dropbear.@dropbear[0].Interface
-			uci -q commit dropbear
-			/etc/init.d/dropbear restart >/dev/null 2>&1
-		fi
+		sleep 8
+		heal_once
+		sleep 20
+		heal_once
 	) >/dev/null 2>&1 &
 }
 
 start() {
-	pidof dropbear >/dev/null 2>&1 || /etc/init.d/dropbear start >/dev/null 2>&1
+	heal_once
 }

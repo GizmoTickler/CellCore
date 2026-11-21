@@ -602,6 +602,50 @@ pub fn current_usb_gadget_udc() -> (String, String, bool) {
     (current, controller, adb_present)
 }
 
+fn adbd_is_running() -> bool {
+    let Ok(entries) = fs::read_dir(crate::paths::p("/proc")) else {
+        return false;
+    };
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let ns = name.to_string_lossy();
+        if !ns.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(comm) = fs::read_to_string(ent.path().join("comm"))
+            && comm.trim() == "adbd"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove dangling `f* -> .../ffs.adb` symlinks from `usb_gadget/g1/configs/c.1` when `adbd`
+/// is disabled so Qualcomm ConfigFS `UDC` bind (`gsi.ecm` + `cser.dun` AT ports) succeeds
+/// without exposing ADB.
+fn unlink_dangling_ffs_adb() -> bool {
+    if adbd_is_running() {
+        return false;
+    }
+    let cfg_dir = crate::paths::p("/sys/kernel/config/usb_gadget/g1/configs/c.1");
+    let Ok(entries) = fs::read_dir(&cfg_dir) else {
+        return false;
+    };
+    let mut removed = false;
+    for ent in entries.flatten() {
+        let p = ent.path();
+        let is_adb_link = ent.file_name().to_string_lossy().contains("ffs.adb")
+            || fs::read_link(&p)
+                .ok()
+                .is_some_and(|t| t.to_string_lossy().contains("ffs.adb"));
+        if is_adb_link && fs::remove_file(&p).is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
 pub fn set_usb_gadget_enabled(enable: bool) -> Result<String, String> {
     let udc_s = crate::paths::p("/sys/kernel/config/usb_gadget/g1/UDC");
     let udc_path = Path::new(&udc_s);
@@ -610,9 +654,10 @@ pub fn set_usb_gadget_enabled(enable: bool) -> Result<String, String> {
     }
     let _ = fs::create_dir_all(crate::paths::p("/etc/cellcore"));
     if enable {
+        let _ = unlink_dangling_ffs_adb();
         let (current, controller, adb_present) = current_usb_gadget_udc();
         if adb_present {
-            return Err("Refusing to bind USB gadget while ffs.adb is present".into());
+            return Err("Refusing to bind USB gadget while active ffs.adb is present".into());
         }
         if controller.is_empty() {
             return Err("No USB UDC controller found in /sys/class/udc".into());
@@ -635,8 +680,14 @@ pub fn set_usb_gadget_enabled(enable: bool) -> Result<String, String> {
 }
 
 fn ensure_usb_gadget_bound(actions: &mut Vec<String>, warnings: &mut Vec<String>) -> String {
+    if Path::new(&crate::paths::p(USB_DISABLED_MARKER)).exists() {
+        return current_usb_gadget_udc().0;
+    }
+    if unlink_dangling_ffs_adb() {
+        actions.push("Unlinked dangling ffs.adb symlink from usb_gadget/g1/configs/c.1".into());
+    }
     let (cur, ctrl, adb_present) = current_usb_gadget_udc();
-    if !cur.is_empty() || ctrl.is_empty() || adb_present || Path::new(&crate::paths::p(USB_DISABLED_MARKER)).exists() {
+    if !cur.is_empty() || ctrl.is_empty() || adb_present {
         return cur;
     }
     let udc_s = crate::paths::p("/sys/kernel/config/usb_gadget/g1/UDC");
@@ -854,11 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn usb_gadget_detects_ffs_adb_symlink_target() {
+    fn usb_gadget_detects_active_adbd_and_unlinks_dangling_ffs_adb() {
         let env = crate::paths::TestSandbox::new("usb-adb-symlink");
         env.write("/sys/class/udc/a600000.dwc3/uevent", "");
         env.write("/sys/kernel/config/usb_gadget/g1/UDC", "");
         env.write("/sys/kernel/config/usb_gadget/g1/functions/ffs.adb/.keep", "");
+        let adbd_comm = env.write("/proc/4242/comm", "adbd\n");
         let cfg = env.root.join("sys/kernel/config/usb_gadget/g1/configs/c.1");
         std::fs::create_dir_all(&cfg).unwrap();
         std::os::unix::fs::symlink(
@@ -869,8 +921,14 @@ mod tests {
 
         let (_, _, adb) = current_usb_gadget_udc();
         assert!(adb, "symlink target containing ffs.adb must be detected");
+        // While adbd is running, binding UDC is refused to avoid exposing ADB.
         let err = set_usb_gadget_enabled(true).unwrap_err();
         assert!(err.contains("ffs.adb"), "{err}");
+
+        // Once adbd is disabled/stopped, dangling f5 -> ffs.adb is unlinked so UDC binds cleanly.
+        std::fs::remove_file(adbd_comm).unwrap();
+        assert_eq!(set_usb_gadget_enabled(true).unwrap(), "a600000.dwc3");
+        assert!(!cfg.join("f5").exists());
     }
 
     #[test]

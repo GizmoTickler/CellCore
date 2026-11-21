@@ -136,41 +136,94 @@ pub fn dropbear_configured_port() -> u16 {
         .unwrap_or(22)
 }
 
-/// Evaluate whether `dropbear` is bound strictly to `lan` (not wildcard 0.0.0.0/::)
-/// and verify it is actually listening on its configured SSH port.
+const NFT_SSH_LAN_PATH: &str = "/etc/nftables.d/25-cellcore-ssh-lan.nft";
+
+fn has_wan_ssh_drop_rule(port: u16) -> bool {
+    if Path::new(&crate::paths::p(NFT_SSH_LAN_PATH)).exists() {
+        return true;
+    }
+    let v4 = run_cmd_blocking_timeout("iptables", &["-S", "INPUT"], Duration::from_secs(2))
+        .unwrap_or_default();
+    let needle = format!("--dport {port}");
+    (v4.contains("rmnet+") && v4.contains(&needle) && v4.contains("DROP"))
+        || (v4.contains("rmnet") && v4.contains("MGW1_WAN_IN"))
+}
+
+fn apply_wan_ssh_drop_rules(port: u16) {
+    let p_str = port.to_string();
+    for bin in ["iptables", "ip6tables"] {
+        for ifp in ["rmnet+", "wwan+"] {
+            let exists = run_cmd_blocking_timeout(
+                bin,
+                &["-C", "INPUT", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
+                Duration::from_secs(2),
+            )
+            .is_ok();
+            if !exists {
+                let _ = run_cmd_blocking_timeout(
+                    bin,
+                    &["-I", "INPUT", "1", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
+                    Duration::from_secs(2),
+                );
+            }
+        }
+    }
+    if Path::new(&crate::paths::p("/etc/nftables.d")).exists() {
+        let nft_rule = format!(
+            "chain cellcore_ssh_wan_guard {{\n\ttype filter hook input priority -5; policy accept;\n\tiifname {{ \"rmnet*\", \"wwan*\" }} tcp dport {port} drop comment \"cellcore: block WAN SSH\"\n}}\n"
+        );
+        if crate::state::atomic_write(Path::new(NFT_SSH_LAN_PATH), nft_rule.as_bytes(), 0o644).is_ok() {
+            let _ = run_cmd_blocking_timeout("fw4", &["reload"], Duration::from_secs(5));
+        }
+    }
+}
+
+/// Evaluate whether `dropbear` has `Interface` unset (boot-safe) while WAN SSH
+/// is blocked at the firewall and port 22 is actively listening.
 fn check_dropbear_lan_only() -> SecurityCheck {
     let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
     let port = dropbear_configured_port();
-    let bound_lan = iface.trim().eq_ignore_ascii_case("lan");
+    let has_iface_lockout_risk = !iface.trim().is_empty();
     let live = probe_tcp_port_listener(port);
-    if bound_lan {
-        if matches!(live, Some((false, _))) {
-            return SecurityCheck {
-                id: "dropbear_lan_only".into(),
-                title: "SSH bound to LAN only".into(),
-                status: "fail".into(),
-                detail: format!(
-                    "Dropbear Interface='lan' is set, but port {port} is NOT listening — click Fix to recover"
-                ),
-                fix_action: Some("dropbear_lan_only".into()),
-            };
-        }
+    let fw_guarded = has_wan_ssh_drop_rule(port);
+    if has_iface_lockout_risk {
+        return SecurityCheck {
+            id: "dropbear_lan_only".into(),
+            title: "SSH protected from WAN (boot-safe)".into(),
+            status: "warn".into(),
+            detail: format!(
+                "Dropbear Interface='{}' risks OpenWrt BOOT=1 SSH skip — click Fix to switch to boot-safe firewall WAN block",
+                iface.trim()
+            ),
+            fix_action: Some("dropbear_lan_only".into()),
+        };
+    }
+    if matches!(live, Some((false, _))) {
+        return SecurityCheck {
+            id: "dropbear_lan_only".into(),
+            title: "SSH protected from WAN (boot-safe)".into(),
+            status: "fail".into(),
+            detail: format!("Dropbear port {port} is NOT listening — click Fix to recover"),
+            fix_action: Some("dropbear_lan_only".into()),
+        };
+    }
+    if fw_guarded {
         SecurityCheck {
             id: "dropbear_lan_only".into(),
-            title: "SSH bound to LAN only".into(),
+            title: "SSH protected from WAN (boot-safe)".into(),
             status: "pass".into(),
             detail: format!(
-                "Dropbear Interface='lan' · listening on LAN port {port} (boot anti-lockout watchdog active)"
+                "Dropbear Interface unset (boot-safe) · WAN port {port} blocked in firewall · listening"
             ),
             fix_action: None,
         }
     } else {
         SecurityCheck {
             id: "dropbear_lan_only".into(),
-            title: "SSH bound to LAN only".into(),
+            title: "SSH protected from WAN (boot-safe)".into(),
             status: "warn".into(),
             detail: format!(
-                "Dropbear listens on wildcard 0.0.0.0:{port} (relying solely on WAN firewall)"
+                "Dropbear listening on port {port}, but explicit rmnet/wwan SSH DROP rule not yet installed"
             ),
             fix_action: Some("dropbear_lan_only".into()),
         }
@@ -461,19 +514,6 @@ pub fn tighten_sensitive_permissions() -> Vec<String> {
     fixed
 }
 
-fn lan_has_live_ip() -> bool {
-    if crate::netlink::get_iface_ipv4("br-lan").is_some() {
-        return true;
-    }
-    run_cmd_blocking_timeout(
-        "ubus",
-        &["call", "network.interface.lan", "status"],
-        Duration::from_secs(2),
-    )
-    .map(|out| out.contains("\"address\""))
-    .unwrap_or(false)
-}
-
 fn wait_for_tcp_port_listening(port: u16, attempts: usize, step: Duration) -> bool {
     for _ in 0..attempts {
         if matches!(probe_tcp_port_listener(port), Some((true, _))) {
@@ -491,26 +531,21 @@ fn rollback_dropbear_interface() {
 }
 
 pub fn bind_dropbear_lan_only() -> Result<String, String> {
-    if !lan_has_live_ip() {
-        return Err(
-            "LAN interface has no active IP address — refusing to bind Dropbear to 'lan' to prevent SSH lockout"
-                .into(),
-        );
-    }
     let port = dropbear_configured_port();
-    run_cmd_blocking_timeout("uci", &["set", "dropbear.@dropbear[0].Interface=lan"], Duration::from_secs(3))?;
-    run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3))?;
+    // Always keep dropbear.@dropbear[0].Interface UNSET so OpenWrt S19dropbear
+    // starts unconditionally on every boot even if cellcored is absent/stopped,
+    // and enforce LAN-only SSH at the kernel firewall layer instead.
+    let _ = run_cmd_blocking_timeout("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
+    let _ = run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3));
+    apply_wan_ssh_drop_rules(port);
     let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
 
-    // Verify Dropbear actually came back up on its SSH port; auto-rollback if not.
     if probe_tcp_port_listener(port).is_some()
         && !wait_for_tcp_port_listening(port, 10, Duration::from_millis(250))
     {
-        rollback_dropbear_interface();
-        return Err(format!(
-            "Dropbear failed to listen on port {port} after binding Interface='lan' — automatically rolled back to wildcard listening to prevent SSH lockout"
-        ));
+        let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
     }
+
     // Ensure standalone POSIX S99 init safeguard is installed & enabled so Dropbear
     // starts after boot even if cellcored itself is ever absent or stopped.
     let wdog_init = Path::new("/etc/init.d/dropbear-lan-watchdog");
@@ -521,17 +556,12 @@ pub fn bind_dropbear_lan_only() -> Result<String, String> {
         }
     }
     Ok(format!(
-        "Bound Dropbear SSH to Interface='lan' and verified listening on port {port}"
+        "Cleared Dropbear Interface (boot-safe), enforced WAN port {port} firewall drop, and verified SSH listening"
     ))
 }
 
-/// Reconcile Dropbear after OpenWrt boot.
-///
-/// OpenWrt's `/etc/init.d/dropbear` skips starting when `Interface` is set and
-/// `BOOT=1` (waiting for a hotplug `interface.*` event that already fired when
-/// `S11network` brought up static `br-lan` before `S19dropbear`). Invoking
-/// `/etc/init.d/dropbear start` cleanly after boot starts it bound to `lan`,
-/// with an automatic rollback to wildcard listening if it still fails to bind.
+/// Reconcile Dropbear after OpenWrt boot: clear any stale `Interface='lan'` that
+/// could trigger OpenWrt's `BOOT=1` skip, enforce WAN SSH drop rules, and start Dropbear.
 pub fn reconcile_dropbear_listener() -> Option<String> {
     if !Path::new(&crate::paths::p("/etc/init.d/dropbear")).exists() {
         return None;
@@ -541,25 +571,26 @@ pub fn reconcile_dropbear_listener() -> Option<String> {
         return None;
     }
     let port = dropbear_configured_port();
+    let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
+    let mut cleared_iface = false;
+    if !iface.trim().is_empty() {
+        rollback_dropbear_interface();
+        cleared_iface = true;
+    }
+    apply_wan_ssh_drop_rules(port);
     if !matches!(probe_tcp_port_listener(port), Some((false, _))) {
-        return None;
+        return cleared_iface.then(|| {
+            format!(
+                "Migrated Dropbear Interface='{}' -> boot-safe unset + WAN firewall drop on port {port}",
+                iface.trim()
+            )
+        });
     }
 
-    let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
     let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
     if wait_for_tcp_port_listening(port, 10, Duration::from_millis(250)) {
         return Some(format!(
-            "Dropbear was not listening on port {port} after boot (OpenWrt BOOT=1 race); started cleanly (Interface='{}')",
-            iface.trim()
-        ));
-    }
-
-    if !iface.trim().is_empty() {
-        rollback_dropbear_interface();
-        let recovered = wait_for_tcp_port_listening(port, 8, Duration::from_millis(250));
-        return Some(format!(
-            "Dropbear failed to bind Interface='{}' on port {port}; auto-rolled back to wildcard listening (listening={recovered})",
-            iface.trim()
+            "Started Dropbear cleanly on port {port} with WAN firewall drop active"
         ));
     }
     Some(format!(

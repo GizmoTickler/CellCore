@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.3 — Boot-Safe Dropbear Firewall Hardening (`Interface` Unset) & Dangling `ffs.adb` USB Fix
+
+- **Eliminate OpenWrt `S19dropbear` `Interface='lan'` `BOOT=1` Lockout Vector (`hardening.rs`, `dropbear-lan-watchdog`):**
+  - Migrated `dropbear_lan_only` hardening away from setting `dropbear.@dropbear[0].Interface='lan'` (which causes OpenWrt's `S19dropbear` to skip startup when `BOOT=1` if `cellcored` is not running) to keeping `Interface` **unset** while enforcing explicit `rmnet*`/`wwan*` port-22 `DROP` rules in `nftables`/`iptables`/`ip6tables`.
+  - Automatically migrates any existing `Interface='lan'` setting to boot-safe `Interface` unset + firewall WAN drop on startup.
+- **Unlink Dangling `ffs.adb` Symlinks When `adbd` Is Disabled (`reconcile.rs`):**
+  - When USB is unlocked and `adbd` is not running, automatically removes dangling `f* -> .../ffs.adb` symlinks from `usb_gadget/g1/configs/c.1` before binding `UDC` so `gsi.ecm` and serial AT ports enumerate cleanly without exposing ADB.
+
 ## 1.4.2 — UBIFS `postinst` `sync` Barrier & Standalone `S99dropbear-lan-watchdog`
 
 - **UBIFS Crash-Safe Package Install (`packaging/sdxpinn-cellcore/CONTROL/postinst`):**
