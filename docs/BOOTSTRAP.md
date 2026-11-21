@@ -70,6 +70,8 @@ Confirm you see `arch=aarch64`, `uid=0`, and at least **32 MiB** free on `/usrda
 ## Step 3 — First Login & Setup
 
 1. Open **`https://<lan-ip>/`** (default `https://192.168.225.1/`).
+   - **Initial TLS certificate:** If no ACME certificate exists yet, `cellcored` automatically uses an existing cert or generates a fresh **ECDSA P-256 self-signed certificate** at `/etc/cellcore/tls/{cert,key}.pem` (with `IP:<lan-ip>` SAN) so `:443` always binds cleanly even on a bare factory unit without LuCI/`uhttpd`.
+   - **Automatic ACME upgrade:** Dropping a trusted cert at `/etc/ssl/acme/fullchain.pem` + `/etc/ssl/acme/privkey.pem` is automatically picked up and hot-reloaded within 60 seconds — zero restart required.
 2. Set a strong root password if still on factory defaults (`System → Security & Units`, or `passwd` over SSH).
 3. Configure your carrier APN / SIM profile (`Radio → Profiles & MBN`).
 4. *(Optional)* Switch to the pure-Rust QRTR/QMI data plane under **`Network → Data Plane`**, configure your Home location & tower pin under **`Radio → Antenna Aim`**, and mint a read-only Bearer token under **`System → Security & Units`** for Prometheus `/api/v1/metrics`.

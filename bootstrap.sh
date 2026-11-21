@@ -291,7 +291,34 @@ if [ -n "$SSH_PUBKEY" ]; then
   "
 fi
 
-# 6. Install sdxpinn-cellcore (from local --ipk if given, else from signed CellCore-repo feed)
+# 6. Ensure a TLS cert exists before starting cellcored (ACME -> CellCore self-signed ECDSA -> uhttpd)
+echo "==> Verifying TLS certificate for :443..."
+run_remote "
+  if [ ! -f /etc/ssl/acme/fullchain.pem ] && [ ! -f /etc/cellcore/tls/cert.pem ] && [ ! -f /etc/uhttpd.crt ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      LAN_IP=\$(uci -q get network.lan.ipaddr || echo 192.168.225.1)
+      HOST=\$(uci -q get system.@system[0].hostname || hostname || echo cellcore)
+      mkdir -p /etc/cellcore/tls
+      chmod 0700 /etc/cellcore/tls
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -nodes -days 3650 \
+        -keyout /etc/cellcore/tls/key.pem \
+        -out /etc/cellcore/tls/cert.pem \
+        -subj \"/CN=\${HOST}\" \
+        -addext \"subjectAltName=DNS:\${HOST},DNS:cellcore.local,IP:\${LAN_IP},IP:127.0.0.1\" 2>/dev/null || \
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -nodes -days 3650 \
+        -keyout /etc/cellcore/tls/key.pem \
+        -out /etc/cellcore/tls/cert.pem \
+        -subj \"/CN=\${HOST}\"
+      chmod 0600 /etc/cellcore/tls/key.pem
+      chmod 0644 /etc/cellcore/tls/cert.pem
+      echo 'Generated self-signed ECDSA P-256 cert at /etc/cellcore/tls/cert.pem'
+    fi
+  fi
+"
+
+# 7. Install sdxpinn-cellcore (from local --ipk if given, else from signed CellCore-repo feed)
 if [ -n "$LOCAL_IPK" ]; then
   echo "==> Installing local package ${LOCAL_IPK}..."
   push_file "$LOCAL_IPK" "/tmp/sdxpinn-cellcore.ipk"

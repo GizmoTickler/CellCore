@@ -58,7 +58,11 @@ pub async fn serve_http_and_https(
         enforce_uhttpd_loopback,
     };
 
-    let (cert_path, key_path) = resolve_tls_pair(&TLS_SOURCES);
+    let lan_ip_str = https_addrs
+        .iter()
+        .find(|a| !a.ip().is_loopback() && !a.ip().is_unspecified())
+        .map(|a| a.ip().to_string());
+    let (cert_path, key_path) = ensure_tls_pair(&TLS_SOURCES, lan_ip_str.as_deref())?;
     let tls_cfg = Arc::new(RwLock::new(Arc::new(load_tls_config(&cert_path, &key_path)?)));
 
     // Hot-reload TLS on ACME renewal: re-resolve the pair every tick (so an
@@ -1120,6 +1124,8 @@ async fn luci_proxy_handler(State(ctx): State<HttpCtx>, mut req: Request) -> Res
 pub struct TlsSources<'a> {
     pub acme_cert: &'a str,
     pub acme_key: &'a str,
+    pub self_cert: &'a str,
+    pub self_key: &'a str,
     pub fallback_cert: &'a str,
     pub fallback_key: &'a str,
 }
@@ -1127,19 +1133,140 @@ pub struct TlsSources<'a> {
 const TLS_SOURCES: TlsSources<'static> = TlsSources {
     acme_cert: "/etc/ssl/acme/fullchain.pem",
     acme_key: "/etc/ssl/acme/privkey.pem",
+    self_cert: "/etc/cellcore/tls/cert.pem",
+    self_key: "/etc/cellcore/tls/key.pem",
     fallback_cert: "/etc/uhttpd.crt",
     fallback_key: "/etc/uhttpd.key",
 };
 
-/// Use the ACME pair only when both halves exist, so cert and key always match.
+/// Resolve the active TLS certificate/key pair in priority order:
+/// 1. Trusted ACME pair (`/etc/ssl/acme/{fullchain,privkey}.pem`)
+/// 2. CellCore-managed self-signed ECDSA pair (`/etc/cellcore/tls/{cert,key}.pem`)
+/// 3. Existing OpenWrt `uhttpd` self-signed pair (`/etc/uhttpd.{crt,key}`)
+///
+/// Both halves must exist so cert and key always match.
 pub fn resolve_tls_pair(src: &TlsSources) -> (PathBuf, PathBuf) {
     let p = crate::paths::p;
-    let (ac, ak) = (p(src.acme_cert), p(src.acme_key));
-    if Path::new(&ac).exists() && Path::new(&ak).exists() {
-        (PathBuf::from(ac), PathBuf::from(ak))
-    } else {
-        (PathBuf::from(p(src.fallback_cert)), PathBuf::from(p(src.fallback_key)))
+    for (c, k) in [
+        (src.acme_cert, src.acme_key),
+        (src.self_cert, src.self_key),
+        (src.fallback_cert, src.fallback_key),
+    ] {
+        if c.is_empty() || k.is_empty() {
+            continue;
+        }
+        let (cp, kp) = (p(c), p(k));
+        if Path::new(&cp).exists() && Path::new(&kp).exists() {
+            return (PathBuf::from(cp), PathBuf::from(kp));
+        }
     }
+    let target_c = if !src.self_cert.is_empty() { src.self_cert } else { src.fallback_cert };
+    let target_k = if !src.self_key.is_empty() { src.self_key } else { src.fallback_key };
+    (PathBuf::from(p(target_c)), PathBuf::from(p(target_k)))
+}
+
+/// Generate a fresh 10-year ECDSA P-256 self-signed cert/key pair using `openssl`.
+pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path, lan_ip: Option<&str>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = cert_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+
+    let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        .unwrap_or_else(|| "cellcore".into());
+
+    let mut san = format!("DNS:{hostname},DNS:cellcore.local,IP:127.0.0.1");
+    if let Some(ip) = lan_ip
+        && ip.parse::<std::net::IpAddr>().is_ok()
+    {
+        san.push_str(&format!(",IP:{ip}"));
+    }
+
+    let tmp_cert = cert_path.with_extension("pem.tmp");
+    let tmp_key = key_path.with_extension("pem.tmp");
+    let _ = fs::remove_file(&tmp_cert);
+    let _ = fs::remove_file(&tmp_key);
+
+    let subj = format!("/CN={hostname}");
+    let san_arg = format!("subjectAltName={san}");
+    let run_openssl = |with_san: bool| -> Result<std::process::Output, String> {
+        let mut cmd = std::process::Command::new("openssl");
+        cmd.args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-days",
+            "3650",
+            "-keyout",
+        ])
+        .arg(&tmp_key)
+        .arg("-out")
+        .arg(&tmp_cert)
+        .args(["-subj", &subj]);
+        if with_san {
+            cmd.args(["-addext", &san_arg]);
+        }
+        cmd.output().map_err(|e| format!("spawn openssl: {e}"))
+    };
+
+    let out = match run_openssl(true) {
+        Ok(o) if o.status.success() => o,
+        _ => run_openssl(false)?,
+    };
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp_cert);
+        let _ = fs::remove_file(&tmp_key);
+        return Err(format!(
+            "openssl self-signed cert failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let key_bytes = fs::read(&tmp_key).map_err(|e| format!("read {}: {e}", tmp_key.display()))?;
+    let cert_bytes = fs::read(&tmp_cert).map_err(|e| format!("read {}: {e}", tmp_cert.display()))?;
+    let _ = fs::remove_file(&tmp_key);
+    let _ = fs::remove_file(&tmp_cert);
+    crate::state::atomic_write(key_path, &key_bytes, 0o600)?;
+    crate::state::atomic_write(cert_path, &cert_bytes, 0o644)?;
+    eprintln!(
+        "cellcored: generated self-signed ECDSA P-256 TLS certificate at {}",
+        cert_path.display()
+    );
+    Ok(())
+}
+
+/// Ensure a valid, loadable TLS pair exists (auto-generating a self-signed ECDSA P-256
+/// cert under `/etc/cellcore/tls/` on factory modems that have no cert yet).
+pub fn ensure_tls_pair(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    let (cp, kp) = resolve_tls_pair(src);
+    if cp.exists() && kp.exists() && load_tls_config(&cp, &kp).is_ok() {
+        return Ok((cp, kp));
+    }
+    let p = crate::paths::p;
+    let target_c = PathBuf::from(p(if !src.self_cert.is_empty() {
+        src.self_cert
+    } else {
+        src.fallback_cert
+    }));
+    let target_k = PathBuf::from(p(if !src.self_key.is_empty() {
+        src.self_key
+    } else {
+        src.fallback_key
+    }));
+    generate_self_signed_cert(&target_c, &target_k, lan_ip)?;
+    Ok((target_c, target_k))
 }
 
 fn file_stamp(path: &Path) -> Option<(i64, i64, u64, u64)> {
@@ -1310,8 +1437,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
-        let (ac, ak, fc, fk) = (p("fullchain.pem"), p("privkey.pem"), p("uhttpd.crt"), p("uhttpd.key"));
-        let src = TlsSources { acme_cert: &ac, acme_key: &ak, fallback_cert: &fc, fallback_key: &fk };
+        let (ac, ak, sc, sk, fc, fk) = (
+            p("fullchain.pem"),
+            p("privkey.pem"),
+            p("cellcore.pem"),
+            p("cellcore.key"),
+            p("uhttpd.crt"),
+            p("uhttpd.key"),
+        );
+        let src = TlsSources {
+            acme_cert: &ac,
+            acme_key: &ak,
+            self_cert: &sc,
+            self_key: &sk,
+            fallback_cert: &fc,
+            fallback_key: &fk,
+        };
         fs::write(&fc, "c").unwrap();
         fs::write(&fk, "k").unwrap();
         let (c0, k0) = resolve_tls_pair(&src);
@@ -1328,6 +1469,38 @@ mod tests {
         // key-only rotation changes the fingerprint
         fs::write(&ak, "acmekey-rotated-longer").unwrap();
         assert_ne!(fp1, tls_fingerprint(&c1, &k1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_tls_pair_generates_valid_ecdsa_self_signed_cert() {
+        let _ = rustls_rustcrypto::provider().install_default();
+        let dir = std::env::temp_dir().join(format!("cc-tls-gen-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        let (ac, ak, sc, sk, fc, fk) = (
+            p("acme/fullchain.pem"),
+            p("acme/privkey.pem"),
+            p("tls/cert.pem"),
+            p("tls/key.pem"),
+            p("uhttpd.crt"),
+            p("uhttpd.key"),
+        );
+        let src = TlsSources {
+            acme_cert: &ac,
+            acme_key: &ak,
+            self_cert: &sc,
+            self_key: &sk,
+            fallback_cert: &fc,
+            fallback_key: &fk,
+        };
+        let (cert, key) = ensure_tls_pair(&src, Some("192.168.225.1")).expect("generate self-signed cert");
+        assert_eq!(cert, PathBuf::from(&sc));
+        assert_eq!(key, PathBuf::from(&sk));
+        assert!(load_tls_config(&cert, &key).is_ok(), "generated cert must load in rustls");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 
