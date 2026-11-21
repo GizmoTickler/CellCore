@@ -26,8 +26,9 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::http::Method;
@@ -37,6 +38,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::{constant_time_eq, now_secs};
 
 pub const TOKENS_PATH: &str = "/etc/cellcore/api_tokens.json";
+pub const TOKEN_USAGE_TMP_PATH: &str = "/tmp/cellcore/token_usage.json";
 pub const TOKEN_PREFIX: &str = "qmt_";
 const ID_HEX: usize = 16;
 const SECRET_HEX: usize = 64;
@@ -44,10 +46,11 @@ pub const TOKEN_LEN: usize = TOKEN_PREFIX.len() + ID_HEX + 1 + SECRET_HEX;
 pub const MAX_TOKENS: usize = 16;
 pub const MAX_NAME_LEN: usize = 40;
 pub const MAX_EXPIRY_DAYS: u32 = 3650;
+pub const MAX_FAILURE_PEERS: usize = 256;
 const FAIL_WINDOW_SECS: u64 = 60;
 const FAIL_MAX: u32 = 10;
-/// last-used is persisted at most this often per token (flash wear).
-const LAST_USED_PERSIST_SECS: u64 = 300;
+/// last-used is flushed to volatile tmpfs at most every 5 minutes (never `/etc` on normal reads).
+const LAST_USED_TMP_PERSIST_SECS: u64 = 300;
 
 /// Browser-session-only for every token type. Hard list: checked before
 /// anything else and never relaxed by the type rules below.
@@ -275,11 +278,19 @@ pub enum TokenError {
     Expired,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct TokenUsageOverlay {
+    last_used_at: Option<u64>,
+    last_used_ip: Option<String>,
+}
+
 #[derive(Default)]
 struct Inner {
     tokens: Vec<TokenRecord>,
-    failures: HashMap<IpAddr, (u64, u32)>,
-    persisted_use: HashMap<String, u64>,
+    failures: HashMap<IpAddr, (Instant, u32)>,
+    last_tmp_flush: Option<Instant>,
+    usage_dirty: bool,
 }
 
 #[derive(Clone)]
@@ -328,7 +339,7 @@ impl TokenStore {
             .unwrap_or_default();
         let total = stored.len();
         let mut changed = false;
-        let tokens: Vec<TokenRecord> = stored
+        let mut tokens: Vec<TokenRecord> = stored
             .into_iter()
             .filter_map(migrate)
             .filter(|(t, _)| parse_token(&format!("{TOKEN_PREFIX}{}_{}", t.id, "0".repeat(SECRET_HEX))).is_some() && t.hash.len() == 64)
@@ -338,6 +349,22 @@ impl TokenStore {
             })
             .collect();
         changed |= tokens.len() != total;
+        if path.is_some()
+            && let Ok(raw_usage) = std::fs::read(crate::paths::p(TOKEN_USAGE_TMP_PATH))
+            && let Ok(usage_map) = serde_json::from_slice::<HashMap<String, TokenUsageOverlay>>(&raw_usage)
+        {
+            for tok in &mut tokens {
+                if let Some(ov) = usage_map.get(&tok.id)
+                    && ov.last_used_at.unwrap_or(0) >= tok.last_used_at.unwrap_or(0)
+                    && ov.last_used_at.is_some()
+                {
+                    tok.last_used_at = ov.last_used_at;
+                    if ov.last_used_ip.is_some() {
+                        tok.last_used_ip = ov.last_used_ip.clone();
+                    }
+                }
+            }
+        }
         let store = Self {
             path: path.map(Arc::new),
             inner: Arc::new(Mutex::new(Inner { tokens, ..Default::default() })),
@@ -358,6 +385,41 @@ impl TokenStore {
         let Some(p) = self.path.as_deref() else { return Ok(()) };
         let json = serde_json::to_vec_pretty(tokens).map_err(|e| e.to_string())?;
         crate::state::atomic_write(p, &json, 0o600)
+    }
+
+    fn persist_tmp_usage(&self, tokens: &[TokenRecord]) {
+        if self.path.is_none() {
+            return;
+        }
+        let mut map = HashMap::with_capacity(tokens.len());
+        for t in tokens {
+            if t.last_used_at.is_some() || t.last_used_ip.is_some() {
+                map.insert(
+                    t.id.clone(),
+                    TokenUsageOverlay {
+                        last_used_at: t.last_used_at,
+                        last_used_ip: t.last_used_ip.clone(),
+                    },
+                );
+            }
+        }
+        if let Ok(json) = serde_json::to_vec(&map) {
+            let tmp_p = crate::paths::p(TOKEN_USAGE_TMP_PATH);
+            let _ = crate::state::atomic_write(Path::new(&tmp_p), &json, 0o600);
+        }
+    }
+
+    /// Flush in-memory `last_used_at` / `last_used_ip` metadata to `/etc/cellcore/api_tokens.json`
+    /// on clean shutdown (`SIGTERM` / reboot).
+    pub fn flush_tokens_usage(&self) {
+        let mut g = lock(&self.inner);
+        if !g.usage_dirty || self.path.is_none() {
+            return;
+        }
+        if self.persist(&g.tokens).is_ok() {
+            g.usage_dirty = false;
+        }
+        self.persist_tmp_usage(&g.tokens);
     }
 
     pub fn list(&self) -> Vec<TokenInfo> {
@@ -399,6 +461,7 @@ impl TokenStore {
             g.tokens.pop();
             return Err(e);
         }
+        g.usage_dirty = false;
         Ok((rec.info(now), token))
     }
 
@@ -410,7 +473,8 @@ impl TokenStore {
             g.tokens.insert(pos, removed);
             return Err(e);
         }
-        g.persisted_use.remove(id);
+        g.usage_dirty = false;
+        self.persist_tmp_usage(&g.tokens);
         Ok(Some(removed.name))
     }
 
@@ -418,13 +482,25 @@ impl TokenStore {
     /// Failed attempts are counted per IP *before* any lookup.
     pub fn authenticate(&self, presented: &str, ip: IpAddr) -> Result<TokenAuth, TokenError> {
         let now = now_secs();
+        let now_mono = Instant::now();
+        let win = Duration::from_secs(FAIL_WINDOW_SECS);
         let mut g = lock(&self.inner);
-        g.failures.retain(|_, (start, _)| now.saturating_sub(*start) <= FAIL_WINDOW_SECS);
+        g.failures.retain(|_, (start, _)| now_mono.saturating_duration_since(*start) <= win);
         if g.failures.get(&ip).is_some_and(|(_, n)| *n >= FAIL_MAX) {
             return Err(TokenError::RateLimited);
         }
         let fail = |g: &mut Inner| {
-            let e = g.failures.entry(ip).or_insert((now, 0));
+            if !g.failures.contains_key(&ip)
+                && g.failures.len() >= MAX_FAILURE_PEERS
+                && let Some(oldest_ip) = g
+                    .failures
+                    .iter()
+                    .min_by_key(|(_, (start, _))| *start)
+                    .map(|(k, _)| *k)
+            {
+                g.failures.remove(&oldest_ip);
+            }
+            let e = g.failures.entry(ip).or_insert((now_mono, 0));
             e.1 += 1;
         };
         let Some(id) = parse_token(presented) else {
@@ -452,10 +528,12 @@ impl TokenStore {
             name: t.name.clone(),
             kind: t.kind,
         };
-        let last = g.persisted_use.get(&auth.id).copied();
-        if last.is_none_or(|l| now.saturating_sub(l) >= LAST_USED_PERSIST_SECS) {
-            g.persisted_use.insert(auth.id.clone(), now);
-            let _ = self.persist(&g.tokens);
+        g.usage_dirty = true;
+        if g.last_tmp_flush
+            .is_none_or(|l| now_mono.saturating_duration_since(l) >= Duration::from_secs(LAST_USED_TMP_PERSIST_SECS))
+        {
+            g.last_tmp_flush = Some(now_mono);
+            self.persist_tmp_usage(&g.tokens);
         }
         Ok(auth)
     }
@@ -644,5 +722,60 @@ mod tests {
         assert!(!disk.contains("scopes") && !disk.contains("bogus"), "{disk}");
         assert_eq!(TokenStore::new(Some(path)).list().len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn token_authenticate_defers_etc_write_until_flush_and_caps_failures() {
+        let sbx = crate::paths::TestSandbox::new("tok-tmpfs-flush");
+        std::fs::create_dir_all(sbx.root.join("etc/cellcore")).unwrap();
+        std::fs::create_dir_all(sbx.root.join("tmp/cellcore")).unwrap();
+        let etc_path = sbx.root.join("etc/cellcore/api_tokens.json");
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let st = TokenStore::new(Some(etc_path.clone()));
+                let (_, secret) = st.create(" exporter ", TokenKind::Read, None).unwrap();
+                let before_etc = std::fs::read_to_string(&etc_path).unwrap();
+                assert!(
+                    before_etc.contains("\"lastUsedAt\": null"),
+                    "newly created token has null lastUsedAt: {before_etc}"
+                );
+
+                // Authenticate writes tmpfs overlay (0600) without rewriting /etc/cellcore/api_tokens.json!
+                st.authenticate(&secret, ip("192.0.2.44")).unwrap();
+                let after_auth_etc = std::fs::read_to_string(&etc_path).unwrap();
+                assert_eq!(
+                    before_etc, after_auth_etc,
+                    "authenticate() must not write /etc/cellcore/api_tokens.json"
+                );
+                let tmp_path = sbx.root.join("tmp/cellcore/token_usage.json");
+                assert!(tmp_path.exists(), "tmpfs token usage snapshot should be written");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+
+                // Startup reloads last_used_at from /tmp/cellcore/token_usage.json even before /etc flush.
+                let reloaded = TokenStore::new(Some(etc_path.clone()));
+                assert_eq!(
+                    reloaded.list()[0].last_used_ip.as_deref(),
+                    Some("192.0.2.44")
+                );
+
+                // Clean shutdown flushes dirty usage to /etc/cellcore/api_tokens.json.
+                st.flush_tokens_usage();
+                let flushed_etc = std::fs::read_to_string(&etc_path).unwrap();
+                assert!(flushed_etc.contains("192.0.2.44"), "{flushed_etc}");
+
+                // Cap failures map at MAX_FAILURE_PEERS (256).
+                for i in 0..(MAX_FAILURE_PEERS + 32) {
+                    let peer = IpAddr::from([198, 51, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8]);
+                    let _ = st.authenticate("qmt_bad", peer);
+                }
+                assert!(lock(&st.inner).failures.len() <= MAX_FAILURE_PEERS);
+            })
+            .await;
     }
 }

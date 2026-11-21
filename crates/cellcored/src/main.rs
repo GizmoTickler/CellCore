@@ -55,11 +55,11 @@ use crate::{
     smd::SmdClient,
     speedtest::SPEEDTEST_HISTORY_PATH,
     state::{
-        AntennaAlignState, AppState, DataUsageState, ETC_QM_DIR, MemoryTelemetry, ModemSecrets,
-        ModemSnapshot, LinkWatchRuntime, SystemInternals, TMP_QM_DIR, TrafficRuntime,
-        UptimeTelemetry, load_json_or_default, load_settings_from_uci_and_disk,
+        AntennaAlignState, AppState, ETC_QM_DIR, LinkWatchRuntime, MemoryTelemetry, ModemSecrets,
+        ModemSnapshot, SystemInternals, TMP_QM_DIR, TrafficRuntime, UptimeTelemetry,
+        load_json_or_default, load_settings_from_uci_and_disk,
     },
-    telemetry::{DATA_USAGE_PATH, flush_persistent_state, spawn_background_tasks},
+    telemetry::{flush_persistent_state, load_initial_data_usage, spawn_background_tasks, spawn_liveness_watchdog},
 };
 
 fn parse_addrs(raw: &str) -> Vec<SocketAddr> {
@@ -189,7 +189,7 @@ async fn async_main() {
     let (ws_tx, _) = broadcast::channel(64);
     let (rf_refresh_tx, rf_refresh_rx) = mpsc::channel(4);
 
-    let data_usage = load_json_or_default::<DataUsageState>(DATA_USAGE_PATH);
+    let data_usage = load_initial_data_usage();
     let speedtest_history = load_json_or_default(SPEEDTEST_HISTORY_PATH);
     let settings = load_settings_from_uci_and_disk();
 
@@ -198,6 +198,7 @@ async fn async_main() {
         ..Default::default()
     };
 
+    let init_hb = state::mono_ms();
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_package: "sdxpinn-cellcore".to_string(),
@@ -245,6 +246,13 @@ async fn async_main() {
         tokens: tokens::TokenStore::new(Some(PathBuf::from(crate::paths::p(tokens::TOKENS_PATH)))),
         radio: Default::default(),
         radio_lock: Default::default(),
+        cell_lock_bypassed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        hb_telemetry_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        hb_http_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        last_sim_slot: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        spn_cache: Arc::new(RwLock::new((String::new(), String::new(), String::new()))),
     };
     state.audit.spawn_flusher();
 
@@ -255,6 +263,7 @@ async fn async_main() {
     acme::spawn_renewal_task();
     hardening::spawn_dropbear_boot_watchdog(state.clone());
     spawn_background_tasks(state.clone(), rf_refresh_rx);
+    spawn_liveness_watchdog(&state);
     ipc::spawn_ipc_server(state.clone(), enforce_uhttpd_loopback);
 
     if let Err(e) =

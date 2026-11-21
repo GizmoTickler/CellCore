@@ -21,6 +21,17 @@ use crate::{
 
 pub const ETC_QM_DIR: &str = "/etc/cellcore";
 pub const TMP_QM_DIR: &str = "/tmp/cellcore";
+/// 2025-01-01T00:00:00Z — wall-clock timestamps below this indicate pre-NTP 1970 boot clock.
+pub const MIN_VALID_WALL_CLOCK_SECS: u64 = 1_735_689_600;
+
+static STARTUP_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Monotonic milliseconds elapsed since daemon startup (`CLOCK_MONOTONIC`).
+/// Returns `>= 1` so `0` can serve as an "unset" sentinel in `AtomicU64`s.
+pub fn mono_ms() -> u64 {
+    let base = STARTUP_INSTANT.get_or_init(std::time::Instant::now);
+    (base.elapsed().as_millis() as u64).saturating_add(1)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -351,6 +362,18 @@ impl Default for AntennaAlignState {
     }
 }
 
+fn default_cell_lock_deadman_enabled() -> bool {
+    true
+}
+
+fn default_cell_lock_deadman_secs() -> u64 {
+    180
+}
+
+fn default_sim_failback_mins() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DaemonSettings {
@@ -385,6 +408,14 @@ pub struct DaemonSettings {
     pub cell_lock_nr5g: String,
     pub cell_lock_lte_persist: bool,
     pub cell_lock_nr5g_persist: bool,
+    #[serde(default = "default_cell_lock_deadman_enabled")]
+    pub cell_lock_deadman_enabled: bool,
+    #[serde(default = "default_cell_lock_deadman_secs")]
+    pub cell_lock_deadman_secs: u64,
+    #[serde(default)]
+    pub preferred_sim_slot: u8,
+    #[serde(default = "default_sim_failback_mins")]
+    pub sim_failback_mins: u64,
 }
 
 impl Default for DaemonSettings {
@@ -421,6 +452,10 @@ impl Default for DaemonSettings {
             cell_lock_nr5g: String::new(),
             cell_lock_lte_persist: false,
             cell_lock_nr5g_persist: false,
+            cell_lock_deadman_enabled: default_cell_lock_deadman_enabled(),
+            cell_lock_deadman_secs: default_cell_lock_deadman_secs(),
+            preferred_sim_slot: 0,
+            sim_failback_mins: default_sim_failback_mins(),
         }
     }
 }
@@ -530,6 +565,20 @@ pub struct AppState {
     /// Held by every radio-changing read-plan-write (band lock, network mode,
     /// cell lock, console / IPC radio writes, scheduled locks): see crate::radio::lock.
     pub radio_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True while the cell-lock dead-man's-switch (or LinkWatch stage 3) has temporarily bypassed live modem locks.
+    pub cell_lock_bypassed: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic heartbeat timestamp (`mono_ms()`) of the background telemetry poller.
+    pub hb_telemetry_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic heartbeat timestamp (`mono_ms()`) of the HTTP/TLS watcher & request path.
+    pub hb_http_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Last observed active SIM slot (`0` = not yet observed, `1` or `2`).
+    pub last_sim_slot: Arc<std::sync::atomic::AtomicI32>,
+    /// Monotonic timestamp (`mono_ms()`) of the most recent SIM slot switch (`0` = none).
+    pub sim_switched_at_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether `profiles::tick_cell_lock_scheduler` has performed its one-time startup modem lock check.
+    pub sched_boot_checked: Arc<std::sync::atomic::AtomicBool>,
+    /// Cached `(mcc, mnc, spn)` for `AT+QSPN` chatter avoidance when PLMN is unchanged.
+    pub spn_cache: Arc<RwLock<(String, String, String)>>,
 }
 
 impl AppState {
@@ -545,6 +594,7 @@ impl AppState {
     pub fn for_tests_with_smd(www_dir: PathBuf, auth: AuthStore, smd: SmdClient) -> Self {
         let (ws_tx, _) = broadcast::channel(4);
         let (rf_refresh_tx, _) = mpsc::channel(1);
+        let init_hb = mono_ms();
         Self {
             version: "test".into(),
             build_package: "sdxpinn-cellcore".into(),
@@ -588,6 +638,13 @@ impl AppState {
             tokens: crate::tokens::TokenStore::ram_only(),
             radio: Default::default(),
             radio_lock: Default::default(),
+            cell_lock_bypassed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hb_telemetry_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            hb_http_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            last_sim_slot: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            spn_cache: Default::default(),
         }
     }
 
@@ -823,6 +880,13 @@ mod tests {
         assert_eq!(v.ping_host, "1.1.1.1");
         assert!(!v.https_redirect);
         assert_eq!(v.cell_lock_start_time, "08:00");
+        assert!(v.cell_lock_deadman_enabled);
+        assert_eq!(v.cell_lock_deadman_secs, 180);
+        assert_eq!(v.preferred_sim_slot, 0);
+        assert_eq!(v.sim_failback_mins, 30);
+        let t1 = mono_ms();
+        let t2 = mono_ms();
+        assert!(t1 >= 1 && t2 >= t1);
         let u: DataUsageState = serde_json::from_str(
             r#"{"quotaBytes":5,"daily":[{"date":"2026-01-01","rxBytes":1}]}"#,
         )

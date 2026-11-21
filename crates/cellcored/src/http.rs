@@ -68,11 +68,24 @@ pub async fn serve_http_and_https(
     // Hot-reload TLS on ACME renewal: re-resolve the pair every tick (so an
     // ACME cert issued after boot is picked up) and reload when the chosen
     // pair or either file's mtime/size changes (key-only rotations too).
+    // Also heals a pre-NTP 1970 self-signed certificate once wall clock syncs.
     let tls_watch = Arc::clone(&tls_cfg);
+    let hb_http_watch = Arc::clone(&state.hb_http_ms);
+    let lan_ip_watch = lan_ip_str.clone();
     tokio::spawn(async move {
         let mut last = tls_fingerprint(&cert_path, &key_path);
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            hb_http_watch.store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
+            let lan_clone = lan_ip_watch.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                check_and_heal_self_signed_cert(
+                    &TLS_SOURCES,
+                    crate::auth::now_secs(),
+                    lan_clone.as_deref(),
+                )
+            })
+            .await;
             let (cp, kp) = resolve_tls_pair(&TLS_SOURCES);
             let cur = tls_fingerprint(&cp, &kp);
             if cur != last
@@ -430,6 +443,9 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
 }
 
 async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, next: Next) -> Response {
+    ctx.app
+        .hb_http_ms
+        .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
     let path = req.uri().path().to_string();
     let hsts = ctx.app.settings.read().await.https_redirect;
     let mut resp = next.run(req).await;
@@ -1316,6 +1332,40 @@ pub fn ensure_tls_pair(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBu
     Ok((target_c, target_k))
 }
 
+/// If the active TLS certificate is the CellCore self-signed fallback (`/etc/cellcore/tls/cert.pem`)
+/// and the wall clock has synced (`>= 2025-01-01`), verify `openssl x509 -checkend 0 -noout -in <cert>`.
+/// If expired (e.g. generated at `1970` pre-NTP!), regenerate a fresh 10-year ECDSA P-256 pair so the
+/// TLS watcher hot-reloads it automatically. Returns `Ok(true)` when regenerated.
+pub fn check_and_heal_self_signed_cert(
+    src: &TlsSources,
+    wall_now_secs: u64,
+    lan_ip: Option<&str>,
+) -> Result<bool, String> {
+    if wall_now_secs < crate::state::MIN_VALID_WALL_CLOCK_SECS || src.self_cert.is_empty() {
+        return Ok(false);
+    }
+    let (cp, kp) = resolve_tls_pair(src);
+    let self_cp = PathBuf::from(crate::paths::p(src.self_cert));
+    if cp != self_cp || !cp.exists() {
+        return Ok(false);
+    }
+    let check_ok = std::process::Command::new(crate::paths::program("openssl"))
+        .args(["x509", "-checkend", "0", "-noout", "-in"])
+        .arg(&cp)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if check_ok {
+        return Ok(false);
+    }
+    eprintln!(
+        "cellcored: self-signed TLS cert {} is expired (likely pre-NTP 1970 boot); regenerating 10-year cert",
+        cp.display()
+    );
+    generate_self_signed_cert(&cp, &kp, lan_ip)?;
+    Ok(true)
+}
+
 fn file_stamp(path: &Path) -> Option<(i64, i64, u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = fs::metadata(path).ok()?;
@@ -1791,6 +1841,64 @@ mod tests {
         // HTTP/2 requests send :authority instead of Host header
         assert!(same_origin_for(&h(&[("origin", "https://192.168.228.1")]), Some("192.168.228.1")));
         assert!(!same_origin_for(&h(&[("origin", "https://evil.example")]), Some("192.168.228.1")));
+    }
+
+    #[test]
+    fn expired_1970_self_signed_cert_is_regenerated_once_wall_clock_syncs() {
+        let dir = std::env::temp_dir().join(format!("qm-tls-1970-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let acme_c = dir.join("acme/fullchain.pem").display().to_string();
+        let acme_k = dir.join("acme/privkey.pem").display().to_string();
+        let self_c_path = dir.join("tls/cert.pem");
+        let self_k_path = dir.join("tls/key.pem");
+        let self_c = self_c_path.display().to_string();
+        let self_k = self_k_path.display().to_string();
+        let fb_c = dir.join("uhttpd.crt").display().to_string();
+        let fb_k = dir.join("uhttpd.key").display().to_string();
+        let sources = TlsSources {
+            acme_cert: &acme_c,
+            acme_key: &acme_k,
+            self_cert: &self_c,
+            self_key: &self_k,
+            fallback_cert: &fb_c,
+            fallback_key: &fb_k,
+        };
+        fs::create_dir_all(self_c_path.parent().unwrap()).unwrap();
+        // Write an invalid/expired PEM simulating a 1970 pre-NTP certificate that fails -checkend 0.
+        fs::write(&self_k_path, b"-----BEGIN PRIVATE KEY-----\ninvalid\n-----END PRIVATE KEY-----\n").unwrap();
+        fs::write(&self_c_path, b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n").unwrap();
+
+        // Pre-NTP wall clock (< 2025-01-01): must NOT regenerate yet.
+        assert_eq!(
+            check_and_heal_self_signed_cert(&sources, 100, Some("192.168.225.1")),
+            Ok(false)
+        );
+
+        // Post-NTP wall clock: detects checkend failure and regenerates a valid 10-year cert.
+        assert_eq!(
+            check_and_heal_self_signed_cert(
+                &sources,
+                crate::state::MIN_VALID_WALL_CLOCK_SECS + 60,
+                Some("192.168.225.1")
+            ),
+            Ok(true)
+        );
+        let ok = std::process::Command::new("openssl")
+            .args(["x509", "-checkend", "86400", "-noout", "-in", &self_c])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "regenerated self-signed cert must be valid");
+        // Subsequent check sees valid cert and returns Ok(false) (no churn).
+        assert_eq!(
+            check_and_heal_self_signed_cert(
+                &sources,
+                crate::state::MIN_VALID_WALL_CLOCK_SECS + 120,
+                Some("192.168.225.1")
+            ),
+            Ok(false)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     impl super::HttpCtx {

@@ -950,11 +950,21 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
     Ok(summary)
 }
 
+/// True once the wall clock has advanced past 2025-01-01 (`1_735_689_600`), preventing
+/// pre-NTP `1970` boot clocks from miscomputing certificate expiry or triggering ACME storms.
+pub fn is_wall_clock_ready_for_acme(now_secs: u64) -> bool {
+    now_secs >= crate::state::MIN_VALID_WALL_CLOCK_SECS
+}
+
 /// Background renewal loop: checks every 6 hours and renews automatically when due.
 pub fn spawn_renewal_task() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_secs(120)).await;
         loop {
+            if !is_wall_clock_ready_for_acme(crate::auth::now_secs()) {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
             let cfg = load_config();
             if cfg.enabled && !cfg.domains.is_empty() {
                 let active = inspect_active_cert().await;
@@ -1605,5 +1615,13 @@ mod tests {
 
         let bad_args = vec!["--domains".into(), "bad domain".into()];
         assert!(apply_cli_config_args(&mut cfg, &bad_args).is_err());
+    }
+
+    #[test]
+    fn acme_renewal_waits_for_post_2025_wall_clock() {
+        assert!(!is_wall_clock_ready_for_acme(0));
+        assert!(!is_wall_clock_ready_for_acme(120));
+        assert!(!is_wall_clock_ready_for_acme(1_735_689_599));
+        assert!(is_wall_clock_ready_for_acme(1_735_689_600));
     }
 }

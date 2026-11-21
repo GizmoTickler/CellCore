@@ -14,6 +14,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_SMD_DEVICE: &str = "/dev/smd11";
+pub const FALLBACK_SMD_DEVICE: &str = "/dev/smd7";
+/// Consecutive failed `QMRESYNC` cycles before closing & reopening the serial fd (~90s wedged).
+pub const MAX_CONSECUTIVE_RESYNC_FAILURES: u32 = 3;
 
 /// Long commands that have run at least this long yield to Emergency work.
 pub const PREEMPT_GRACE: Duration = Duration::from_secs(2);
@@ -180,7 +183,7 @@ pub struct SmdClient {
 impl SmdClient {
     pub fn spawn(device: impl Into<String>) -> Self {
         let device = device.into();
-        Self::spawn_with_opener(Box::new(move || open_device_fd(&device)))
+        Self::spawn_with_opener(Box::new(move || open_device_with_fallback(&device)))
     }
 
     /// Spawn the AT actor on an arbitrary fd source (tests use a socketpair).
@@ -208,6 +211,7 @@ impl SmdClient {
             echo_restore_refusals: 0,
             echo_restore_refused_gen: None,
             unresponsive: false,
+            consecutive_resync_failures: 0,
         };
         tokio::spawn(actor.run());
         Self {
@@ -914,6 +918,25 @@ pub fn open_device_fd(device: &str) -> Result<RawFd, String> {
     Ok(fd)
 }
 
+/// Open the primary SMD AT port, falling back to `/dev/smd7` on real hardware if the
+/// primary node (typically `/dev/smd11`) cannot be opened.
+pub fn open_device_with_fallback(device: &str) -> Result<RawFd, String> {
+    match open_device_fd(device) {
+        Ok(fd) => Ok(fd),
+        Err(primary_err) => {
+            let fallback = crate::paths::p(FALLBACK_SMD_DEVICE);
+            if device != fallback
+                && device != FALLBACK_SMD_DEVICE
+                && let Ok(fd) = open_device_fd(&fallback)
+            {
+                eprintln!("cellcored: {primary_err}; opened fallback {fallback}");
+                return Ok(fd);
+            }
+            Err(primary_err)
+        }
+    }
+}
+
 fn write_all_fd(fd: RawFd, data: &[u8]) -> Result<(), String> {
     let mut written = 0;
     while written < data.len() {
@@ -1109,6 +1132,9 @@ struct Actor {
     /// `absorb_idle`), when a command is answered on an in-sync line, and when
     /// the port breaks or is reopened.
     unresponsive: bool,
+    /// Consecutive resync timeouts on the current open fd. At `>= MAX_CONSECUTIVE_RESYNC_FAILURES`,
+    /// the fd is treated as wedged and reopened via `mark_broken`.
+    consecutive_resync_failures: u32,
 }
 
 enum WaitOutcome {
@@ -1237,6 +1263,7 @@ impl Actor {
                 self.framer = Framer::default();
                 self.probe_sent = None;
                 self.unresponsive = false;
+                self.consecutive_resync_failures = 0;
                 // A fresh start: a pending echo restore is tried again.
                 self.sync_gen += 1;
                 self.healthy.store(true, AtomicOrdering::Relaxed);
@@ -1289,6 +1316,7 @@ impl Actor {
                 self.healthy.store(true, AtomicOrdering::Relaxed);
             }
             self.unresponsive = false;
+            self.consecutive_resync_failures = 0;
         }
     }
 
@@ -1312,6 +1340,7 @@ impl Actor {
         // the reopened port.
         self.probe_sent = None;
         self.unresponsive = false;
+        self.consecutive_resync_failures = 0;
         self.healthy.store(false, AtomicOrdering::Relaxed);
         format!("Broken SMD stream: {err}")
     }
@@ -1550,6 +1579,7 @@ impl Actor {
                 WaitOutcome::Done(..) => {}
                 WaitOutcome::TimedOut => {
                     self.unresponsive = true;
+                    self.consecutive_resync_failures = self.consecutive_resync_failures.saturating_add(1);
                     self.healthy.store(false, AtomicOrdering::Relaxed);
                     return Err(WaitOutcome::TimedOut);
                 }
@@ -1667,8 +1697,14 @@ impl Actor {
                         if self.write_raw(format!("{command}\r\n").into_bytes()).await.is_ok() {
                             self.framer.expect_unawaited_reply(command, Instant::now(), reply_wait);
                         }
+                        if self.consecutive_resync_failures >= MAX_CONSECUTIVE_RESYNC_FAILURES {
+                            let _ = self.mark_broken("consecutive QMRESYNC probes failed");
+                        }
                         format!("AT command timed out ({command}): AT channel did not resync; command sent without waiting")
                     } else {
+                        if self.consecutive_resync_failures >= MAX_CONSECUTIVE_RESYNC_FAILURES {
+                            let _ = self.mark_broken("consecutive QMRESYNC probes failed");
+                        }
                         format!("AT command timed out ({command}): AT channel did not resync; command not sent")
                     }
                 }
@@ -1695,6 +1731,7 @@ impl Actor {
                 // A reply (OK or an error result) on an in-sync line: the
                 // channel answers.
                 self.unresponsive = false;
+                self.consecutive_resync_failures = 0;
                 self.healthy.store(true, AtomicOrdering::Relaxed);
                 Ok(make_response(command, ok, raw, started))
             }
@@ -3096,5 +3133,76 @@ mod tests {
 
         drop(c);
         let _ = modem;
+    }
+
+    #[tokio::test]
+    async fn three_consecutive_failed_qmresync_probes_reopen_serial_fd() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (a1, mut b1) = UnixStream::pair().unwrap();
+        let (a2, mut b2) = UnixStream::pair().unwrap();
+
+        // Port 1 swallows every command and every QMRESYNC probe silently (wedged /dev/smd11).
+        let _t1 = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            while let Ok(n) = b1.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        // Port 2 responds normally once Actor marks port 1 broken and reopens.
+        let _t2 = std::thread::spawn(move || {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = b2.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let _ = b2.write_all(format!("{cmd}\r\r\n+CFUN: 1\r\nOK\r\n").as_bytes());
+                }
+            }
+        });
+
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opens_cl = opens.clone();
+        let fds = std::sync::Mutex::new(VecDeque::from([a1.into_raw_fd(), a2.into_raw_fd()]));
+        let client = SmdClient::spawn_with_opener(Box::new(move || {
+            opens_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fds.lock().unwrap().pop_front().ok_or_else(|| "no more fds".into())
+        }));
+
+        // 1st command times out and leaves stale owed final -> next commands trigger QMRESYNC.
+        let _ = client
+            .exec("AT+CFUN?", Priority::Interactive, Duration::from_millis(30))
+            .await;
+        // Drive 3 consecutive failed QMRESYNC probes; the 3rd marks port 1 broken.
+        for _ in 0..MAX_CONSECUTIVE_RESYNC_FAILURES {
+            let _ = client
+                .exec("AT+CFUN?", Priority::Interactive, Duration::from_millis(80))
+                .await;
+        }
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Next call reopens onto port 2 and succeeds cleanly!
+        let recovered = client
+            .exec("AT+CFUN?", Priority::Interactive, Duration::from_secs(1))
+            .await
+            .expect("reopened port 2 should answer");
+        assert!(recovered.ok);
+        assert!(recovered.body.contains("+CFUN: 1"));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

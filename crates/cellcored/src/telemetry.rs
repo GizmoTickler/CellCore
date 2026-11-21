@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     sync::{
         Arc,
@@ -19,19 +19,19 @@ use tokio::{
 use crate::{
     auth::now_secs,
     parsers::{
-        clean_at_lines, mask_secret_id, merge_nr5g_mimo_layers, overlay_native_bearer,
-        parse_3gpp_rel, parse_active_wwan, parse_carrier_aggregation, parse_mimo_signal,
-        parse_nr5g_mimo_info, parse_nr5g_pathloss, parse_qspn_operator, parse_scalar_at_value,
-        parse_serving_cell, parse_ssb_beam_id, parse_temp_sensors, parse_time_advance_for_rat,
-        read_sysfs_thermals,
+        ServingCellInfo, clean_at_lines, mask_secret_id, merge_nr5g_mimo_layers,
+        overlay_native_bearer, parse_3gpp_rel, parse_active_wwan, parse_carrier_aggregation,
+        parse_mimo_signal, parse_neighbor_cells, parse_nr5g_mimo_info, parse_nr5g_pathloss,
+        parse_qspn_operator, parse_scalar_at_value, parse_serving_cell, parse_ssb_beam_id,
+        parse_temp_sensors, parse_time_advance_for_rat, read_sysfs_thermals,
     },
     reconcile::current_usb_gadget_udc,
     smd::Priority,
     state::{
-        AlertLogEntry, AppState, CarrierMimoLayer, DailyUsageEntry, MemoryTelemetry,
-        MonthlyUsageEntry, PingPoint, SignalHistoryPoint, TrafficDirectionStats,
+        AlertLogEntry, AppState, CarrierMimoLayer, DailyUsageEntry, DataUsageState,
+        MemoryTelemetry, MonthlyUsageEntry, PingPoint, SignalHistoryPoint, TrafficDirectionStats,
         TrafficHistoryPoint, TrafficInterfaceStats, UptimeTelemetry, format_now_hms,
-        format_today_ymd, save_json_atomic,
+        format_today_ymd, load_json_or_default, mono_ms, save_json_atomic,
     },
     uci::{run_cmd, uci_get_blocking},
 };
@@ -55,22 +55,402 @@ const ALIGN_KEEP_AWAKE_PATH: &str = "/__down?bytes=65536";
 const ALIGN_KEEP_AWAKE_MAX_BODY: usize = 256 * 1024;
 
 pub const DATA_USAGE_PATH: &str = "/etc/cellcore/data_usage.json";
-pub const DATA_USAGE_TMP_PATH: &str = "/tmp/cellcore/signal_graphs/data_usage.json";
+pub const DATA_USAGE_TMP_PATH: &str = "/tmp/cellcore/data_usage.json";
 pub const DATA_USAGE_SNAPSHOT_FLUSH_SECS: u64 = 300;
+pub const DATA_USAGE_ETC_FLUSH_SECS: u64 = 6 * 3600;
+pub const DATA_USAGE_ETC_FLUSH_BYTES: u64 = 50 * 1024 * 1024;
+
+pub const LIVENESS_WATCHDOG_CHECK_SECS: u64 = 30;
+pub const LIVENESS_WATCHDOG_TIMEOUT_MS: u64 = 180_000;
+pub const LINKWATCH_COOLDOWN_SECS: u64 = 900;
+pub const SIM_ATTACH_SETTLE_MS: u64 = 45_000;
+
+/// Load `/tmp/cellcore/data_usage.json` if a fresher tmpfs snapshot exists on warm
+/// restart, falling back to persistent `/etc/cellcore/data_usage.json`.
+pub fn load_initial_data_usage() -> DataUsageState {
+    let tmp_p = crate::paths::p(DATA_USAGE_TMP_PATH);
+    if std::path::Path::new(&tmp_p).exists()
+        && let Ok(raw) = fs::read_to_string(&tmp_p)
+        && let Ok(parsed) = serde_json::from_str::<DataUsageState>(&raw)
+    {
+        return parsed;
+    }
+    load_json_or_default(DATA_USAGE_PATH)
+}
+
+/// Spawn a dedicated lightweight OS thread (`cellcore-wdt`) outside the Tokio runtime
+/// that checks `hb_telemetry_ms` every 30s and aborts if the telemetry loop stalls for >180s.
+pub fn spawn_liveness_watchdog(state: &AppState) {
+    state.hb_telemetry_ms.store(mono_ms(), Ordering::Release);
+    let hb = state.hb_telemetry_ms.clone();
+    let _ = std::thread::Builder::new()
+        .name("cellcore-wdt".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(LIVENESS_WATCHDOG_CHECK_SECS));
+                let last = hb.load(Ordering::Acquire);
+                let now = mono_ms();
+                if last > 0 && now.saturating_sub(last) > LIVENESS_WATCHDOG_TIMEOUT_MS {
+                    eprintln!(
+                        "cellcore-wdt: telemetry loop stalled for {} ms (> {} ms); aborting for procd respawn",
+                        now.saturating_sub(last),
+                        LIVENESS_WATCHDOG_TIMEOUT_MS
+                    );
+                    std::process::abort();
+                }
+            }
+        });
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CellLockDeadmanTracker {
+    pub unregistered_since: Option<Instant>,
+    pub bypassed_since: Option<Instant>,
+    pub last_reprobe: Option<Instant>,
+    pub reprobe_stage: u8,
+}
+
+impl CellLockDeadmanTracker {
+    pub fn reprobe_backoff(stage: u8) -> Duration {
+        match stage {
+            0 => Duration::from_secs(15 * 60),
+            1 => Duration::from_secs(30 * 60),
+            _ => Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+pub fn is_modem_registered(serving: Option<&ServingCellInfo>) -> bool {
+    let Some(s) = serving else {
+        return false;
+    };
+    let st = s.state.trim().to_ascii_uppercase();
+    !st.is_empty()
+        && !matches!(st.as_str(), "SEARCH" | "LIMSRV" | "DISCONNECTED" | "UNKNOWN")
+        && !s.rat.trim().is_empty()
+}
+
+pub fn target_cell_lock_pcis(cfg: &crate::state::DaemonSettings) -> (Option<i32>, Option<i32>) {
+    let nr_pci = cfg
+        .cell_lock_nr5g
+        .split(',')
+        .next()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    let lte_parts: Vec<&str> = cfg
+        .cell_lock_lte
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let lte_pci = if lte_parts.len() >= 3 {
+        lte_parts[2].parse::<i32>().ok()
+    } else {
+        lte_parts.first().and_then(|s| s.parse::<i32>().ok())
+    };
+    (nr_pci, lte_pci)
+}
+
+async fn push_alert(state: &AppState, kind: &str, message: impl Into<String>) {
+    let msg = message.into();
+    let mut alerts = state.alerts.write().await;
+    if alerts.len() >= 20 {
+        alerts.pop_back();
+    }
+    alerts.push_front(AlertLogEntry {
+        r#type: kind.into(),
+        message: msg,
+        timestamp: format_now_hms(),
+    });
+}
+
+pub(crate) async fn bypass_cell_lock_temporarily(state: &AppState, reason: &str) {
+    let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+    let cmds = vec![
+        ("AT+QNWLOCK=\"common/5g\",0".into(), Duration::from_secs(5)),
+        ("AT+QNWLOCK=\"common/4g\",0".into(), Duration::from_secs(5)),
+        ("AT+QNWCFG=\"nr5g_earfcn_lock\",0".into(), Duration::from_secs(4)),
+        ("AT+QNWLOCK=\"save_ctrl\",0,0".into(), Duration::from_secs(4)),
+    ];
+    let _ = state.smd.exec_batch(cmds, Priority::Emergency).await;
+    state.cell_lock_bypassed.store(true, Ordering::Release);
+    state.push_daemon_log(reason);
+    push_alert(state, "cell_lock_deadman", reason).await;
+}
+
+pub(crate) async fn restore_cell_lock_from_settings(
+    state: &AppState,
+    cfg: &crate::state::DaemonSettings,
+) {
+    if !cfg.cell_lock_nr5g.is_empty() {
+        let cmd = format!("AT+QNWLOCK=\"common/5g\",{}", cfg.cell_lock_nr5g);
+        let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(6)).await;
+    }
+    if !cfg.cell_lock_lte.is_empty() {
+        let cmd = format!("AT+QNWLOCK=\"common/4g\",{}", cfg.cell_lock_lte);
+        let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(6)).await;
+    }
+    let save_cmd = format!(
+        "AT+QNWLOCK=\"save_ctrl\",{},{}",
+        if cfg.cell_lock_lte_persist { 1 } else { 0 },
+        if cfg.cell_lock_nr5g_persist { 1 } else { 0 }
+    );
+    let _ = state
+        .smd
+        .exec(save_cmd, Priority::Background, Duration::from_secs(5))
+        .await;
+    state.cell_lock_bypassed.store(false, Ordering::Release);
+    let msg = "Cell-lock dead-man's-switch restored configured cell lock after target cell re-appeared";
+    state.push_daemon_log(msg);
+    push_alert(state, "cell_lock_deadman", msg).await;
+}
+
+fn ssb_response_matches_pci(body: &str, want_pci: i32) -> bool {
+    for line in clean_at_lines(body) {
+        if !line.to_ascii_lowercase().contains("ssb_beam_id") {
+            continue;
+        }
+        for tok in line.split([',', ':', '"', ' ']) {
+            if tok.trim().parse::<i32>().ok() == Some(want_pci) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) async fn tick_cell_lock_deadman(
+    state: &AppState,
+    tracker: &mut CellLockDeadmanTracker,
+    now: Instant,
+    trial_attach_wait: Duration,
+) {
+    let cfg = state.settings.read().await.clone();
+    let has_lock = !cfg.cell_lock_nr5g.is_empty() || !cfg.cell_lock_lte.is_empty();
+    if !has_lock {
+        *tracker = CellLockDeadmanTracker::default();
+        state.cell_lock_bypassed.store(false, Ordering::Release);
+        return;
+    }
+
+    let (cfun, serving) = {
+        let m = state.modem.read().await;
+        (m.identity.cfun, m.serving.clone())
+    };
+
+    if !state.cell_lock_bypassed.load(Ordering::Acquire) {
+        tracker.bypassed_since = None;
+        tracker.last_reprobe = None;
+        tracker.reprobe_stage = 0;
+        if !cfg.cell_lock_deadman_enabled || cfun != 1 || is_modem_registered(serving.as_ref()) {
+            tracker.unregistered_since = None;
+            return;
+        }
+        let since = *tracker.unregistered_since.get_or_insert(now);
+        if now.saturating_duration_since(since)
+            >= Duration::from_secs(cfg.cell_lock_deadman_secs.max(1))
+        {
+            bypass_cell_lock_temporarily(
+                state,
+                "Cell-lock dead-man's-switch temporarily cleared live lock after prolonged loss of registration",
+            )
+            .await;
+            tracker.unregistered_since = None;
+            tracker.bypassed_since = Some(now);
+            tracker.last_reprobe = Some(now);
+            tracker.reprobe_stage = 0;
+        }
+        return;
+    }
+
+    // Currently bypassed:
+    tracker.unregistered_since = None;
+    if !cfg.cell_lock_deadman_enabled {
+        let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+        restore_cell_lock_from_settings(state, &cfg).await;
+        *tracker = CellLockDeadmanTracker::default();
+        return;
+    }
+    if crate::obs::failover::is_active() {
+        return;
+    }
+
+    let wait_dur = CellLockDeadmanTracker::reprobe_backoff(tracker.reprobe_stage);
+    let anchor = tracker
+        .last_reprobe
+        .unwrap_or_else(|| *tracker.bypassed_since.get_or_insert(now));
+    if now.saturating_duration_since(anchor) < wait_dur {
+        return;
+    }
+    tracker.last_reprobe = Some(now);
+
+    let (want_nr_pci, want_lte_pci) = target_cell_lock_pcis(&cfg);
+    let mut visible = serving.as_ref().and_then(|s| s.pci).is_some_and(|p| {
+        Some(p) == want_nr_pci || Some(p) == want_lte_pci
+    });
+
+    if !visible {
+        let mut probe_cmds = vec![("AT+QENG=\"neighbourcell\"".into(), Duration::from_secs(5))];
+        if want_nr_pci.is_some() {
+            probe_cmds.push(("AT+QNWCFG=\"ssb_beam_id\"".into(), Duration::from_secs(3)));
+        }
+        if let Ok(res) = state.smd.exec_batch(probe_cmds, Priority::Background).await {
+            if let Some(Ok(nb)) = res.first() {
+                let cells = parse_neighbor_cells(&nb.body);
+                visible = cells.iter().any(|c| {
+                    c.pci.is_some() && (c.pci == want_nr_pci || c.pci == want_lte_pci)
+                });
+            }
+            if !visible
+                && let Some(np) = want_nr_pci
+                && let Some(Ok(ssb)) = res.get(1)
+                && ssb.ok
+            {
+                visible = ssb_response_matches_pci(&ssb.body, np)
+                    || (parse_ssb_beam_id(&ssb.body).is_some()
+                        && serving.as_ref().and_then(|s| s.pci) == Some(np));
+            }
+        }
+    }
+
+    if visible {
+        let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+        restore_cell_lock_from_settings(state, &cfg).await;
+        *tracker = CellLockDeadmanTracker::default();
+        return;
+    }
+
+    // On the 60m backoff stage, perform a bounded 25s trial re-lock and auto-clear if still dead.
+    if tracker.reprobe_stage >= 2 {
+        let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+        if !cfg.cell_lock_nr5g.is_empty() {
+            let _ = state
+                .smd
+                .exec(
+                    format!("AT+QNWLOCK=\"common/5g\",{}", cfg.cell_lock_nr5g),
+                    Priority::Background,
+                    Duration::from_secs(6),
+                )
+                .await;
+        }
+        if !cfg.cell_lock_lte.is_empty() {
+            let _ = state
+                .smd
+                .exec(
+                    format!("AT+QNWLOCK=\"common/4g\",{}", cfg.cell_lock_lte),
+                    Priority::Background,
+                    Duration::from_secs(6),
+                )
+                .await;
+        }
+        if !trial_attach_wait.is_zero() {
+            tokio::time::sleep(trial_attach_wait).await;
+        }
+        let attached = state
+            .smd
+            .exec("AT+QENG=\"servingcell\"", Priority::Background, Duration::from_secs(4))
+            .await
+            .ok()
+            .and_then(|r| parse_serving_cell(&r.body, &[]))
+            .is_some_and(|s| is_modem_registered(Some(&s)));
+        if attached {
+            let save_cmd = format!(
+                "AT+QNWLOCK=\"save_ctrl\",{},{}",
+                if cfg.cell_lock_lte_persist { 1 } else { 0 },
+                if cfg.cell_lock_nr5g_persist { 1 } else { 0 }
+            );
+            let _ = state
+                .smd
+                .exec(save_cmd, Priority::Background, Duration::from_secs(5))
+                .await;
+            state.cell_lock_bypassed.store(false, Ordering::Release);
+            state.push_daemon_log("Cell-lock 60m trial re-probe attached cleanly; restored cell lock");
+            *tracker = CellLockDeadmanTracker::default();
+            return;
+        } else {
+            let clear_cmds = vec![
+                ("AT+QNWLOCK=\"common/5g\",0".into(), Duration::from_secs(5)),
+                ("AT+QNWLOCK=\"common/4g\",0".into(), Duration::from_secs(5)),
+                ("AT+QNWCFG=\"nr5g_earfcn_lock\",0".into(), Duration::from_secs(4)),
+                ("AT+QNWLOCK=\"save_ctrl\",0,0".into(), Duration::from_secs(4)),
+            ];
+            let _ = state.smd.exec_batch(clear_cmds, Priority::Emergency).await;
+            state.push_daemon_log("Cell-lock 60m trial re-probe failed to attach within window; keeping bypass active");
+        }
+    }
+
+    tracker.reprobe_stage = (tracker.reprobe_stage + 1).min(2);
+}
+
+#[derive(Debug, Default)]
+pub struct UsageFlushTracker {
+    pub pending_pre_ntp_rx: u64,
+    pub pending_pre_ntp_tx: u64,
+    pub bytes_since_etc_flush: u64,
+    pub last_tmp_flush: Option<Instant>,
+    pub last_etc_flush: Option<Instant>,
+}
+
+pub fn parse_eth_sysfs_speed(
+    carrier_raw: Option<&str>,
+    speed_raw: Option<&str>,
+    duplex_raw: Option<&str>,
+) -> (String, String) {
+    let duplex = duplex_raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    if carrier_raw.is_some_and(|c| c.trim() == "0") {
+        return ("down".into(), "down".into());
+    }
+    let Some(sp_str) = speed_raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ("down".into(), "down".into());
+    };
+    match sp_str.parse::<i64>() {
+        Ok(sp) if sp > 0 => (format!("{sp}Mb/s"), duplex),
+        _ => ("down".into(), "down".into()),
+    }
+}
+
+pub fn read_eth0_speed_and_duplex() -> (String, String) {
+    let carrier = fs::read_to_string(crate::paths::p("/sys/class/net/eth0/carrier")).ok();
+    let speed = fs::read_to_string(crate::paths::p("/sys/class/net/eth0/speed")).ok();
+    let duplex = fs::read_to_string(crate::paths::p("/sys/class/net/eth0/duplex")).ok();
+    parse_eth_sysfs_speed(carrier.as_deref(), speed.as_deref(), duplex.as_deref())
+}
+
+pub fn is_eth0_degraded_auto(eth_link_speed_cfg: &str, actual_speed: &str, duplex: &str) -> bool {
+    eth_link_speed_cfg.trim().eq_ignore_ascii_case("auto")
+        && actual_speed != "down"
+        && (actual_speed == "100Mb/s"
+            || actual_speed == "10Mb/s"
+            || duplex.trim().eq_ignore_ascii_case("half"))
+}
 
 pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver<()>) {
-    // 1. RF snapshot & identity poller (fast 3s when UI/WS active, 15s when idle, plus on-demand trigger)
+    // 1. RF snapshot, identity poller & cell-lock dead-man's-switch (monotonic Instant timers)
     let st_rf = state.clone();
     tokio::spawn(async move {
         let mut init_urcs = true;
-        let mut last_history_sec = 0u64;
+        let mut last_history: Option<Instant> = None;
+        let mut deadman = CellLockDeadmanTracker::default();
         loop {
+            st_rf.hb_telemetry_ms.store(mono_ms(), Ordering::Release);
             refresh_modem_snapshot(&st_rf, Priority::Telemetry, init_urcs).await;
+            st_rf.hb_telemetry_ms.store(mono_ms(), Ordering::Release);
             init_urcs = false;
 
-            let now = now_secs();
-            if now.saturating_sub(last_history_sec) >= 60 {
-                last_history_sec = now;
+            let now_inst = Instant::now();
+            tick_cell_lock_deadman(
+                &st_rf,
+                &mut deadman,
+                now_inst,
+                Duration::from_secs(25),
+            )
+            .await;
+
+            if last_history.is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(60)) {
+                last_history = Some(now_inst);
                 record_signal_history_point(&st_rf).await;
             }
 
@@ -123,7 +503,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                     }));
                 } else {
                     if keep_awake {
-                        let now_millis = now_ms();
+                        let now_millis = mono_ms();
                         let last = ALIGN_KEEP_AWAKE_MS.load(Ordering::Relaxed);
                         if now_millis.saturating_sub(last) >= ALIGN_KEEP_AWAKE_INTERVAL_MS
                             && ALIGN_KEEP_AWAKE_INFLIGHT
@@ -200,25 +580,31 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         }
     });
 
-    // 3. 1s /proc/net/dev + persistent data usage + 2s memory/uptime/internals poller
+    // 3. 1s /proc/net/dev + persistent data usage + 2s memory/uptime/internals poller + eth0 auto-heal
     let st_net = state.clone();
     tokio::spawn(async move {
         let mut prev_samples: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
         let mut prev_inst = Instant::now();
-        let mut last_flush_sec = now_secs();
+        let mut usage_tracker = UsageFlushTracker::default();
         let mut tick_count = 0u64;
         let mut cached_slot = String::from("_a");
         let mut boot_slot_loaded = false;
         let mut cached_wan_up: Option<UptimeTelemetry> = None;
+        let mut eth_degraded_since: Option<Instant> = None;
+        let mut last_eth_reneg: Option<Instant> = None;
 
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             tick_count += 1;
+            // While an interactive 180s AT+QSCAN holds /dev/smd11, keep watchdog heartbeat fresh.
+            if st_net.qscan_running.try_lock().is_ok_and(|g| g.is_some()) {
+                st_net.hb_telemetry_ms.store(mono_ms(), Ordering::Release);
+            }
             let now_inst = Instant::now();
             let elapsed_secs = now_inst.duration_since(prev_inst).as_secs_f64().max(0.2);
             prev_inst = now_inst;
 
-            poll_network_and_usage(&st_net, &mut prev_samples, elapsed_secs, &mut last_flush_sec).await;
+            poll_network_and_usage(&st_net, &mut prev_samples, elapsed_secs, &mut usage_tracker, now_inst).await;
 
             if tick_count.is_multiple_of(2) {
                 if !boot_slot_loaded {
@@ -239,38 +625,49 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                         }
                     }
                 }
-                poll_system_vitals(&st_net, &cached_slot, cached_wan_up.clone()).await;
+                poll_system_vitals(
+                    &st_net,
+                    &cached_slot,
+                    cached_wan_up.clone(),
+                    &mut eth_degraded_since,
+                    &mut last_eth_reneg,
+                )
+                .await;
             }
         }
     });
 
-    // 4. Native ICMP Latency + CA Keep-Alive + LinkWatch recovery task
+    // 4. Native ICMP Latency + CA Keep-Alive + 5-Stage LinkWatch recovery + Preferred SIM failback
     let st_icmp = state.clone();
     tokio::spawn(async move {
         let mut seq = 1u16;
         let mut hourly_acc: Vec<PingPoint> = Vec::new();
         let mut twelve_acc: Vec<PingPoint> = Vec::new();
         let mut daily_acc: Vec<PingPoint> = Vec::new();
-        let mut last_hour_flush = now_secs();
-        let mut last_twelve_flush = now_secs();
-        let mut last_daily_flush = now_secs();
+        let mut last_hour_flush = Instant::now();
+        let mut last_twelve_flush = Instant::now();
+        let mut last_daily_flush = Instant::now();
         let mut qw_fail_streak = 0u32;
         let mut qw_high_lat_streak = 0u32;
         let mut qw_retries = 0u32;
-        let mut last_qw_probe = 0u64;
-        let mut last_ping_sec = 0u64;
+        let mut last_qw_probe: Option<Instant> = None;
+        let mut last_qw_cooldown_try: Option<Instant> = None;
+        let mut last_ping: Option<Instant> = None;
         let mut was_qw_enabled = false;
+        let mut non_preferred_sim_since: Option<Instant> = None;
 
         loop {
             let cfg = st_icmp.settings.read().await.clone();
-            let now = now_secs();
+            let now_inst = Instant::now();
             let ping_period = if cfg.keep_alive_enabled {
-                1
+                Duration::from_secs(1)
             } else {
-                cfg.ping_interval_sec.clamp(2, 60)
+                Duration::from_secs(cfg.ping_interval_sec.clamp(2, 60))
             };
-            if cfg.ping_enabled && now.saturating_sub(last_ping_sec) >= ping_period {
-                last_ping_sec = now;
+            if cfg.ping_enabled
+                && last_ping.is_none_or(|t| now_inst.saturating_duration_since(t) >= ping_period)
+            {
+                last_ping = Some(now_inst);
                 seq = seq.wrapping_add(1).max(1);
                 let host = cfg.ping_host.clone();
                 let res = icmp_ping_once(&host, seq).await;
@@ -312,47 +709,60 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
 
                 hourly_acc.push(pt.clone());
                 twelve_acc.push(pt.clone());
-                daily_acc.push(pt.clone());
+                daily_acc.push(pt);
 
-                let now = now_secs();
-                if now.saturating_sub(last_hour_flush) >= 30 {
-                    last_hour_flush = now;
+                let flush_now = Instant::now();
+                if flush_now.saturating_duration_since(last_hour_flush) >= Duration::from_secs(30) {
+                    last_hour_flush = flush_now;
                     push_bucket(&st_icmp.ping_hourly, &mut hourly_acc, 120).await;
                 }
-                if now.saturating_sub(last_twelve_flush) >= 300 {
-                    last_twelve_flush = now;
+                if flush_now.saturating_duration_since(last_twelve_flush) >= Duration::from_secs(300) {
+                    last_twelve_flush = flush_now;
                     push_bucket(&st_icmp.ping_twelvehour, &mut twelve_acc, 144).await;
                 }
-                if now.saturating_sub(last_daily_flush) >= 600 {
-                    last_daily_flush = now;
+                if flush_now.saturating_duration_since(last_daily_flush) >= Duration::from_secs(600) {
+                    last_daily_flush = flush_now;
                     push_bucket(&st_icmp.ping_daily, &mut daily_acc, 144).await;
                 }
             }
 
-            // LinkWatch monitoring cycle
-            let now = now_secs();
+            // Preferred SIM failback (monotonic timer, skipped during active failover)
+            tick_preferred_sim_failback(&st_icmp, &cfg, &mut non_preferred_sim_since, Instant::now()).await;
+
+            // LinkWatch monitoring cycle (monotonic Instant timers + 45s SIM settle + 900s cooldown)
+            let now_wall = now_secs();
+            let now_inst = Instant::now();
             if !cfg.quecwatch_enabled {
                 was_qw_enabled = false;
                 qw_fail_streak = 0;
                 qw_high_lat_streak = 0;
                 qw_retries = 0;
-                last_qw_probe = 0;
+                last_qw_probe = None;
+                last_qw_cooldown_try = None;
             } else {
                 if !was_qw_enabled {
                     was_qw_enabled = true;
                     qw_fail_streak = 0;
                     qw_high_lat_streak = 0;
                     qw_retries = 0;
-                    last_qw_probe = 0;
+                    last_qw_probe = None;
+                    last_qw_cooldown_try = None;
                 }
-                if now.saturating_sub(last_qw_probe) >= cfg.quecwatch_interval_sec.max(15) {
-                    last_qw_probe = now;
+                let sim_sw_ms = st_icmp.sim_switched_at_ms.load(Ordering::Acquire);
+                let in_sim_settle =
+                    sim_sw_ms > 0 && mono_ms().saturating_sub(sim_sw_ms) < SIM_ATTACH_SETTLE_MS;
+                let probe_interval = Duration::from_secs(cfg.quecwatch_interval_sec.max(15));
+                if !in_sim_settle
+                    && last_qw_probe.is_none_or(|t| now_inst.saturating_duration_since(t) >= probe_interval)
+                {
+                    last_qw_probe = Some(now_inst);
                     seq = seq.wrapping_add(1).max(1);
                     let res = icmp_ping_once(&cfg.quecwatch_target, seq).await;
                     match res {
                         Ok(rtt) => {
                             qw_fail_streak = 0;
                             qw_retries = 0;
+                            last_qw_cooldown_try = None;
                             let rtt_u64 = rtt.round() as u64;
                             if cfg.quecwatch_high_latency && rtt_u64 > cfg.quecwatch_latency_ceiling {
                                 qw_high_lat_streak += 1;
@@ -364,31 +774,56 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                             qw.message = format!("ICMP reachability OK ({} ms)", rtt_u64);
                             qw.current_latency = rtt_u64;
                             qw.retry = 0;
-                            qw.timestamp = now;
+                            qw.timestamp = now_wall;
                         }
                         Err(err) => {
                             qw_fail_streak += 1;
                             let mut qw = st_icmp.quecwatch.write().await;
-                            qw.status = "failing".into();
-                            qw.message = format!("Probe failed ({qw_fail_streak}/{}): {err}", cfg.quecwatch_failures);
                             qw.current_latency = 0;
-                            qw.timestamp = now;
-                            if qw_fail_streak >= cfg.quecwatch_failures && qw_retries < cfg.quecwatch_max_retries {
-                                qw_retries += 1;
-                                qw.retry = qw_retries;
-                                qw.status = "recovering".into();
-                                qw.message = format!("Triggering recovery attempt {qw_retries}/{}", cfg.quecwatch_max_retries);
-                                drop(qw);
-                                if !trigger_quecwatch_recovery(&st_icmp, &cfg, qw_retries).await {
-                                    // Deferred while carrying failover traffic: Route10's
-                                    // own watchdog owns recovery; do not burn a retry.
-                                    qw_retries -= 1;
-                                    let mut qw = st_icmp.quecwatch.write().await;
-                                    qw.retry = qw_retries;
-                                    qw.status = "failing".into();
-                                    qw.message = "Recovery deferred: carrying failover traffic (Route10 handles recovery)".into();
+                            qw.timestamp = now_wall;
+                            if qw_retries >= cfg.quecwatch_max_retries {
+                                qw.status = "cooldown".into();
+                                let anchor = *last_qw_cooldown_try.get_or_insert(now_inst);
+                                if now_inst.saturating_duration_since(anchor)
+                                    >= Duration::from_secs(LINKWATCH_COOLDOWN_SECS)
+                                {
+                                    last_qw_cooldown_try = Some(now_inst);
+                                    let cd_attempt = qw_retries.saturating_add(1);
+                                    qw.message = format!(
+                                        "Cooldown recovery retry (every 15m after {} retries): {err}",
+                                        cfg.quecwatch_max_retries
+                                    );
+                                    drop(qw);
+                                    let _ = trigger_quecwatch_recovery(&st_icmp, &cfg, cd_attempt).await;
+                                    qw_fail_streak = 0;
+                                } else {
+                                    let rem = LINKWATCH_COOLDOWN_SECS.saturating_sub(
+                                        now_inst.saturating_duration_since(anchor).as_secs(),
+                                    );
+                                    qw.message = format!("Max retries reached; next cooldown retry in {rem}s ({err})");
                                 }
-                                qw_fail_streak = 0;
+                            } else {
+                                qw.status = "failing".into();
+                                qw.message = format!("Probe failed ({qw_fail_streak}/{}): {err}", cfg.quecwatch_failures);
+                                if qw_fail_streak >= cfg.quecwatch_failures {
+                                    qw_retries += 1;
+                                    qw.retry = qw_retries;
+                                    qw.status = "recovering".into();
+                                    qw.message = format!("Triggering recovery attempt {qw_retries}/{}", cfg.quecwatch_max_retries);
+                                    drop(qw);
+                                    if !trigger_quecwatch_recovery(&st_icmp, &cfg, qw_retries).await {
+                                        // Deferred while carrying failover traffic: Route10's
+                                        // own watchdog owns recovery; do not burn a retry.
+                                        qw_retries -= 1;
+                                        let mut qw = st_icmp.quecwatch.write().await;
+                                        qw.retry = qw_retries;
+                                        qw.status = "failing".into();
+                                        qw.message = "Recovery deferred: carrying failover traffic (Route10 handles recovery)".into();
+                                    } else if qw_retries >= cfg.quecwatch_max_retries {
+                                        last_qw_cooldown_try = Some(Instant::now());
+                                    }
+                                    qw_fail_streak = 0;
+                                }
                             }
                         }
                     }
@@ -399,24 +834,27 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         }
     });
 
-    // 5. Public IP refresh + QuecProfiles & Scheduled Tasks + SDX75 PHY & QMI DSP telemetry
+    // 5. Public IP refresh + QuecProfiles & Scheduled Tasks + SDX75 PHY & QMI DSP telemetry (Instant timers)
     let st_prof = state.clone();
     tokio::spawn(async move {
-        let mut tick = 0u64;
+        let mut last_public_ip: Option<Instant> = None;
+        let mut last_profiles: Option<Instant> = None;
         crate::radio_tuning::enable_phy_telemetry_counters(&st_prof).await;
         loop {
-            if tick.is_multiple_of(10) {
+            let now_inst = Instant::now();
+            if last_public_ip.is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(300)) {
+                last_public_ip = Some(now_inst);
                 refresh_public_ip(&st_prof).await;
                 let cert = crate::acme::inspect_active_cert().await;
                 *st_prof.tls_cert_info.write().await = cert;
             }
-            if tick.is_multiple_of(2) {
+            if last_profiles.is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(60)) {
+                last_profiles = Some(now_inst);
                 crate::profiles::tick_profiles_and_schedules(&st_prof).await;
             }
             let _ = crate::radio_tuning::poll_phy_telemetry(&st_prof).await;
             let dsp = crate::qmi::dsp::probe_dsp_telemetry().await;
             *st_prof.dsp_telemetry.write().await = dsp;
-            tick += 1;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
@@ -454,8 +892,194 @@ async fn push_bucket(
     ring.push_back(agg);
 }
 
-/// Returns false when the recovery was deferred (failover traffic).
-pub(crate) async fn trigger_quecwatch_recovery(state: &AppState, cfg: &crate::state::DaemonSettings, attempt: u32) -> bool {
+/// Issue `AT+CFUN=1` and verify `resp.ok`, retrying up to 3 times with 2s backoff so a
+/// transient SMD glitch or slow baseband transition never strands the modem in `CFUN=0`.
+pub(crate) async fn ensure_cfun_one_with_retries(state: &AppState, timeout: Duration) -> bool {
+    for attempt in 1..=3u8 {
+        match state.smd.exec("AT+CFUN=1", Priority::Emergency, timeout).await {
+            Ok(r) if r.ok => return true,
+            Ok(r) => {
+                state.push_daemon_log(format!(
+                    "AT+CFUN=1 rejected on attempt {attempt}/3: {}",
+                    r.body.trim()
+                ));
+            }
+            Err(e) => {
+                state.push_daemon_log(format!(
+                    "AT+CFUN=1 failed/timed out on attempt {attempt}/3: {e}"
+                ));
+            }
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    push_alert(
+        state,
+        "modem_cfun",
+        "AT+CFUN=1 failed after 3 attempts; modem may require hardware reset",
+    )
+    .await;
+    false
+}
+
+pub fn parse_qsimstat_inserted(body: &str) -> Option<bool> {
+    for line in clean_at_lines(body) {
+        let Some(rest) = line.strip_prefix("+QSIMSTAT:") else {
+            continue;
+        };
+        let mut parts = rest.split(',').map(str::trim);
+        let _enable = parts.next()?;
+        let status = parts.next()?.parse::<u8>().ok()?;
+        return match status {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Check whether `target_slot` (`1` or `2`) actually has a SIM card inserted via QMI UIM
+/// (`0x0B`) when QRTR is available, falling back to `AT+QSIMSTAT?`.
+pub(crate) async fn is_sim_slot_present(state: &AppState, target_slot: u8) -> bool {
+    if !(1..=2).contains(&target_slot) {
+        return false;
+    }
+    if let Ok(bus) = crate::qmi::qrtr::QrtrBus::connect() {
+        let has_uim = bus
+            .snapshot()
+            .services
+            .iter()
+            .any(|s| s.service == crate::qmi::SVC_UIM);
+        if has_uim {
+            let (ind_tx, _ind_rx) = mpsc::channel(4);
+            if let Ok(ep) = bus
+                .open_service(crate::qmi::SVC_UIM, "UIM_CHK", ind_tx, Duration::from_secs(2))
+                .await
+                && let Ok(cs) = crate::qmi::uim::get_card_status(ep.as_ref()).await
+                && let Some(slot_st) = cs.slots.iter().find(|s| s.slot == target_slot)
+            {
+                return slot_st.card_state == "present";
+            }
+        }
+    }
+    // AT fallback when QRTR UIM is unavailable (e.g. non-QRTR host or unit tests).
+    match state
+        .smd
+        .exec("AT+QSIMSTAT?", Priority::Emergency, Duration::from_secs(3))
+        .await
+    {
+        Ok(r) if !r.ok => false,
+        Ok(r) => parse_qsimstat_inserted(&r.body).unwrap_or(true),
+        Err(_) => false,
+    }
+}
+
+async fn try_verified_sim_switch(state: &AppState, target_slot: u8, reason: &str) -> bool {
+    if !is_sim_slot_present(state, target_slot).await {
+        state.push_daemon_log(format!(
+            "{reason}: skipped switch to SIM slot {target_slot} (no SIM detected)"
+        ));
+        return false;
+    }
+    match state
+        .smd
+        .exec(
+            format!("AT+QUIMSLOT={target_slot}"),
+            Priority::Emergency,
+            Duration::from_secs(8),
+        )
+        .await
+    {
+        Ok(r) if r.ok => {
+            crate::handlers::post_sim_slot(state).await;
+            state.push_daemon_log(format!("{reason}: switched to SIM slot {target_slot}"));
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn tick_preferred_sim_failback(
+    state: &AppState,
+    cfg: &crate::state::DaemonSettings,
+    non_preferred_since: &mut Option<Instant>,
+    now: Instant,
+) {
+    if !(1..=2).contains(&cfg.preferred_sim_slot) || crate::obs::failover::is_active() {
+        *non_preferred_since = None;
+        return;
+    }
+    let cur_slot = state.modem.read().await.identity.sim_slot;
+    if !(1..=2).contains(&cur_slot) || cur_slot == i32::from(cfg.preferred_sim_slot) {
+        *non_preferred_since = None;
+        return;
+    }
+    let since = *non_preferred_since.get_or_insert(now);
+    if now.saturating_duration_since(since) < Duration::from_secs(cfg.sim_failback_mins.max(1) * 60)
+    {
+        return;
+    }
+    *non_preferred_since = Some(now);
+    let _guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
+    if try_verified_sim_switch(state, cfg.preferred_sim_slot, "Preferred SIM failback").await {
+        crate::handlers::forget_radio_mode(state);
+        *non_preferred_since = None;
+    }
+}
+
+async fn run_stage2_cfun_cycle(state: &AppState) {
+    let guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
+    if guard.is_none() {
+        state.push_daemon_log("LinkWatch: radio_lock busy for 8s; continuing CFUN recovery");
+    }
+    let _ = state
+        .smd
+        .exec("AT+CFUN=0", Priority::Emergency, Duration::from_secs(10))
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = ensure_cfun_one_with_retries(state, Duration::from_secs(12)).await;
+    crate::handlers::forget_radio_mode(state);
+    drop(guard);
+    if crate::dataplane::is_native_mode() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = crate::dataplane::trigger_native_reconnect_if_active().await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
+        let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
+    }
+}
+
+async fn run_stage4_dual_sim_failover(state: &AppState) -> bool {
+    let guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
+    if guard.is_none() {
+        state.push_daemon_log("LinkWatch: radio_lock busy for 8s; continuing SIM failover");
+    }
+    let switched = if let Ok(cur_slot_res) = state
+        .smd
+        .exec("AT+QUIMSLOT?", Priority::Emergency, Duration::from_secs(4))
+        .await
+    {
+        let cur = parse_scalar_at_value(&cur_slot_res.body, "+QUIMSLOT:");
+        let next_slot: u8 = if cur.trim() == "1" { 2 } else { 1 };
+        try_verified_sim_switch(state, next_slot, "LinkWatch Dual-SIM failover").await
+    } else {
+        false
+    };
+    crate::handlers::forget_radio_mode(state);
+    drop(guard);
+    switched
+}
+
+/// 5-stage LinkWatch recovery escalation ladder.
+/// Returns `false` when recovery was deferred because the modem is carrying failover traffic.
+pub(crate) async fn trigger_quecwatch_recovery(
+    state: &AppState,
+    cfg: &crate::state::DaemonSettings,
+    attempt: u32,
+) -> bool {
     if crate::obs::failover::is_active() {
         state.push_daemon_log("LinkWatch recovery deferred: modem is carrying failover traffic");
         crate::obs::events::work_deferred("LinkWatch recovery (CFUN cycle / SIM switch)", "carrying failover traffic");
@@ -467,49 +1091,78 @@ pub(crate) async fn trigger_quecwatch_recovery(state: &AppState, cfg: &crate::st
         cfg.quecwatch_connection_refresh,
         cfg.quecwatch_auto_sim_failover,
     );
-    state.push_daemon_log("LinkWatch initiating recovery cycle");
+    state.push_daemon_log(format!("LinkWatch initiating recovery cycle (attempt {attempt})"));
     state.broadcast_with(|| serde_json::json!({
         "channel": "quecwatch",
-        "message": "LinkWatch initiating cellular recovery",
+        "message": format!("LinkWatch initiating cellular recovery (stage {attempt})"),
         "timestamp": format_now_hms(),
     }));
-    if cfg.quecwatch_connection_refresh || cfg.quecwatch_auto_sim_failover {
-        let guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
-        if guard.is_none() {
-            state.push_daemon_log("LinkWatch: radio_lock busy for 8s; continuing recovery");
-        }
-        if cfg.quecwatch_connection_refresh {
-            let _ = state.smd.exec("AT+CFUN=0", Priority::Emergency, Duration::from_secs(10)).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let _ = state.smd.exec("AT+CFUN=1", Priority::Emergency, Duration::from_secs(12)).await;
-        }
-        if cfg.quecwatch_auto_sim_failover
-            && let Ok(cur_slot_res) = state.smd.exec("AT+QUIMSLOT?", Priority::Emergency, Duration::from_secs(4)).await
-        {
-            let cur = parse_scalar_at_value(&cur_slot_res.body, "+QUIMSLOT:");
-            let next_slot = if cur.trim() == "1" { "2" } else { "1" };
-            let _ = state
-                .smd
-                .exec(format!("AT+QUIMSLOT={next_slot}"), Priority::Emergency, Duration::from_secs(8))
-                .await;
-        }
-        crate::handlers::forget_radio_mode(state);
-        drop(guard);
-        if cfg.quecwatch_connection_refresh {
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            let _ = run_cmd("ubus", &["call", "network.interface.wan", "up"], Duration::from_secs(3)).await;
-            let _ = run_cmd("ubus", &["call", "network.interface.wan_v6", "up"], Duration::from_secs(3)).await;
+
+    let has_cell_lock = !cfg.cell_lock_nr5g.is_empty() || !cfg.cell_lock_lte.is_empty();
+
+    if !cfg.quecwatch_connection_refresh && cfg.quecwatch_auto_sim_failover {
+        let _ = run_stage4_dual_sim_failover(state).await;
+    } else if cfg.quecwatch_connection_refresh {
+        match attempt {
+            0 | 1 => {
+                // Stage 1: Soft bearer reconnect (Native WDS reconnect in Native mode, ubus wan up in Coexist).
+                if crate::dataplane::is_native_mode() {
+                    let _ = crate::dataplane::trigger_native_reconnect_if_active().await;
+                    state.push_daemon_log("LinkWatch Stage 1: triggered native WDS bearer reconnect");
+                } else if run_cmd(
+                    "ubus",
+                    &["call", "network.interface.wan", "up"],
+                    Duration::from_secs(3),
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = run_cmd(
+                        "ubus",
+                        &["call", "network.interface.wan_v6", "up"],
+                        Duration::from_secs(3),
+                    )
+                    .await;
+                    state.push_daemon_log("LinkWatch Stage 1: triggered ubus wan reconnect");
+                } else {
+                    // Standalone Linux without ubus: escalate immediately to Stage 2 CFUN cycle.
+                    run_stage2_cfun_cycle(state).await;
+                }
+            }
+            2 => {
+                // Stage 2: Verified AT+CFUN=0 -> AT+CFUN=1 cycle.
+                run_stage2_cfun_cycle(state).await;
+            }
+            3 => {
+                // Stage 3: Temporary cell-lock bypass if any lock is active, else escalate.
+                if has_cell_lock && !state.cell_lock_bypassed.load(Ordering::Acquire) {
+                    bypass_cell_lock_temporarily(
+                        state,
+                        "LinkWatch Stage 3 temporarily bypassed cell lock to restore reachability",
+                    )
+                    .await;
+                } else if cfg.quecwatch_auto_sim_failover {
+                    if !run_stage4_dual_sim_failover(state).await {
+                        run_stage2_cfun_cycle(state).await;
+                    }
+                } else {
+                    run_stage2_cfun_cycle(state).await;
+                }
+            }
+            _ => {
+                // Stage 4+: Verified Dual-SIM failover (with fallback to verified CFUN=0/1).
+                if cfg.quecwatch_auto_sim_failover {
+                    if !run_stage4_dual_sim_failover(state).await {
+                        run_stage2_cfun_cycle(state).await;
+                    }
+                } else {
+                    run_stage2_cfun_cycle(state).await;
+                }
+            }
         }
     }
-    let mut alerts = state.alerts.write().await;
-    if alerts.len() >= 20 {
-        alerts.pop_back();
-    }
-    alerts.push_front(AlertLogEntry {
-        r#type: "quecwatch".into(),
-        message: "LinkWatch ran automatic link recovery".into(),
-        timestamp: format_now_hms(),
-    });
+
+    push_alert(state, "quecwatch", "LinkWatch ran automatic link recovery").await;
     true
 }
 
@@ -569,6 +1222,7 @@ pub(crate) fn build_telemetry_commands_with_qmap(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_telemetry_commands_with_opts(
     qcainfo_cmd: &str,
     ta_nr_cmd: &str,
@@ -577,31 +1231,58 @@ pub(crate) fn build_telemetry_commands_with_opts(
     include_qtemp: bool,
     need_static: bool,
 ) -> Vec<(String, Duration)> {
+    build_telemetry_commands_full(
+        qcainfo_cmd,
+        ta_nr_cmd,
+        Some(ta_lte_cmd),
+        include_qmap,
+        true,
+        include_qtemp,
+        true,
+        need_static,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_telemetry_commands_full(
+    qcainfo_cmd: &str,
+    ta_nr_cmd: &str,
+    ta_lte_cmd: Option<&str>,
+    include_qmap: bool,
+    include_cgcontrdp: bool,
+    include_qtemp: bool,
+    include_qspn: bool,
+    need_static: bool,
+    need_sim_identity: bool,
+) -> Vec<(String, Duration)> {
     // Keep at_fwd commands (QMAP WWAN, QTEMP) in their mid-batch positions so trailing
     // baseband queries always follow them; moving them to the end caused a post-CFUN resync miss.
+    // Combine AT+QRSRP;+QRSRQ;+QSINR into one compound query and omit unused AT+C5GREG?.
     let mut cmds: Vec<(String, Duration)> = vec![
         ("AT+CFUN?".into(), Duration::from_secs(3)),
         ("AT+QENG=\"servingcell\"".into(), Duration::from_secs(4)),
         (qcainfo_cmd.into(), Duration::from_secs(4)),
-        ("AT+QRSRP".into(), Duration::from_secs(3)),
-        ("AT+QRSRQ".into(), Duration::from_secs(3)),
-        ("AT+QSINR".into(), Duration::from_secs(3)),
+        ("AT+QRSRP;+QRSRQ;+QSINR".into(), Duration::from_secs(3)),
         ("AT+QNWCFG=\"nr5g_mimo_info\"".into(), Duration::from_secs(3)),
     ];
     if include_qmap {
         cmds.push(("AT+QMAP=\"WWAN\"".into(), Duration::from_secs(4)));
     }
-    cmds.push(("AT+CGCONTRDP".into(), Duration::from_secs(4)));
+    if include_cgcontrdp {
+        cmds.push(("AT+CGCONTRDP".into(), Duration::from_secs(4)));
+    }
     if include_qtemp {
         cmds.push(("AT+QTEMP".into(), Duration::from_secs(4)));
     }
-    cmds.extend([
-        ("AT+QSPN".into(), Duration::from_secs(3)),
-        (ta_nr_cmd.into(), Duration::from_secs(3)),
-        (ta_lte_cmd.into(), Duration::from_secs(3)),
-        ("AT+QUIMSLOT?".into(), Duration::from_secs(3)),
-        ("AT+C5GREG?".into(), Duration::from_secs(3)),
-    ]);
+    if include_qspn {
+        cmds.push(("AT+QSPN".into(), Duration::from_secs(3)));
+    }
+    cmds.push((ta_nr_cmd.into(), Duration::from_secs(3)));
+    if let Some(lte_ta) = ta_lte_cmd {
+        cmds.push((lte_ta.into(), Duration::from_secs(3)));
+    }
+    cmds.push(("AT+QUIMSLOT?".into(), Duration::from_secs(3)));
     if need_static {
         cmds.extend([
             ("AT+CGMI".into(), Duration::from_secs(3)),
@@ -609,6 +1290,12 @@ pub(crate) fn build_telemetry_commands_with_opts(
             ("AT+QGMR".into(), Duration::from_secs(3)),
             ("AT+QNWCFG=\"3gpp_rel\"".into(), Duration::from_secs(3)),
             ("AT+CGSN".into(), Duration::from_secs(3)),
+            ("AT+ICCID".into(), Duration::from_secs(3)),
+            ("AT+CIMI".into(), Duration::from_secs(3)),
+            ("AT+CNUM".into(), Duration::from_secs(3)),
+        ]);
+    } else if need_sim_identity {
+        cmds.extend([
             ("AT+ICCID".into(), Duration::from_secs(3)),
             ("AT+CIMI".into(), Duration::from_secs(3)),
             ("AT+CNUM".into(), Duration::from_secs(3)),
@@ -628,13 +1315,13 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     } else {
         "AT+QNWCFG=\"nr5g_time_advance\""
     };
-    let ta_lte_cmd = if init_urcs {
+    let ta_lte_raw = if init_urcs {
         "AT+QNWCFG=\"lte_time_advance\",1;+QNWCFG=\"lte_time_advance\""
     } else {
         "AT+QNWCFG=\"lte_time_advance\""
     };
 
-    let (need_static, thermals_empty, cached_wwan_raw, cached_thermals) = {
+    let (need_static, thermals_empty, cached_wwan_raw, cached_thermals, prev_rat, prev_plmn) = {
         let m = state.modem.read().await;
         (
             m.identity.revision.is_empty() || m.identity.model.is_empty(),
@@ -644,32 +1331,58 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
                 .cloned()
                 .unwrap_or_default(),
             m.thermals.clone(),
+            m.serving.as_ref().map(|s| s.rat.clone()).unwrap_or_default(),
+            m.serving
+                .as_ref()
+                .map(|s| (s.mcc.clone(), s.mnc.clone()))
+                .unwrap_or_default(),
         )
     };
+    let need_sim_identity = {
+        let sec = state.secrets.read().await;
+        sec.iccid.is_empty() || sec.imsi.is_empty()
+    };
+    let cached_spn = state.spn_cache.read().await.clone();
+    let spn_cache_hit = !init_urcs
+        && !prev_plmn.0.is_empty()
+        && !prev_plmn.1.is_empty()
+        && cached_spn.0 == prev_plmn.0
+        && cached_spn.1 == prev_plmn.1
+        && !cached_spn.2.is_empty();
 
     let sysfs_thermals = tokio::task::spawn_blocking(read_sysfs_thermals)
         .await
         .unwrap_or_default();
 
-    let now = now_secs();
+    let mono_now_secs = mono_ms() / 1000;
     let poll_atfwd = should_poll_atfwd(
         priority,
         init_urcs,
         thermals_empty && sysfs_thermals.is_empty(),
-        now,
+        mono_now_secs,
         LAST_ATFWD_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed),
     );
     let native_mode = crate::dataplane::is_native_mode();
     let include_qmap = poll_atfwd && !native_mode;
+    let include_cgcontrdp = !native_mode;
     let include_qtemp = poll_atfwd && sysfs_thermals.is_empty();
+    let include_qspn = !spn_cache_hit;
+    let ta_lte_cmd = if !init_urcs && prev_rat == "NR5G-SA" {
+        None
+    } else {
+        Some(ta_lte_raw)
+    };
 
-    let cmds = build_telemetry_commands_with_opts(
+    let cmds = build_telemetry_commands_full(
         qcainfo_cmd,
         ta_nr_cmd,
         ta_lte_cmd,
         include_qmap,
+        include_cgcontrdp,
         include_qtemp,
+        include_qspn,
         need_static,
+        need_sim_identity,
     );
 
     let cmd_names: Vec<String> = cmds.iter().map(|(c, _)| c.clone()).collect();
@@ -678,7 +1391,7 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     };
 
     if poll_atfwd {
-        LAST_ATFWD_POLL_SECS.store(now, std::sync::atomic::Ordering::Relaxed);
+        LAST_ATFWD_POLL_SECS.store(mono_now_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     let mut raw_map: BTreeMap<String, String> = BTreeMap::new();
@@ -686,6 +1399,32 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
         if let Ok(r) = res {
             raw_map.insert(name, r.body);
         }
+    }
+
+    // Fallback to individual QRSRP/QRSRQ/QSINR if compound command returned empty/error on non-standard firmware
+    let compound_sig = raw_map
+        .get("AT+QRSRP;+QRSRQ;+QSINR")
+        .cloned()
+        .unwrap_or_default();
+    let mut mimo = parse_mimo_signal(&compound_sig, &compound_sig, &compound_sig);
+    if mimo.rsrp.iter().all(|v| v.is_none())
+        && !compound_sig.contains("+QRSRP:")
+        && let Ok(fb) = state
+            .smd
+            .exec_batch(
+                vec![
+                    ("AT+QRSRP".into(), Duration::from_secs(2)),
+                    ("AT+QRSRQ".into(), Duration::from_secs(2)),
+                    ("AT+QSINR".into(), Duration::from_secs(2)),
+                ],
+                priority,
+            )
+            .await
+    {
+        let r0 = fb.first().and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+        let r1 = fb.get(1).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+        let r2 = fb.get(2).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+        mimo = parse_mimo_signal(r0, r1, r2);
     }
 
     let get_resp = |needle: &str| -> String {
@@ -700,7 +1439,6 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     let mimo_info = parse_nr5g_mimo_info(&get_resp("nr5g_mimo_info"));
     merge_nr5g_mimo_layers(&mut carriers, &mimo_info);
     let serving = parse_serving_cell(&get_resp("servingcell"), &carriers);
-    let mimo = parse_mimo_signal(&get_resp("QRSRP"), &get_resp("QRSRQ"), &get_resp("QSINR"));
     let wwan_raw = if native_mode {
         String::new()
     } else if include_qmap {
@@ -708,7 +1446,12 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     } else {
         cached_wwan_raw
     };
-    let mut bearers = parse_active_wwan(&wwan_raw, &get_resp("CGCONTRDP"));
+    let cgcontrdp_raw = if include_cgcontrdp {
+        get_resp("CGCONTRDP")
+    } else {
+        String::new()
+    };
+    let mut bearers = parse_active_wwan(&wwan_raw, &cgcontrdp_raw);
     if native_mode
         && let Some(ov) = crate::dataplane::native_bearer_overlay().await
     {
@@ -727,7 +1470,34 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
         cached_thermals
     };
 
-    let qspn = parse_qspn_operator(&get_resp("QSPN"));
+    let cur_mcc = serving.as_ref().map(|s| s.mcc.clone()).unwrap_or_default();
+    let cur_mnc = serving.as_ref().map(|s| s.mnc.clone()).unwrap_or_default();
+    let mut qspn = if include_qspn {
+        let parsed = parse_qspn_operator(&get_resp("QSPN"));
+        if !parsed.is_empty() && !cur_mcc.is_empty() && !cur_mnc.is_empty() {
+            *state.spn_cache.write().await = (cur_mcc.clone(), cur_mnc.clone(), parsed.clone());
+        }
+        parsed
+    } else if cur_mcc == cached_spn.0 && cur_mnc == cached_spn.1 {
+        cached_spn.2
+    } else {
+        String::new()
+    };
+    if qspn.is_empty()
+        && !include_qspn
+        && !cur_mcc.is_empty()
+        && let Ok(spn_res) = state
+            .smd
+            .exec("AT+QSPN", priority, Duration::from_secs(3))
+            .await
+    {
+        let parsed = parse_qspn_operator(&spn_res.body);
+        if !parsed.is_empty() {
+            *state.spn_cache.write().await = (cur_mcc.clone(), cur_mnc.clone(), parsed.clone());
+            qspn = parsed;
+        }
+    }
+
     let operator = if !qspn.is_empty() {
         qspn
     } else if serving.as_ref().is_some_and(|s| s.mcc == "310" && s.mnc == "260") {
@@ -744,6 +1514,21 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     let sim_slot = parse_scalar_at_value(&get_resp("QUIMSLOT"), "+QUIMSLOT:")
         .parse::<i32>()
         .unwrap_or(1);
+
+    let prev_sim_slot = state.last_sim_slot.swap(sim_slot, Ordering::AcqRel);
+    let sim_slot_changed = prev_sim_slot != 0 && prev_sim_slot != sim_slot;
+    let mut trigger_profile_sync = false;
+    let mut extra_cnum: Option<String> = None;
+
+    if sim_slot_changed {
+        {
+            let mut sec = state.secrets.write().await;
+            sec.iccid.clear();
+            sec.imsi.clear();
+        }
+        *state.spn_cache.write().await = (String::new(), String::new(), String::new());
+        state.sim_switched_at_ms.store(mono_ms(), Ordering::Release);
+    }
 
     if need_static {
         let prev_imei = tokio::task::spawn_blocking(|| uci_get_blocking("cellcore.imei.previous"))
@@ -769,6 +1554,49 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
             sec.imsi = imsi_val;
         }
         sec.previous_imei = prev_imei;
+    } else if sim_slot_changed {
+        // SIM slot changed since previous poll and AT+ICCID wasn't in this batch yet: query immediately!
+        if let Ok(sim_res) = state
+            .smd
+            .exec_batch(
+                vec![
+                    ("AT+ICCID".into(), Duration::from_secs(3)),
+                    ("AT+CIMI".into(), Duration::from_secs(3)),
+                    ("AT+CNUM".into(), Duration::from_secs(3)),
+                ],
+                Priority::Interactive,
+            )
+            .await
+        {
+            let r_iccid = sim_res.first().and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let r_cimi = sim_res.get(1).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let r_cnum = sim_res.get(2).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let mut sec = state.secrets.write().await;
+            let iccid_val = parse_scalar_at_value(r_iccid, "+ICCID:");
+            if !iccid_val.is_empty() {
+                sec.iccid = iccid_val;
+                trigger_profile_sync = true;
+            }
+            let imsi_val = parse_scalar_at_value(r_cimi, "");
+            if !imsi_val.is_empty() {
+                sec.imsi = imsi_val;
+            }
+            extra_cnum = Some(parse_scalar_at_value(r_cnum, "+CNUM:"));
+        }
+    } else if need_sim_identity {
+        let mut sec = state.secrets.write().await;
+        let iccid_val = parse_scalar_at_value(&get_resp("ICCID"), "+ICCID:");
+        if !iccid_val.is_empty() {
+            sec.iccid = iccid_val;
+            if prev_sim_slot == 0 {
+                trigger_profile_sync = true;
+            }
+        }
+        let imsi_val = parse_scalar_at_value(&get_resp("CIMI"), "");
+        if !imsi_val.is_empty() {
+            sec.imsi = imsi_val;
+        }
+        extra_cnum = Some(parse_scalar_at_value(&get_resp("CNUM"), "+CNUM:"));
     }
 
     let sec_snap = state.secrets.read().await.clone();
@@ -807,10 +1635,13 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
         }
         let cnum = parse_scalar_at_value(&get_resp("CNUM"), "+CNUM:");
         modem.identity.phone_number = cnum;
+    } else if let Some(cnum) = extra_cnum {
+        modem.identity.phone_number = cnum;
     }
 
     if native_mode {
         modem.raw_commands.remove("AT+QMAP=\"WWAN\"");
+        modem.raw_commands.remove("AT+CGCONTRDP");
     }
     if !init_urcs {
         for stale in [
@@ -831,6 +1662,9 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
 
     let snap_val = modem.clone();
     drop(modem);
+    if trigger_profile_sync {
+        crate::profiles::tick_iccid_profile_sync(state).await;
+    }
     // Event detectors diff consecutive snapshots here (no extra AT).
     crate::obs::events::on_snapshot(&snap_val);
 
@@ -1156,7 +1990,8 @@ async fn poll_network_and_usage(
     state: &AppState,
     prev: &mut HashMap<String, (u64, u64, u64, u64)>,
     elapsed_secs: f64,
-    last_flush_sec: &mut u64,
+    tracker: &mut UsageFlushTracker,
+    mono_now: Instant,
 ) {
     let Ok(Some(rows)) = tokio::task::spawn_blocking(read_net_dev_samples).await else {
         return;
@@ -1205,11 +2040,20 @@ async fn poll_network_and_usage(
 
     let rx_bps = primary.map(|p| p.rx.bps).unwrap_or(0);
     let tx_bps = primary.map(|p| p.tx.bps).unwrap_or(0);
-    let now_ms = now_secs() * 1000;
+    let now_ms_val = now_secs() * 1000;
 
     if let Some(p) = primary {
-        update_persistent_usage(state, &p.name, p.rx.bytes_total, p.tx.bytes_total, last_flush_sec)
-            .await;
+        update_persistent_usage_with_clock(
+            state,
+            &p.name,
+            p.rx.bytes_total,
+            p.tx.bytes_total,
+            tracker,
+            now_secs(),
+            format_today_ymd(),
+            mono_now,
+        )
+        .await;
     }
 
     {
@@ -1225,7 +2069,7 @@ async fn poll_network_and_usage(
             tr.history.pop_front();
         }
         tr.history.push_back(TrafficHistoryPoint {
-            ts: now_ms,
+            ts: now_ms_val,
             rx_bps,
             tx_bps,
         });
@@ -1270,14 +2114,17 @@ fn pick_primary_rmnet(ifaces: &[TrafficInterfaceStats]) -> Option<&TrafficInterf
         .or_else(|| rmnets.iter().copied().max_by_key(|i| i.rx.bytes_total))
 }
 
-async fn update_persistent_usage(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_persistent_usage_with_clock(
     state: &AppState,
     iface: &str,
     raw_rx: u64,
     raw_tx: u64,
-    last_flush_sec: &mut u64,
+    tracker: &mut UsageFlushTracker,
+    wall_now_secs: u64,
+    ymd: (String, String, u8),
+    mono_now: Instant,
 ) {
-    let (today, month, _) = format_today_ymd();
     let mut u = state.data_usage.write().await;
 
     let (delta_rx, delta_tx) = if u.last_iface != iface {
@@ -1301,34 +2148,46 @@ async fn update_persistent_usage(
         (drx, dtx)
     };
 
-    if delta_rx == 0 && delta_tx == 0 {
+    // Hold pre-NTP deltas in memory until wall clock >= 2025-01-01 so 1970-01-01 buckets never form.
+    if wall_now_secs < crate::state::MIN_VALID_WALL_CLOCK_SECS {
+        tracker.pending_pre_ntp_rx = tracker.pending_pre_ntp_rx.saturating_add(delta_rx);
+        tracker.pending_pre_ntp_tx = tracker.pending_pre_ntp_tx.saturating_add(delta_tx);
         return;
     }
 
+    let total_rx = delta_rx.saturating_add(std::mem::take(&mut tracker.pending_pre_ntp_rx));
+    let total_tx = delta_tx.saturating_add(std::mem::take(&mut tracker.pending_pre_ntp_tx));
+    if total_rx == 0 && total_tx == 0 {
+        return;
+    }
+
+    let (today, month, _) = ymd;
+    let mut day_rolled_over = false;
+
     if let Some(entry) = u.daily.iter_mut().find(|d| d.date == today) {
-        entry.rx_bytes = entry.rx_bytes.saturating_add(delta_rx);
-        entry.tx_bytes = entry.tx_bytes.saturating_add(delta_tx);
+        entry.rx_bytes = entry.rx_bytes.saturating_add(total_rx);
+        entry.tx_bytes = entry.tx_bytes.saturating_add(total_tx);
     } else {
         u.daily.push(DailyUsageEntry {
-            date: today.clone(),
-            rx_bytes: delta_rx,
-            tx_bytes: delta_tx,
+            date: today,
+            rx_bytes: total_rx,
+            tx_bytes: total_tx,
         });
         if u.daily.len() > 90 {
             let drain_n = u.daily.len() - 90;
             u.daily.drain(0..drain_n);
         }
-        *last_flush_sec = 0; // force flush on day change
+        day_rolled_over = true;
     }
 
     if let Some(entry) = u.monthly.iter_mut().find(|m| m.month == month) {
-        entry.rx_bytes = entry.rx_bytes.saturating_add(delta_rx);
-        entry.tx_bytes = entry.tx_bytes.saturating_add(delta_tx);
+        entry.rx_bytes = entry.rx_bytes.saturating_add(total_rx);
+        entry.tx_bytes = entry.tx_bytes.saturating_add(total_tx);
     } else {
         u.monthly.push(MonthlyUsageEntry {
             month,
-            rx_bytes: delta_rx,
-            tx_bytes: delta_tx,
+            rx_bytes: total_rx,
+            tx_bytes: total_tx,
         });
         if u.monthly.len() > 24 {
             let drain_n = u.monthly.len() - 24;
@@ -1336,20 +2195,44 @@ async fn update_persistent_usage(
         }
     }
 
-    let now = now_secs();
-    let flush_snap = if now.saturating_sub(*last_flush_sec) >= DATA_USAGE_SNAPSHOT_FLUSH_SECS {
-        *last_flush_sec = now;
+    tracker.bytes_since_etc_flush = tracker
+        .bytes_since_etc_flush
+        .saturating_add(total_rx)
+        .saturating_add(total_tx);
+
+    let flush_etc = day_rolled_over
+        || tracker.bytes_since_etc_flush >= DATA_USAGE_ETC_FLUSH_BYTES
+        || tracker.last_etc_flush.is_none_or(|t| {
+            mono_now.saturating_duration_since(t) >= Duration::from_secs(DATA_USAGE_ETC_FLUSH_SECS)
+        });
+    let flush_tmp = flush_etc
+        || tracker.last_tmp_flush.is_none_or(|t| {
+            mono_now.saturating_duration_since(t)
+                >= Duration::from_secs(DATA_USAGE_SNAPSHOT_FLUSH_SECS)
+        });
+
+    let snap = if flush_tmp || flush_etc {
+        if flush_tmp {
+            tracker.last_tmp_flush = Some(mono_now);
+        }
+        if flush_etc {
+            tracker.last_etc_flush = Some(mono_now);
+            tracker.bytes_since_etc_flush = 0;
+        }
         Some(u.clone())
     } else {
         None
     };
     drop(u);
-    if let Some(snap) = flush_snap {
-        let p1 = crate::paths::p(DATA_USAGE_PATH);
-        let p2 = crate::paths::p(DATA_USAGE_TMP_PATH);
+
+    if let Some(snap) = snap {
+        let p_etc = crate::paths::p(DATA_USAGE_PATH);
+        let p_tmp = crate::paths::p(DATA_USAGE_TMP_PATH);
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = save_json_atomic(&p1, &snap, 0o600);
-            let _ = save_json_atomic(&p2, &snap, 0o644);
+            let _ = save_json_atomic(&p_tmp, &snap, 0o600);
+            if flush_etc {
+                let _ = save_json_atomic(&p_etc, &snap, 0o600);
+            }
         })
         .await;
     }
@@ -1357,12 +2240,14 @@ async fn update_persistent_usage(
 
 pub async fn flush_persistent_state(state: &AppState) {
     let snap = state.data_usage.read().await.clone();
+    let tokens = state.tokens.clone();
     let p1 = crate::paths::p(DATA_USAGE_PATH);
     let p2 = crate::paths::p(DATA_USAGE_TMP_PATH);
-    // Event ring + observability counters + usage flash flush (SIGTERM and every reboot path).
+    // Event ring + observability counters + API token usage + data usage flash flush (SIGTERM / reboot).
     let _ = tokio::task::spawn_blocking(move || {
         let _ = save_json_atomic(&p1, &snap, 0o600);
-        let _ = save_json_atomic(&p2, &snap, 0o644);
+        let _ = save_json_atomic(&p2, &snap, 0o600);
+        tokens.flush_tokens_usage();
         crate::obs::flush_now(true);
     })
     .await;
@@ -1415,6 +2300,7 @@ struct SystemVitalsRaw {
     usrdata_avail_bytes: u64,
     mwan3_running: bool,
     eth_speed: String,
+    eth_duplex: String,
 }
 
 fn read_system_vitals_blocking() -> SystemVitalsRaw {
@@ -1479,10 +2365,7 @@ fn read_system_vitals_blocking() -> SystemVitalsRaw {
     let (usrdata_total_bytes, usrdata_used_bytes, usrdata_avail_bytes) =
         statvfs_bytes(&crate::paths::p("/usrdata"));
     let mwan3_running = is_proc_running("mwan3track");
-    let eth_speed = fs::read_to_string(crate::paths::p("/sys/class/net/eth0/speed"))
-        .ok()
-        .map(|s| format!("{}Mb/s", s.trim()))
-        .unwrap_or_else(|| "2500Mb/s".into());
+    let (eth_speed, eth_duplex) = read_eth0_speed_and_duplex();
 
     SystemVitalsRaw {
         mem,
@@ -1500,6 +2383,7 @@ fn read_system_vitals_blocking() -> SystemVitalsRaw {
         usrdata_avail_bytes,
         mwan3_running,
         eth_speed,
+        eth_duplex,
     }
 }
 
@@ -1507,6 +2391,8 @@ async fn poll_system_vitals(
     state: &AppState,
     boot_slot: &str,
     wan_up: Option<UptimeTelemetry>,
+    eth_degraded_since: &mut Option<Instant>,
+    last_eth_reneg: &mut Option<Instant>,
 ) {
     let raw = match tokio::task::spawn_blocking(read_system_vitals_blocking).await {
         Ok(r) => r,
@@ -1548,7 +2434,32 @@ async fn poll_system_vitals(
         "timestamp": dev_up.timestamp,
     }));
 
-    let keep_alive_enabled = state.settings.read().await.keep_alive_enabled;
+    let (keep_alive_enabled, eth_link_speed_cfg) = {
+        let s = state.settings.read().await;
+        (s.keep_alive_enabled, s.eth_link_speed.clone())
+    };
+
+    let now_inst = Instant::now();
+    if is_eth0_degraded_auto(&eth_link_speed_cfg, &raw.eth_speed, &raw.eth_duplex)
+        && !crate::obs::failover::is_active()
+    {
+        let since = *eth_degraded_since.get_or_insert(now_inst);
+        if now_inst.saturating_duration_since(since) >= Duration::from_secs(60)
+            && last_eth_reneg.is_none_or(|t| {
+                now_inst.saturating_duration_since(t) >= Duration::from_secs(3600)
+            })
+        {
+            *last_eth_reneg = Some(now_inst);
+            *eth_degraded_since = None;
+            state.push_daemon_log(format!(
+                "eth0 negotiated degraded link ({} {}); running ethtool -r eth0",
+                raw.eth_speed, raw.eth_duplex
+            ));
+            let _ = run_cmd("ethtool", &["-r", "eth0"], Duration::from_secs(3)).await;
+        }
+    } else {
+        *eth_degraded_since = None;
+    }
 
     let mut internals = state.internals.write().await;
     internals.conntrack_count = raw.conntrack_count;
@@ -1843,43 +2754,105 @@ pub fn icmp_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+fn bind_socket_to_cellular_wan(sock: libc::c_int, is_loopback: bool) -> Option<String> {
+    if is_loopback {
+        return None;
+    }
+    let iface = crate::vpn::bypass_iface().or_else(crate::netlink::detect_active_rmnet_wan_live)?;
+    if let Ok(c_if) = std::ffi::CString::new(iface.as_str()) {
+        unsafe {
+            libc::setsockopt(
+                sock,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                c_if.as_ptr() as *const libc::c_void,
+                c_if.as_bytes_with_nul().len() as libc::socklen_t,
+            );
+        }
+    }
+    Some(iface)
+}
+
 pub async fn icmp_ping_once(target: &str, seq: u16) -> Result<f64, String> {
     let host = target.trim().to_string();
     // Stored targets may predate validation: never hand ping something it reads as a flag.
     if !crate::admin::validate::is_net_target(&host) {
         return Err("Invalid ping target".into());
     }
-    let ip_v4 = if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        v4
+    let resolved_ip: Option<IpAddr> = if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        Some(IpAddr::V4(v4))
+    } else if let Ok(v6) = host.parse::<Ipv6Addr>() {
+        Some(IpAddr::V6(v6))
     } else {
         let h_clone = host.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            (h_clone.as_str(), 0u16)
+        tokio::task::spawn_blocking(move || {
+            let addrs: Vec<SocketAddr> = (h_clone.as_str(), 0u16)
                 .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| it.find_map(|sa| match sa.ip() {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    _ => None,
-                }))
+                .ok()?
+                .collect();
+            addrs
+                .iter()
+                .find_map(|sa| match sa.ip() {
+                    IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
+                    IpAddr::V6(_) => None,
+                })
+                .or_else(|| addrs.first().map(SocketAddr::ip))
         })
         .await
         .ok()
-        .flatten();
-        match resolved {
-            Some(v4) => v4,
-            None => return ping_subprocess_fallback(&host).await,
-        }
+        .flatten()
     };
 
-    let raw_res = tokio::task::spawn_blocking(move || raw_icmp_echo_v4(ip_v4, seq))
-        .await
-        .map_err(|e| format!("icmp task failed: {e}"))?;
-    match raw_res {
-        Ok(rtt) => Ok(rtt),
-        Err(e) if e.contains("Operation not permitted") || e.contains("EPERM") || e.contains("EACCES") => {
-            ping_subprocess_fallback(&host).await
+    match resolved_ip {
+        Some(IpAddr::V4(ip_v4)) => {
+            let raw_res = tokio::task::spawn_blocking(move || raw_icmp_echo_v4(ip_v4, seq))
+                .await
+                .map_err(|e| format!("icmp task failed: {e}"))?;
+            match raw_res {
+                Ok(rtt) => Ok(rtt),
+                Err(e)
+                    if e.contains("Operation not permitted")
+                        || e.contains("EPERM")
+                        || e.contains("EACCES") =>
+                {
+                    let iface = if ip_v4.is_loopback() {
+                        None
+                    } else {
+                        tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live)
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    ping_subprocess_fallback(&host, false, iface.as_deref()).await
+                }
+                Err(e) => Err(e),
+            }
         }
-        Err(e) => Err(e),
+        Some(IpAddr::V6(ip_v6)) => {
+            let raw_res = tokio::task::spawn_blocking(move || raw_icmp_echo_v6(ip_v6, seq))
+                .await
+                .map_err(|e| format!("icmp6 task failed: {e}"))?;
+            match raw_res {
+                Ok(rtt) => Ok(rtt),
+                Err(e)
+                    if e.contains("Operation not permitted")
+                        || e.contains("EPERM")
+                        || e.contains("EACCES") =>
+                {
+                    let iface = if ip_v6.is_loopback() {
+                        None
+                    } else {
+                        tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live)
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    ping_subprocess_fallback(&host, true, iface.as_deref()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        None => ping_subprocess_fallback(&host, host.contains(':'), None).await,
     }
 }
 
@@ -1895,6 +2868,7 @@ fn raw_icmp_echo_v4(dest: Ipv4Addr, seq: u16) -> Result<f64, String> {
         }
     }
     let guard = FdGuard(sock);
+    let _ = bind_socket_to_cellular_wan(sock, dest.is_loopback());
     // While WARP steers modem traffic, the reachability probe must still
     // measure the cellular path (LinkWatch decides on modem recovery from
     // it): the bypass mark skips the WARP rules. No-op when WARP is off.
@@ -1987,6 +2961,103 @@ fn raw_icmp_echo_v4(dest: Ipv4Addr, seq: u16) -> Result<f64, String> {
     }
 }
 
+fn raw_icmp_echo_v6(dest: Ipv6Addr, seq: u16) -> Result<f64, String> {
+    let sock = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
+    if sock < 0 {
+        return Err(format!("socket6: {}", std::io::Error::last_os_error()));
+    }
+    struct FdGuard(libc::c_int);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0); }
+        }
+    }
+    let guard = FdGuard(sock);
+    let _ = bind_socket_to_cellular_wan(sock, dest.is_loopback());
+    if let Some(mark) = crate::vpn::bypass_mark() {
+        let m: libc::c_int = mark as libc::c_int;
+        unsafe {
+            libc::setsockopt(
+                sock,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &m as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    let ident = (std::process::id() & 0xFFFF) as u16;
+    let mut pkt = [0u8; 16];
+    pkt[0] = 128; // ICMPv6 Echo Request (kernel fills checksum at offset 2 for IPPROTO_ICMPV6)
+    pkt[1] = 0;
+    pkt[4..6].copy_from_slice(&ident.to_be_bytes());
+    pkt[6..8].copy_from_slice(&seq.to_be_bytes());
+    pkt[8..16].copy_from_slice(b"QUECMGR6");
+
+    let sa = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: 0,
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: dest.octets(),
+        },
+        sin6_scope_id: 0,
+    };
+    let started = Instant::now();
+    let sent = unsafe {
+        libc::sendto(
+            guard.0,
+            pkt.as_ptr() as *const libc::c_void,
+            pkt.len(),
+            0,
+            &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(format!("sendto6: {}", std::io::Error::last_os_error()));
+    }
+
+    let deadline = started + Duration::from_millis(1800);
+    let mut recv_buf = [0u8; 256];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("ICMPv6 request timed out".into());
+        }
+        let rem_ms = deadline.duration_since(now).as_millis() as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd: guard.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let prc = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+        if prc <= 0 {
+            return Err("ICMPv6 request timed out".into());
+        }
+        let n = unsafe {
+            libc::recv(
+                guard.0,
+                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                recv_buf.len(),
+                0,
+            )
+        };
+        if n < 8 {
+            continue;
+        }
+        let icmp6 = &recv_buf[..n as usize];
+        // SOCK_RAW IPPROTO_ICMPV6 delivers the ICMPv6 header directly (Echo Reply = 129).
+        if icmp6[0] == 129
+            && u16::from_be_bytes([icmp6[4], icmp6[5]]) == ident
+            && u16::from_be_bytes([icmp6[6], icmp6[7]]) == seq
+        {
+            return Ok(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 /// RTT from `ping -c 1` output, if a reply was received.
 pub fn parse_ping_rtt(out: &str) -> Option<f64> {
     out.split_whitespace().find_map(|tok| {
@@ -1996,12 +3067,24 @@ pub fn parse_ping_rtt(out: &str) -> Option<f64> {
     })
 }
 
-async fn ping_subprocess_fallback(host: &str) -> Result<f64, String> {
+async fn ping_subprocess_fallback(
+    host: &str,
+    ipv6: bool,
+    iface: Option<&str>,
+) -> Result<f64, String> {
     if !crate::admin::validate::is_net_target(host) {
         return Err("Invalid ping host".into());
     }
+    let mut args: Vec<&str> = Vec::with_capacity(9);
+    if ipv6 {
+        args.push("-6");
+    }
+    if let Some(dev) = iface.filter(|d| !d.is_empty()) {
+        args.extend(["-I", dev]);
+    }
+    args.extend(ping_argv(host));
     // `--` ends option parsing: the host is an operand even if validation regressed.
-    let out = run_cmd("ping", &ping_argv(host), Duration::from_secs(3)).await?;
+    let out = run_cmd("ping", &args, Duration::from_secs(3)).await?;
     // No reply line means no reply: report a failure, not a fake 1 ms RTT.
     parse_ping_rtt(&out).ok_or_else(|| "No ICMP reply".to_string())
 }
@@ -2116,11 +3199,13 @@ mod tests {
                     disconnect_count: Some(1),
                     timestamp: "2026-11-18 00:00:00".into(),
                 };
-                poll_system_vitals(&state, "_a", Some(up)).await;
+                let mut eth_deg = None;
+                let mut eth_ren = None;
+                poll_system_vitals(&state, "_a", Some(up), &mut eth_deg, &mut eth_ren).await;
                 assert_eq!(state.session_uptime.read().await.is_connected, Some(true));
                 assert_eq!(state.session_uptime.read().await.uptime_seconds, 120);
 
-                poll_system_vitals(&state, "_a", None).await;
+                poll_system_vitals(&state, "_a", None, &mut eth_deg, &mut eth_ren).await;
                 let dropped = state.session_uptime.read().await.clone();
                 assert_eq!(dropped.is_connected, Some(false));
                 assert_eq!(dropped.uptime_seconds, 0);
@@ -2134,7 +3219,7 @@ mod tests {
     async fn zero_byte_tick_after_clear_does_not_recreate_daily_row() {
         let env = crate::paths::TestSandbox::new("zero-usage-tick");
         std::fs::create_dir_all(env.root.join("etc/cellcore")).unwrap();
-        std::fs::create_dir_all(env.root.join("tmp/cellcore/signal_graphs")).unwrap();
+        std::fs::create_dir_all(env.root.join("tmp/cellcore")).unwrap();
 
         crate::paths::TEST_ENV
             .scope(env.env(), async {
@@ -2150,8 +3235,20 @@ mod tests {
                     save_json_atomic(DATA_USAGE_PATH, &*u, 0o600).unwrap();
                 }
 
-                let mut last_flush = 0u64;
-                update_persistent_usage(&app, "rmnet_data0", 500, 200, &mut last_flush).await;
+                let mut tracker = UsageFlushTracker::default();
+                let valid_wall = crate::state::MIN_VALID_WALL_CLOCK_SECS + 3600;
+                let ymd = ("2026-11-21".to_string(), "2026-11".to_string(), 21u8);
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    500,
+                    200,
+                    &mut tracker,
+                    valid_wall,
+                    ymd.clone(),
+                    Instant::now(),
+                )
+                .await;
                 {
                     let u = app.data_usage.read().await;
                     assert!(u.daily.is_empty());
@@ -2162,7 +3259,17 @@ mod tests {
                         .unwrap();
                 assert_eq!(on_disk_idle["daily"], serde_json::json!([]));
 
-                update_persistent_usage(&app, "rmnet_data0", 1524, 200, &mut last_flush).await;
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    1524,
+                    200,
+                    &mut tracker,
+                    valid_wall,
+                    ymd,
+                    Instant::now(),
+                )
+                .await;
                 {
                     let u = app.data_usage.read().await;
                     assert_eq!(u.daily.len(), 1);
@@ -2199,14 +3306,18 @@ mod tests {
         .into_iter()
         .map(|(c, _)| c)
         .collect();
-        let qrsrp_i = with_atfwd.iter().position(|c| c == "AT+QRSRP").unwrap();
+        let qrsrp_i = with_atfwd
+            .iter()
+            .position(|c| c == "AT+QRSRP;+QRSRQ;+QSINR")
+            .unwrap();
         let qmap_i = with_atfwd.iter().position(|c| c == "AT+QMAP=\"WWAN\"").unwrap();
         let cgcont_i = with_atfwd.iter().position(|c| c == "AT+CGCONTRDP").unwrap();
         let qtemp_i = with_atfwd.iter().position(|c| c == "AT+QTEMP").unwrap();
         let qspn_i = with_atfwd.iter().position(|c| c == "AT+QSPN").unwrap();
+        assert!(!with_atfwd.iter().any(|c| c == "AT+C5GREG?"));
         assert!(qrsrp_i < qmap_i && qmap_i < cgcont_i && cgcont_i < qtemp_i && qtemp_i < qspn_i);
-        // Five fast baseband commands always trail AT+QTEMP so /dev/smd11 recovers cleanly.
-        assert_eq!(with_atfwd.len() - qtemp_i - 1, 5);
+        // Four fast baseband commands always trail AT+QTEMP so /dev/smd11 recovers cleanly.
+        assert_eq!(with_atfwd.len() - qtemp_i - 1, 4);
 
         let fast_only: Vec<String> = build_telemetry_commands(
             "AT+QCAINFO",
@@ -2238,7 +3349,406 @@ mod tests {
         let cgcont_i = native_cmds.iter().position(|c| c == "AT+CGCONTRDP").unwrap();
         let qtemp_i = native_cmds.iter().position(|c| c == "AT+QTEMP").unwrap();
         assert!(cgcont_i < qtemp_i);
-        assert_eq!(native_cmds.len() - qtemp_i - 1, 5);
+        assert_eq!(native_cmds.len() - qtemp_i - 1, 4);
+
+        // Native mode + NR5G-SA + cached QSPN omits QMAP, CGCONTRDP, QSPN, and lte_time_advance (6 cmds total!)
+        let lean_sa: Vec<String> = build_telemetry_commands_full(
+            "AT+QCAINFO",
+            "AT+QNWCFG=\"nr5g_time_advance\"",
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+        assert_eq!(
+            lean_sa,
+            vec![
+                "AT+CFUN?",
+                "AT+QENG=\"servingcell\"",
+                "AT+QCAINFO",
+                "AT+QRSRP;+QRSRQ;+QSINR",
+                "AT+QNWCFG=\"nr5g_mimo_info\"",
+                "AT+QNWCFG=\"nr5g_time_advance\"",
+                "AT+QUIMSLOT?",
+            ]
+        );
+    }
+
+    #[test]
+    fn eth0_sysfs_speed_reports_down_on_carrier_zero_or_negative_speed() {
+        assert_eq!(
+            parse_eth_sysfs_speed(Some("0\n"), Some("2500\n"), Some("full\n")),
+            ("down".into(), "down".into())
+        );
+        assert_eq!(
+            parse_eth_sysfs_speed(Some("1\n"), Some("-1\n"), Some("unknown\n")),
+            ("down".into(), "down".into())
+        );
+        assert_eq!(
+            parse_eth_sysfs_speed(None, None, None),
+            ("down".into(), "down".into())
+        );
+        assert_eq!(
+            parse_eth_sysfs_speed(Some("1\n"), Some("2500\n"), Some("full\n")),
+            ("2500Mb/s".into(), "full".into())
+        );
+        assert!(is_eth0_degraded_auto("auto", "100Mb/s", "full"));
+        assert!(is_eth0_degraded_auto("auto", "2500Mb/s", "half"));
+        assert!(!is_eth0_degraded_auto("auto", "2500Mb/s", "full"));
+        assert!(!is_eth0_degraded_auto("auto", "down", "down"));
+        assert!(!is_eth0_degraded_auto("100", "100Mb/s", "full"));
+    }
+
+    #[tokio::test]
+    async fn usage_flush_cuts_etc_wear_to_6h_or_50mib_and_blocks_1970_pre_ntp_buckets() {
+        let sbx = crate::paths::TestSandbox::new("usage-wear-cut");
+        std::fs::create_dir_all(sbx.root.join("etc/cellcore")).unwrap();
+        std::fs::create_dir_all(sbx.root.join("tmp/cellcore")).unwrap();
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests(sbx.root.clone(), auth);
+                {
+                    let mut u = app.data_usage.write().await;
+                    u.last_iface = "rmnet_data0".into();
+                    u.last_raw_rx = 0;
+                    u.last_raw_tx = 0;
+                }
+
+                let mut tracker = UsageFlushTracker::default();
+                let t0 = Instant::now();
+
+                // 1. Pre-NTP wall clock (e.g. 42s in 1970): holds delta in memory, NO 1970-01-01 bucket!
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    4096,
+                    1024,
+                    &mut tracker,
+                    42,
+                    ("1970-01-01".into(), "1970-01".into(), 1),
+                    t0,
+                )
+                .await;
+                assert!(app.data_usage.read().await.daily.is_empty());
+                assert!(!sbx.root.join("etc/cellcore/data_usage.json").exists());
+
+                // 2. NTP syncs -> first post-NTP tick folds held 4096+1024 + new 1000 into 2026-11-21
+                // and flushes initial daily bucket to /etc and /tmp (0600).
+                let valid_wall = crate::state::MIN_VALID_WALL_CLOCK_SECS + 100;
+                let ymd = ("2026-11-21".to_string(), "2026-11".to_string(), 21u8);
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    5096,
+                    1024,
+                    &mut tracker,
+                    valid_wall,
+                    ymd.clone(),
+                    t0,
+                )
+                .await;
+                assert_eq!(app.data_usage.read().await.daily[0].rx_bytes, 5096);
+                let etc_file = sbx.root.join("etc/cellcore/data_usage.json");
+                let tmp_file = sbx.root.join("tmp/cellcore/data_usage.json");
+                assert!(etc_file.exists() && tmp_file.exists());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&tmp_file).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+
+                // 3. 10 minutes later (+1 MiB): writes /tmp snapshot (5m), does NOT touch /etc (<6h & <50MiB)!
+                let t_10m = t0 + Duration::from_secs(600);
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    5096 + 1024 * 1024,
+                    1024,
+                    &mut tracker,
+                    valid_wall + 600,
+                    ymd.clone(),
+                    t_10m,
+                )
+                .await;
+                let etc_v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&etc_file).unwrap()).unwrap();
+                let tmp_v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&tmp_file).unwrap()).unwrap();
+                assert_eq!(etc_v["daily"][0]["rxBytes"], 5096, "/etc must not be rewritten at 10m");
+                assert_eq!(tmp_v["daily"][0]["rxBytes"], 5096 + 1024 * 1024, "/tmp updated at 5m");
+
+                // 4. Startup load_initial_data_usage prefers fresher /tmp snapshot over stale /etc.
+                let loaded = load_initial_data_usage();
+                assert_eq!(loaded.daily[0].rx_bytes, 5096 + 1024 * 1024);
+
+                // 5. >= 50 MiB accumulated delta triggers immediate /etc flush even before 6h.
+                let big_rx = 5096 + 52 * 1024 * 1024;
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    big_rx,
+                    1024,
+                    &mut tracker,
+                    valid_wall + 900,
+                    ymd.clone(),
+                    t0 + Duration::from_secs(900),
+                )
+                .await;
+                let etc_after_50m: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&etc_file).unwrap()).unwrap();
+                assert_eq!(etc_after_50m["daily"][0]["rxBytes"], big_rx);
+
+                // 6. Small delta after 6 hours also flushes /etc.
+                update_persistent_usage_with_clock(
+                    &app,
+                    "rmnet_data0",
+                    big_rx + 2048,
+                    1024,
+                    &mut tracker,
+                    valid_wall + 900 + DATA_USAGE_ETC_FLUSH_SECS + 10,
+                    ymd,
+                    t0 + Duration::from_secs(900 + DATA_USAGE_ETC_FLUSH_SECS + 10),
+                )
+                .await;
+                let etc_after_6h: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&etc_file).unwrap()).unwrap();
+                assert_eq!(etc_after_6h["daily"][0]["rxBytes"], big_rx + 2048);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cell_lock_deadman_clears_live_lock_preserves_settings_and_reprobes() {
+        let sbx = crate::paths::TestSandbox::new("deadman-reprobe");
+        let modem = crate::fakeat::FakeModem::new(crate::fakeat::Radio::new("2:66", "41", "41", "AUTO", 0));
+        modem.with(|s| {
+            s.lock5g = Some("589,521310,30,41".into());
+        });
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, modem.client());
+                {
+                    let mut s = app.settings.write().await;
+                    s.cell_lock_deadman_enabled = true;
+                    s.cell_lock_deadman_secs = 180;
+                    s.cell_lock_nr5g = "589,521310,30,41".into();
+                    s.cell_lock_nr5g_persist = true;
+                }
+                {
+                    // Simulate unregistered SEARCH state on modem.
+                    let mut m = app.modem.write().await;
+                    m.identity.cfun = 1;
+                    m.serving = None;
+                }
+
+                let mut tracker = CellLockDeadmanTracker::default();
+                let t0 = Instant::now();
+
+                // At t=0 and t=179s: still within 180s grace window.
+                tick_cell_lock_deadman(&app, &mut tracker, t0, Duration::ZERO).await;
+                tick_cell_lock_deadman(&app, &mut tracker, t0 + Duration::from_secs(179), Duration::ZERO).await;
+                assert!(!app.cell_lock_bypassed.load(Ordering::Acquire));
+                assert_eq!(modem.with(|s| s.lock5g.as_deref().unwrap_or("0").to_string()), "589,521310,30,41");
+
+                // At t=180s: deadman fires -> clears live modem lock + save_ctrl=0,0 while keeping settings!
+                tick_cell_lock_deadman(&app, &mut tracker, t0 + Duration::from_secs(180), Duration::ZERO).await;
+                assert!(app.cell_lock_bypassed.load(Ordering::Acquire));
+                assert_eq!(modem.with(|s| s.lock5g.as_deref().unwrap_or("0").to_string()), "0");
+                assert_eq!(modem.with(|s| s.save_ctrl.as_deref().unwrap_or("0,0").to_string()), "0,0");
+                assert_eq!(app.settings.read().await.cell_lock_nr5g, "589,521310,30,41");
+
+                // Re-probe at +15m when target PCI 589 is NOT visible -> stays bypassed and escalates stage to 30m.
+                let t_15m = t0 + Duration::from_secs(180 + 15 * 60);
+                tick_cell_lock_deadman(&app, &mut tracker, t_15m, Duration::ZERO).await;
+                assert!(app.cell_lock_bypassed.load(Ordering::Acquire));
+                assert_eq!(tracker.reprobe_stage, 1);
+
+                // Re-probe at +45m (15m + 30m) when modem sees target PCI 589 -> restores QNWLOCK + save_ctrl!
+                {
+                    let mut m = app.modem.write().await;
+                    m.serving = Some(ServingCellInfo {
+                        state: "NOCONN".into(),
+                        rat: "NR5G-SA".into(),
+                        pci: Some(589),
+                        ..Default::default()
+                    });
+                }
+                let t_45m = t_15m + Duration::from_secs(30 * 60);
+                tick_cell_lock_deadman(&app, &mut tracker, t_45m, Duration::ZERO).await;
+                assert!(!app.cell_lock_bypassed.load(Ordering::Acquire));
+                assert_eq!(modem.with(|s| s.lock5g.as_deref().unwrap_or("0").to_string()), "589,521310,30,41");
+                assert_eq!(modem.with(|s| s.save_ctrl.as_deref().unwrap_or("0,0").to_string()), "0,1");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sim_slot_change_immediately_requeries_iccid_and_imsi_without_waiting_for_need_static() {
+        let sbx = crate::paths::TestSandbox::new("sim-swap-iccid");
+        let sim_iccid = Arc::new(std::sync::Mutex::new("89012601111111111111".to_string()));
+        let sim_imsi = Arc::new(std::sync::Mutex::new("310260111111111".to_string()));
+        let sim_slot = Arc::new(std::sync::Mutex::new(1i32));
+
+        let iccid_c = sim_iccid.clone();
+        let imsi_c = sim_imsi.clone();
+        let slot_c = sim_slot.clone();
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = b.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let body = match cmd.as_str() {
+                        "AT+CGMI" => "+CGMI: Quectel".to_string(),
+                        "AT+CGMM" => "+CGMM: RM551E-GL".to_string(),
+                        "AT+QGMR" => "RM551EGL00AAR01A02M8G".to_string(),
+                        "AT+ICCID" => format!("+ICCID: {}", *iccid_c.lock().unwrap()),
+                        "AT+CIMI" => imsi_c.lock().unwrap().clone(),
+                        "AT+QUIMSLOT?" => format!("+QUIMSLOT: {}", *slot_c.lock().unwrap()),
+                        "AT+CFUN?" => "+CFUN: 1".to_string(),
+                        _ => String::new(),
+                    };
+                    let reply = if body.is_empty() {
+                        format!("{cmd}\r\r\nOK\r\n")
+                    } else {
+                        format!("{cmd}\r\r\n{body}\r\nOK\r\n")
+                    };
+                    let _ = b.write_all(reply.as_bytes());
+                }
+            }
+        });
+
+        use std::os::unix::io::IntoRawFd;
+        let fd_opt = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_opt.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, smd);
+
+                // Poll 1: populates static revision/model + SIM1 ICCID/IMSI.
+                refresh_modem_snapshot(&app, Priority::Telemetry, true).await;
+                assert_eq!(app.secrets.read().await.iccid, "89012601111111111111");
+                assert_eq!(app.secrets.read().await.imsi, "310260111111111");
+                assert!(!app.modem.read().await.identity.revision.is_empty());
+
+                // Switch SIM slot to 2 with brand-new ICCID/IMSI (need_static is now FALSE!).
+                *sim_slot.lock().unwrap() = 2;
+                *sim_iccid.lock().unwrap() = "89014102222222222222".into();
+                *sim_imsi.lock().unwrap() = "310410222222222".into();
+
+                // Poll 2: detects sim_slot 1 -> 2 and immediately refreshes ICCID & IMSI!
+                refresh_modem_snapshot(&app, Priority::Telemetry, false).await;
+                assert_eq!(app.modem.read().await.identity.sim_slot, 2);
+                assert_eq!(app.secrets.read().await.iccid, "89014102222222222222");
+                assert_eq!(app.secrets.read().await.imsi, "310410222222222");
+                assert!(app.modem.read().await.identity.masked_iccid.ends_with("2222"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cfun_one_guard_retries_on_failure_and_linkwatch_stage3_bypasses_cell_lock() {
+        let sbx = crate::paths::TestSandbox::new("cfun-guard-stage3");
+        let cfun_tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tries_c = cfun_tries.clone();
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = b.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let reply = if cmd == "AT+CFUN=1" {
+                        let k = tries_c.fetch_add(1, Ordering::SeqCst) + 1;
+                        if k == 1 {
+                            format!("{cmd}\r\r\nERROR\r\n")
+                        } else {
+                            format!("{cmd}\r\r\nOK\r\n")
+                        }
+                    } else if cmd == "AT+QSIMSTAT?" {
+                        format!("{cmd}\r\r\n+QSIMSTAT: 1,0\r\nOK\r\n")
+                    } else if cmd == "AT+QUIMSLOT?" {
+                        format!("{cmd}\r\r\n+QUIMSLOT: 1\r\nOK\r\n")
+                    } else {
+                        format!("{cmd}\r\r\nOK\r\n")
+                    };
+                    let _ = b.write_all(reply.as_bytes());
+                }
+            }
+        });
+
+        use std::os::unix::io::IntoRawFd;
+        let fd_opt = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_opt.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, smd);
+
+                // 1. CFUN=1 fails once, succeeds on retry 2.
+                assert!(ensure_cfun_one_with_retries(&app, Duration::from_secs(2)).await);
+                assert_eq!(cfun_tries.load(Ordering::SeqCst), 2);
+
+                // 2. LinkWatch Stage 3 temporarily bypasses configured cell lock.
+                let cfg = crate::state::DaemonSettings {
+                    quecwatch_connection_refresh: true,
+                    cell_lock_nr5g: "589,521310,30,41".into(),
+                    ..Default::default()
+                };
+                assert!(trigger_quecwatch_recovery(&app, &cfg, 3).await);
+                assert!(app.cell_lock_bypassed.load(Ordering::Acquire));
+
+                // 3. SIM presence check rejects switch when +QSIMSTAT reports absent (0).
+                assert!(!try_verified_sim_switch(&app, 2, "test").await);
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -1314,11 +1314,29 @@ pub async fn post_mode(State(ctx): State<HttpCtx>, Json(body): Json<ModeMutateRe
         (Err(_), Some(_)) => forget_radio_mode(&ctx.app),
         _ => {}
     }
+    if result.is_ok() && body.sim_slot.is_some() {
+        post_sim_slot(&ctx.app).await;
+    }
     refresh_modem_snapshot(&ctx.app, Priority::Interactive, false).await;
     match result {
         Ok(applied) => Json(serde_json::json!({ "status": "success", "applied": applied })).into_response(),
         Err(resp) => *resp,
     }
+}
+
+/// Clear cached SIM identity (`iccid`, `imsi`, `spn`) and record the monotonic
+/// SIM-switch timestamp so the next telemetry poll immediately re-queries
+/// `AT+ICCID` / `AT+CIMI` and syncs the matching `QuecProfile`.
+pub async fn post_sim_slot(app: &AppState) {
+    {
+        let mut sec = app.secrets.write().await;
+        sec.iccid.clear();
+        sec.imsi.clear();
+    }
+    *app.spn_cache.write().await = (String::new(), String::new(), String::new());
+    app.last_sim_slot.store(0, std::sync::atomic::Ordering::Release);
+    app.sim_switched_at_ms
+        .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
 }
 
 pub async fn get_cell_lock(State(ctx): State<HttpCtx>) -> Response {
@@ -1336,10 +1354,17 @@ pub async fn get_cell_lock(State(ctx): State<HttpCtx>) -> Response {
             .unwrap_or_default()
     };
     let s = ctx.app.settings.read().await.clone();
+    let bypassed = ctx
+        .app
+        .cell_lock_bypassed
+        .load(std::sync::atomic::Ordering::Acquire);
     Json(serde_json::json!({
         "lteRaw": get_b(0),
         "nr5gRaw": get_b(1),
         "saveCtrlRaw": get_b(2),
+        "bypassed": bypassed,
+        "cellLockDeadmanEnabled": s.cell_lock_deadman_enabled,
+        "cellLockDeadmanSecs": s.cell_lock_deadman_secs,
         "schedule": {
             "enabled": s.cell_lock_sched_enabled,
             "startTime": s.cell_lock_start_time,
@@ -1348,6 +1373,9 @@ pub async fn get_cell_lock(State(ctx): State<HttpCtx>) -> Response {
             "nr5gLock": s.cell_lock_nr5g,
             "ltePersist": s.cell_lock_lte_persist,
             "nr5gPersist": s.cell_lock_nr5g_persist,
+            "deadmanEnabled": s.cell_lock_deadman_enabled,
+            "deadmanSecs": s.cell_lock_deadman_secs,
+            "bypassed": bypassed,
         }
     }))
     .into_response()
@@ -1365,6 +1393,10 @@ pub struct CellLockReq {
     schedule_enabled: Option<bool>,
     start_time: Option<String>,
     end_time: Option<String>,
+    #[serde(default, alias = "cell_lock_deadman_enabled", alias = "deadmanEnabled")]
+    cell_lock_deadman_enabled: Option<bool>,
+    #[serde(default, alias = "cell_lock_deadman_secs", alias = "deadmanSecs")]
+    cell_lock_deadman_secs: Option<u64>,
 }
 
 /// LTE cell lock: PCI 0..503 (TS 36.211), EARFCN 0..262143 (TS 36.101).
@@ -1397,24 +1429,51 @@ pub fn validate_nr5g_lock(pci: i64, arfcn: i64, scs: i64, band: i64) -> Result<(
 }
 
 pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLockReq>) -> Response {
-    if let Some(en) = body.schedule_enabled {
+    if let Some(secs) = body.cell_lock_deadman_secs
+        && !(1..=86_400).contains(&secs)
+    {
+        return err_resp(StatusCode::BAD_REQUEST, "cellLockDeadmanSecs must be 1..86400");
+    }
+    if body.rat.is_none()
+        && (body.schedule_enabled.is_some()
+            || body.cell_lock_deadman_enabled.is_some()
+            || body.cell_lock_deadman_secs.is_some())
+    {
         for t in [&body.start_time, &body.end_time].into_iter().flatten() {
             if crate::profiles::parse_hhmm(t).is_none() {
                 return err_resp(StatusCode::BAD_REQUEST, "Times must be HH:MM (24 h)");
             }
         }
         let mut s = ctx.app.settings.write().await;
-        s.cell_lock_sched_enabled = en;
+        if let Some(en) = body.schedule_enabled {
+            s.cell_lock_sched_enabled = en;
+        }
         if let Some(st) = body.start_time {
             s.cell_lock_start_time = st;
         }
         if let Some(et) = body.end_time {
             s.cell_lock_end_time = et;
         }
+        if let Some(dm_en) = body.cell_lock_deadman_enabled {
+            s.cell_lock_deadman_enabled = dm_en;
+        }
+        if let Some(dm_secs) = body.cell_lock_deadman_secs {
+            s.cell_lock_deadman_secs = dm_secs;
+        }
         if let Err(e) = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600) {
             return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save the cell-lock schedule: {e}"));
         }
-        return Json(serde_json::json!({ "status": "success" })).into_response();
+        let bypassed = ctx
+            .app
+            .cell_lock_bypassed
+            .load(std::sync::atomic::Ordering::Acquire);
+        return Json(serde_json::json!({
+            "status": "success",
+            "bypassed": bypassed,
+            "cellLockDeadmanEnabled": s.cell_lock_deadman_enabled,
+            "cellLockDeadmanSecs": s.cell_lock_deadman_secs,
+        }))
+        .into_response();
     }
 
     if !matches!(body.rat.as_deref(), Some("nr5g" | "lte")) {
@@ -1437,9 +1496,16 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
                 Ok(r) => return err_resp(StatusCode::UNPROCESSABLE_ENTITY, format!("Modem rejected the 5G cell lock: {}", r.body.trim())),
                 Err(e) => return err_resp(StatusCode::BAD_GATEWAY, e),
             }
-            ctx.app.settings.write().await.cell_lock_nr5g = params;
+            let mut s = ctx.app.settings.write().await;
+            s.cell_lock_nr5g = params;
             if let Some(p) = body.persist {
-                ctx.app.settings.write().await.cell_lock_nr5g_persist = p;
+                s.cell_lock_nr5g_persist = p;
+            }
+            if let Some(dm_en) = body.cell_lock_deadman_enabled {
+                s.cell_lock_deadman_enabled = dm_en;
+            }
+            if let Some(dm_secs) = body.cell_lock_deadman_secs {
+                s.cell_lock_deadman_secs = dm_secs;
             }
         }
         Some("lte") => {
@@ -1456,13 +1522,23 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
                 Ok(r) => return err_resp(StatusCode::UNPROCESSABLE_ENTITY, format!("Modem rejected the LTE cell lock: {}", r.body.trim())),
                 Err(e) => return err_resp(StatusCode::BAD_GATEWAY, e),
             }
-            ctx.app.settings.write().await.cell_lock_lte = params;
+            let mut s = ctx.app.settings.write().await;
+            s.cell_lock_lte = params;
             if let Some(p) = body.persist {
-                ctx.app.settings.write().await.cell_lock_lte_persist = p;
+                s.cell_lock_lte_persist = p;
+            }
+            if let Some(dm_en) = body.cell_lock_deadman_enabled {
+                s.cell_lock_deadman_enabled = dm_en;
+            }
+            if let Some(dm_secs) = body.cell_lock_deadman_secs {
+                s.cell_lock_deadman_secs = dm_secs;
             }
         }
         _ => return err_resp(StatusCode::BAD_REQUEST, "rat must be nr5g or lte"),
     }
+    ctx.app
+        .cell_lock_bypassed
+        .store(false, std::sync::atomic::Ordering::Release);
 
     // Keep the lock across modem reboots (save_ctrl), then the daemon's own
     // record of it. The lock itself is already applied: a failure in either
@@ -1498,7 +1574,13 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
     if let Err(e) = saved {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("Cell lock applied, but the settings could not be saved: {e}"));
     }
-    Json(serde_json::json!({ "status": "success" })).into_response()
+    Json(serde_json::json!({
+        "status": "success",
+        "bypassed": false,
+        "cellLockDeadmanEnabled": s.cell_lock_deadman_enabled,
+        "cellLockDeadmanSecs": s.cell_lock_deadman_secs,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1506,7 +1588,7 @@ pub struct RatQuery {
     rat: Option<String>,
 }
 
-fn qnwlock_is_unlocked(body: &str, key: &str) -> bool {
+pub(crate) fn qnwlock_is_unlocked(body: &str, key: &str) -> bool {
     for line in body.lines() {
         let t = line.trim();
         if t.len() >= 9 && t[..9].eq_ignore_ascii_case("+QNWLOCK:") {
@@ -1576,6 +1658,14 @@ pub async fn delete_cell_lock(State(ctx): State<HttpCtx>, Query(q): Query<RatQue
             Err(e) => transport.push(format!("{label} unlock not confirmed by the modem: {e}")),
         }
     }
+    {
+        let s = ctx.app.settings.read().await;
+        if s.cell_lock_lte.is_empty() && s.cell_lock_nr5g.is_empty() {
+            ctx.app
+                .cell_lock_bypassed
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
     let saved = {
         let s = ctx.app.settings.read().await.clone();
         save_json_atomic(SETTINGS_JSON_PATH, &s, 0o600)
@@ -1617,25 +1707,54 @@ pub async fn get_cell_scan(State(ctx): State<HttpCtx>) -> Response {
     .into_response()
 }
 
-pub async fn post_cell_scan(State(ctx): State<HttpCtx>) -> Response {
+#[derive(Default, Deserialize)]
+pub struct CellScanReq {
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+pub fn qscan_command_for_mode(mode: Option<&str>) -> Result<(&'static str, &'static str), &'static str> {
+    match mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("all") => Ok(("all", "AT+QSCAN=3,1")),
+        Some("nr5g") | Some("5g") => Ok(("nr5g", "AT+QSCAN=2,1")),
+        Some("lte") | Some("4g") => Ok(("lte", "AT+QSCAN=1,1")),
+        Some(_) => Err("Scan mode must be 'nr5g', 'lte', or 'all'"),
+    }
+}
+
+pub async fn post_cell_scan(State(ctx): State<HttpCtx>, body: axum::body::Bytes) -> Response {
+    let parsed_mode = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        None
+    } else {
+        match serde_json::from_slice::<CellScanReq>(&body) {
+            Ok(req) => req.mode,
+            Err(_) => return err_resp(StatusCode::BAD_REQUEST, "Invalid scan request JSON"),
+        }
+    };
+    let (mode_label, qscan_cmd) = match qscan_command_for_mode(parsed_mode.as_deref()) {
+        Ok(pair) => pair,
+        Err(msg) => return err_resp(StatusCode::BAD_REQUEST, msg),
+    };
+
     let mut guard = ctx.app.qscan_running.lock().await;
     if guard.is_some() {
         return Json(serde_json::json!({ "status": "running", "message": "Cell scan already running" })).into_response();
     }
-    *guard = Some(serde_json::json!({ "startedAt": now_secs() }));
+    *guard = Some(serde_json::json!({ "startedAt": now_secs(), "mode": mode_label }));
     drop(guard);
 
     let app = ctx.app.clone();
     tokio::spawn(async move {
         let res = app
             .smd
-            .exec("AT+QSCAN=3,1", Priority::Interactive, Duration::from_secs(180))
+            .exec(qscan_cmd, Priority::Interactive, Duration::from_secs(180))
             .await;
         match res {
             Ok(r) if r.ok => {
                 let entries = parse_qscan_entries(&r.body);
                 *app.qscan_last.write().await = Some(serde_json::json!({
                     "status": "completed",
+                    "mode": mode_label,
                     "timestamp": format_now_hms(),
                     "entries": entries,
                     "raw": r.body,
@@ -1649,6 +1768,7 @@ pub async fn post_cell_scan(State(ctx): State<HttpCtx>) -> Response {
                 };
                 *app.qscan_last.write().await = Some(serde_json::json!({
                     "status": "error",
+                    "mode": mode_label,
                     "error": err,
                     "timestamp": format_now_hms(),
                 }));
@@ -1656,6 +1776,7 @@ pub async fn post_cell_scan(State(ctx): State<HttpCtx>) -> Response {
             Err(e) => {
                 *app.qscan_last.write().await = Some(serde_json::json!({
                     "status": "error",
+                    "mode": mode_label,
                     "error": e,
                     "timestamp": format_now_hms(),
                 }));
@@ -1664,7 +1785,7 @@ pub async fn post_cell_scan(State(ctx): State<HttpCtx>) -> Response {
         *app.qscan_running.lock().await = None;
     });
 
-    Json(serde_json::json!({ "status": "started" })).into_response()
+    Json(serde_json::json!({ "status": "started", "mode": mode_label })).into_response()
 }
 
 pub async fn delete_cell_scan(State(ctx): State<HttpCtx>) -> Response {
@@ -1787,10 +1908,7 @@ pub async fn get_network_lan(State(ctx): State<HttpCtx>) -> Response {
     } else {
         live_mtu_opt.unwrap_or(1500)
     };
-    let eth_speed = fs::read_to_string(crate::paths::p("/sys/class/net/eth0/speed"))
-        .ok()
-        .map(|s| format!("{}Mb/s", s.trim()))
-        .unwrap_or_else(|| "2500Mb/s".into());
+    let (eth_speed, _) = crate::telemetry::read_eth0_speed_and_duplex();
     let dns_uci = uci_get("dhcp.lan.dhcp_option").await.unwrap_or_default();
     let tailscale = query_tailscale_status().await;
 
@@ -3082,7 +3200,7 @@ pub async fn post_data_usage(State(ctx): State<HttpCtx>, Json(body): Json<DataUs
         u.quota_bytes = q;
     }
     let _ = save_json_atomic(DATA_USAGE_PATH, &*u, 0o600);
-    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o644);
+    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o600);
     Json(serde_json::json!({ "status": "success", "dataUsage": *u })).into_response()
 }
 
@@ -3091,7 +3209,7 @@ pub async fn delete_data_usage(State(ctx): State<HttpCtx>) -> Response {
     u.daily.clear();
     u.monthly.clear();
     let _ = save_json_atomic(DATA_USAGE_PATH, &*u, 0o600);
-    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o644);
+    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o600);
     Json(serde_json::json!({ "status": "success", "dataUsage": *u })).into_response()
 }
 
@@ -3155,6 +3273,8 @@ pub async fn get_quecwatch(State(ctx): State<HttpCtx>) -> Response {
             "maxRetries": s.quecwatch_max_retries,
             "connectionRefresh": s.quecwatch_connection_refresh,
             "autoSimFailover": s.quecwatch_auto_sim_failover,
+            "preferredSimSlot": s.preferred_sim_slot,
+            "simFailbackMins": s.sim_failback_mins,
             "highLatencyMonitoring": s.quecwatch_high_latency,
             "latencyCeiling": s.quecwatch_latency_ceiling,
         },
@@ -3173,6 +3293,10 @@ pub struct LinkWatchUpdateReq {
     max_retries: Option<u32>,
     connection_refresh: Option<bool>,
     auto_sim_failover: Option<bool>,
+    #[serde(default, alias = "preferred_sim_slot")]
+    preferred_sim_slot: Option<u8>,
+    #[serde(default, alias = "sim_failback_mins")]
+    sim_failback_mins: Option<u64>,
     high_latency_monitoring: Option<bool>,
     latency_ceiling: Option<u64>,
 }
@@ -3183,6 +3307,11 @@ pub async fn post_quecwatch(State(ctx): State<HttpCtx>, Json(body): Json<LinkWat
         Some(Err(e)) => return err_resp(StatusCode::BAD_REQUEST, e),
         None => None,
     };
+    if let Some(slot) = body.preferred_sim_slot
+        && slot > 2
+    {
+        return err_resp(StatusCode::BAD_REQUEST, "preferredSimSlot must be 0 (none), 1, or 2");
+    }
     let mut s = ctx.app.settings.write().await;
     s.quecwatch_enabled = body.enabled;
     if let Some(t) = target {
@@ -3202,6 +3331,12 @@ pub async fn post_quecwatch(State(ctx): State<HttpCtx>, Json(body): Json<LinkWat
     }
     if let Some(v) = body.auto_sim_failover {
         s.quecwatch_auto_sim_failover = v;
+    }
+    if let Some(slot) = body.preferred_sim_slot {
+        s.preferred_sim_slot = slot;
+    }
+    if let Some(mins) = body.sim_failback_mins {
+        s.sim_failback_mins = mins.clamp(1, 1440);
     }
     if let Some(v) = body.high_latency_monitoring {
         s.quecwatch_high_latency = v;
@@ -4067,7 +4202,7 @@ Settings for eth0:
                 *ctx.app.qscan_running.lock().await = None;
 
                 // post_cell_scan when AT+QSCAN=3,1 returns !ok records status="error"
-                let start = post_cell_scan(State(ctx.clone())).await;
+                let start = post_cell_scan(State(ctx.clone()), axum::body::Bytes::new()).await;
                 assert_eq!(start.status(), StatusCode::OK);
                 for _ in 0..50 {
                     if ctx.app.qscan_running.lock().await.is_none()
@@ -4734,5 +4869,89 @@ qcmap_lan.@profile[3].ippt_mac_addr='02:00:5e:10:00:01'\n";
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v["response"].as_str().unwrap_or("").contains("Quectel"), "{v}");
         drop(t2);
+    }
+
+    #[tokio::test]
+    async fn cell_lock_api_exposes_deadman_and_scan_supports_nr5g_fast_mode() {
+        let env = crate::paths::TestSandbox::new("cell-lock-deadman-scan");
+        std::fs::create_dir_all(env.root.join("etc/cellcore")).unwrap();
+        let (ctx, seen) = spawn_fake_modem_ctx(&env.root, |cmd| {
+            if cmd.starts_with("AT+QSCAN=") {
+                "\r\n+QSCAN: \"NR5G\",310,260,521310,589,-82,-11,22,41\r\nOK\r\n".into()
+            } else {
+                "\r\nOK\r\n".into()
+            }
+        });
+
+        crate::paths::TEST_ENV
+            .scope(env.env(), async {
+                ctx.app
+                    .cell_lock_bypassed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let get1 = get_cell_lock(State(ctx.clone())).await;
+                assert_eq!(get1.status(), StatusCode::OK);
+                let b1 = axum::body::to_bytes(get1.into_body(), 4096).await.unwrap();
+                let v1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+                assert_eq!(v1["cellLockDeadmanEnabled"], true);
+                assert_eq!(v1["cellLockDeadmanSecs"], 180);
+                assert_eq!(v1["bypassed"], true);
+                assert!(v1.get("lteRaw").is_some() && v1.get("schedule").is_some());
+
+                // Update deadman config via POST /api/v1/cellular/cell-lock without touching radio
+                let req: CellLockReq = serde_json::from_value(serde_json::json!({
+                    "cellLockDeadmanEnabled": false,
+                    "cellLockDeadmanSecs": 240,
+                }))
+                .unwrap();
+                let post_dm = post_cell_lock(State(ctx.clone()), Json(req)).await;
+                assert_eq!(post_dm.status(), StatusCode::OK);
+                assert!(!ctx.app.settings.read().await.cell_lock_deadman_enabled);
+                assert_eq!(ctx.app.settings.read().await.cell_lock_deadman_secs, 240);
+
+                // Fast 5G-only scan uses AT+QSCAN=2,1
+                seen.lock().unwrap().clear();
+                let scan_nr = post_cell_scan(
+                    State(ctx.clone()),
+                    axum::body::Bytes::from_static(br#"{"mode":"nr5g"}"#),
+                )
+                .await;
+                assert_eq!(scan_nr.status(), StatusCode::OK);
+                for _ in 0..50 {
+                    if ctx.app.qscan_running.lock().await.is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                assert!(
+                    seen.lock().unwrap().iter().any(|c| c == "AT+QSCAN=2,1"),
+                    "expected AT+QSCAN=2,1 in {:?}",
+                    *seen.lock().unwrap()
+                );
+
+                // LTE-only scan uses AT+QSCAN=1,1
+                seen.lock().unwrap().clear();
+                let scan_lte = post_cell_scan(
+                    State(ctx.clone()),
+                    axum::body::Bytes::from_static(br#"{"mode":"lte"}"#),
+                )
+                .await;
+                assert_eq!(scan_lte.status(), StatusCode::OK);
+                for _ in 0..50 {
+                    if ctx.app.qscan_running.lock().await.is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                assert!(seen.lock().unwrap().iter().any(|c| c == "AT+QSCAN=1,1"));
+
+                // Invalid mode -> 400
+                let bad = post_cell_scan(
+                    State(ctx.clone()),
+                    axum::body::Bytes::from_static(br#"{"mode":"gsm"}"#),
+                )
+                .await;
+                assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+            })
+            .await;
     }
 }

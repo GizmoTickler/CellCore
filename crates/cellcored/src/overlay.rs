@@ -24,6 +24,7 @@ use std::{
 use serde::Serialize;
 
 pub const OVERLAY_LOG_PATH: &str = "/tmp/cellcore-overlay.log";
+pub const OVERLAY_LOG_MAX_BYTES: u64 = 64 * 1024;
 pub const REAL_ROOTFS: &str = "/real_rootfs";
 pub const NEW_ROOTFS: &str = "/rootfs";
 pub const MIN_BACKING_FREE_MIB: u64 = 32;
@@ -272,15 +273,35 @@ pub fn probe_status() -> Result<OverlayStatus, String> {
     ))
 }
 
-fn log_line(msg: &str) {
-    eprintln!("cellcore-overlay: {msg}");
+pub(crate) fn append_overlay_log_at(log_path: &Path, msg: &str) {
+    if let Ok(meta) = fs::metadata(log_path)
+        && meta.len() > OVERLAY_LOG_MAX_BYTES
+    {
+        let keep_target = (OVERLAY_LOG_MAX_BYTES / 2) as usize;
+        let kept = match fs::read(log_path) {
+            Ok(bytes) if bytes.len() > keep_target => {
+                let slice = &bytes[bytes.len() - keep_target..];
+                match slice.iter().position(|&b| b == b'\n') {
+                    Some(nl) => slice[nl + 1..].to_vec(),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
+        let _ = crate::state::atomic_write(log_path, &kept, 0o644);
+    }
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(OVERLAY_LOG_PATH)
+        .open(log_path)
     {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+fn log_line(msg: &str) {
+    eprintln!("cellcore-overlay: {msg}");
+    append_overlay_log_at(Path::new(&crate::paths::p(OVERLAY_LOG_PATH)), msg);
 }
 
 fn cstr_path(p: &str) -> Result<CString, String> {
@@ -692,5 +713,19 @@ overlay /etc overlay rw,relatime 0 0
         assert!(!base.join("etc/rc.d/S03cellcore-overlay").exists());
         assert!(base.join("etc/init.d/dropbear").exists());
         assert!(!upper.exists());
+    }
+
+    #[test]
+    fn overlay_log_truncates_when_exceeding_64_kib() {
+        let sbx = crate::paths::TestSandbox::new("overlay-log-cap");
+        let log_path = sbx.root.join("tmp/cellcore-overlay.log");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let big = format!("{}\n", "A".repeat(OVERLAY_LOG_MAX_BYTES as usize + 4096));
+        fs::write(&log_path, big.as_bytes()).unwrap();
+
+        append_overlay_log_at(&log_path, "fresh-entry-after-rotate");
+        let after = fs::read_to_string(&log_path).unwrap();
+        assert!(after.len() < OVERLAY_LOG_MAX_BYTES as usize);
+        assert!(after.contains("fresh-entry-after-rotate"));
     }
 }

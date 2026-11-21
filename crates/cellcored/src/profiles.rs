@@ -590,66 +590,218 @@ pub fn cell_lock_sched_action(now_min: u16, start: &str, end: &str, engaged: boo
 
 const SCHED_ENGAGED_MARKER: &str = "/tmp/cellcore/cell_lock_sched_engaged";
 
-pub async fn tick_profiles_and_schedules(state: &AppState) {
-    // 1. QuecProfiles drift check every 5 min (read-first, non-disruptive)
-    let now = now_secs();
-    let last_drift = LAST_DRIFT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    let failover_active = crate::obs::failover::is_active();
-    if failover_active && now.saturating_sub(last_drift) >= 300 {
-        // MBN select / APN rewrite can drop the bearer: not while it carries traffic.
-        crate::obs::failover::note_deferred("MBN/APN realignment");
-    } else if now.saturating_sub(last_drift) >= 300 {
-        LAST_DRIFT_SECS.store(now, std::sync::atomic::Ordering::Relaxed);
-        let iccid = state.secrets.read().await.iccid.clone();
-        if !iccid.is_empty() {
-            let profiles = list_profiles().await;
-            if let Some(prof) = profiles.into_iter().find(|p| p.iccid == iccid && p.paused != "1") {
-                // MBN select / APN rewrite: not in the middle of a radio change.
-                let _radio = crate::radio::lock(state).await;
-                if !prof.mbn_profile.is_empty()
-                    && !prof.mbn_profile.contains(['"', '\n', '\r'])
-                    && let Ok(mbn_res) = state.smd.exec("AT+QMBNCFG=\"List\"", Priority::Background, Duration::from_secs(4)).await
-                {
-                    let mbns = parse_mbn_list(&mbn_res.body);
-                    let ours = DRIFT_MEMO.lock().ok().and_then(|m| m.mbn_selected.clone());
-                    if mbn_select_needed(&mbns, &prof.mbn_profile, ours.as_deref()) {
-                        state.push_daemon_log(format!(
-                            "QuecProfiles selecting MBN profile {} (AutoSel=0, applies after reboot)",
-                            prof.mbn_profile
-                        ));
-                        let _ = state.smd.exec("AT+QMBNCFG=\"AutoSel\",0", Priority::Background, Duration::from_secs(4)).await;
-                        let _ = state
-                            .smd
-                            .exec(
-                                format!("AT+QMBNCFG=\"Select\",\"{}\"", prof.mbn_profile),
-                                Priority::Background,
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                        if let Ok(mut m) = DRIFT_MEMO.lock() {
-                            m.mbn_selected = Some(prof.mbn_profile.clone());
-                        }
-                    }
-                }
-                if let (Ok(apn), Ok(pdp)) = (validate_apn(&prof.apn), validate_pdp_type(&prof.pdp_type))
-                    && let Ok(cgd) = state.smd.exec("AT+CGDCONT?", Priority::Background, Duration::from_secs(4)).await
-                {
-                    let current = parse_cgdcont(&cgd.body, 1);
-                    let last = DRIFT_MEMO.lock().ok().and_then(|m| m.apn_applied.clone());
-                    if apn_apply_needed(current, &pdp, &apn, last.as_ref(), now) {
-                        let cmd = format!("AT+CGDCONT=1,\"{pdp}\",\"{apn}\"");
-                        let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
-                        if let Ok(mut m) = DRIFT_MEMO.lock() {
-                            m.apn_applied = Some((pdp, apn.clone(), now));
-                        }
-                        state.push_daemon_log(format!("QuecProfiles restored APN={apn}"));
-                    }
-                }
+fn mono_secs() -> u64 {
+    crate::state::mono_ms() / 1000
+}
+
+async fn sync_active_iccid_profile(state: &AppState, mono_now: u64) {
+    let iccid = state.secrets.read().await.iccid.clone();
+    if iccid.is_empty() {
+        return;
+    }
+    let profiles = list_profiles().await;
+    let Some(prof) = profiles.into_iter().find(|p| p.iccid == iccid && p.paused != "1") else {
+        return;
+    };
+    // MBN select / APN rewrite: not in the middle of a radio change.
+    let _radio = crate::radio::lock(state).await;
+    if !prof.mbn_profile.is_empty()
+        && !prof.mbn_profile.contains(['"', '\n', '\r'])
+        && let Ok(mbn_res) = state.smd.exec("AT+QMBNCFG=\"List\"", Priority::Background, Duration::from_secs(4)).await
+    {
+        let mbns = parse_mbn_list(&mbn_res.body);
+        let ours = DRIFT_MEMO.lock().ok().and_then(|m| m.mbn_selected.clone());
+        if mbn_select_needed(&mbns, &prof.mbn_profile, ours.as_deref()) {
+            state.push_daemon_log(format!(
+                "QuecProfiles selecting MBN profile {} (AutoSel=0, applies after reboot)",
+                prof.mbn_profile
+            ));
+            let _ = state.smd.exec("AT+QMBNCFG=\"AutoSel\",0", Priority::Background, Duration::from_secs(4)).await;
+            let _ = state
+                .smd
+                .exec(
+                    format!("AT+QMBNCFG=\"Select\",\"{}\"", prof.mbn_profile),
+                    Priority::Background,
+                    Duration::from_secs(5),
+                )
+                .await;
+            if let Ok(mut m) = DRIFT_MEMO.lock() {
+                m.mbn_selected = Some(prof.mbn_profile.clone());
             }
         }
     }
+    if let (Ok(apn), Ok(pdp)) = (validate_apn(&prof.apn), validate_pdp_type(&prof.pdp_type))
+        && let Ok(cgd) = state.smd.exec("AT+CGDCONT?", Priority::Background, Duration::from_secs(4)).await
+    {
+        let current = parse_cgdcont(&cgd.body, 1);
+        let last = DRIFT_MEMO.lock().ok().and_then(|m| m.apn_applied.clone());
+        if apn_apply_needed(current, &pdp, &apn, last.as_ref(), mono_now) {
+            let cmd = format!("AT+CGDCONT=1,\"{pdp}\",\"{apn}\"");
+            let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
+            if let Ok(mut m) = DRIFT_MEMO.lock() {
+                m.apn_applied = Some((pdp, apn.clone(), mono_now));
+            }
+            state.push_daemon_log(format!("QuecProfiles restored APN={apn}"));
+        }
+    }
+}
+
+/// Immediately synchronize the MBN/APN profile for a newly detected SIM ICCID
+/// (e.g. right after a SIM slot switch), resetting per-SIM drift memoization.
+pub async fn tick_iccid_profile_sync(state: &AppState) {
+    if let Ok(mut m) = DRIFT_MEMO.lock() {
+        m.mbn_selected = None;
+        m.apn_applied = None;
+    }
+    let mono_now = mono_secs();
+    LAST_DRIFT_SECS.store(mono_now, std::sync::atomic::Ordering::Relaxed);
+    if crate::obs::failover::is_active() {
+        crate::obs::failover::note_deferred("MBN/APN realignment");
+        return;
+    }
+    sync_active_iccid_profile(state, mono_now).await;
+}
+
+/// Evaluate and apply scheduled cell-lock transitions, checking actual modem
+/// `AT+QNWLOCK` state on first tick when `/tmp/cellcore/cell_lock_sched_engaged`
+/// is absent so a pre-restart scheduled lock is never leaked outside its window.
+pub async fn tick_cell_lock_scheduler(
+    state: &AppState,
+    cfg: &crate::state::DaemonSettings,
+    now_min: u16,
+) {
+    if state.cell_lock_bypassed.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let marker_path = crate::paths::p(SCHED_ENGAGED_MARKER);
+    let mut engaged = std::path::Path::new(&marker_path).exists();
+    if !engaged
+        && cfg.cell_lock_sched_enabled
+        && !state.sched_boot_checked.load(std::sync::atomic::Ordering::Acquire)
+    {
+        let probe_cmds = vec![
+            ("AT+QNWLOCK=\"common/5g\"".into(), Duration::from_secs(4)),
+            ("AT+QNWLOCK=\"common/4g\"".into(), Duration::from_secs(4)),
+        ];
+        if let Ok(res) = state.smd.exec_batch(probe_cmds, Priority::Background).await {
+            let mut any_ok = false;
+            let mut modem_locked = false;
+            for (idx, key) in [(0usize, "common/5g"), (1usize, "common/4g")] {
+                if let Some(Ok(r)) = res.get(idx)
+                    && r.ok
+                {
+                    any_ok = true;
+                    if r.body.to_ascii_lowercase().contains("+qnwlock:")
+                        && !crate::handlers::qnwlock_is_unlocked(&r.body, key)
+                    {
+                        modem_locked = true;
+                    }
+                }
+            }
+            if any_ok {
+                state
+                    .sched_boot_checked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if modem_locked {
+                    engaged = true;
+                    let _ = crate::state::atomic_write(
+                        std::path::Path::new(&marker_path),
+                        b"1\n",
+                        0o600,
+                    );
+                }
+            }
+        }
+    } else if engaged {
+        state
+            .sched_boot_checked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    if cfg.cell_lock_sched_enabled || engaged {
+        let has_locks = !cfg.cell_lock_nr5g.is_empty() || !cfg.cell_lock_lte.is_empty();
+        let action = if cfg.cell_lock_sched_enabled {
+            cell_lock_sched_action(
+                now_min,
+                &cfg.cell_lock_start_time,
+                &cfg.cell_lock_end_time,
+                engaged,
+                has_locks,
+            )
+        } else {
+            // schedule switched off while its lock was engaged: undo it
+            SchedAction::Release
+        };
+        // Engaging or releasing a lock re-selects the cell: hold the current
+        // state while carrying failover traffic; the next tick catches up.
+        let action = if action != SchedAction::Nothing && crate::obs::failover::is_active() {
+            crate::obs::failover::note_deferred("scheduled cell lock change");
+            SchedAction::Nothing
+        } else {
+            action
+        };
+        // Engaging / releasing a lock is a radio change: one at a time.
+        let _radio = if action != SchedAction::Nothing {
+            Some(crate::radio::lock(state).await)
+        } else {
+            None
+        };
+        let status_path = crate::paths::p("/tmp/cell_lock_status.json");
+        match action {
+            SchedAction::Engage => {
+                if !cfg.cell_lock_nr5g.is_empty() {
+                    let cmd = format!("AT+QNWLOCK=\"common/5g\",{}", cfg.cell_lock_nr5g);
+                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
+                }
+                if !cfg.cell_lock_lte.is_empty() {
+                    let cmd = format!("AT+QNWLOCK=\"common/4g\",{}", cfg.cell_lock_lte);
+                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
+                }
+                let _ = crate::state::atomic_write(std::path::Path::new(&marker_path), b"1\n", 0o600);
+                let _ = crate::state::atomic_write(
+                    std::path::Path::new(&status_path),
+                    b"{\"status\":\"active\",\"locked\":1}",
+                    0o600,
+                );
+                state.push_daemon_log("Scheduled Cell Lock engaged");
+            }
+            SchedAction::Release => {
+                let _ = state
+                    .smd
+                    .exec("AT+QNWLOCK=\"common/5g\",0", Priority::Background, Duration::from_secs(5))
+                    .await;
+                let _ = state
+                    .smd
+                    .exec("AT+QNWLOCK=\"common/4g\",0", Priority::Background, Duration::from_secs(5))
+                    .await;
+                let _ = fs::remove_file(&marker_path);
+                let _ = crate::state::atomic_write(
+                    std::path::Path::new(&status_path),
+                    b"{\"status\":\"inactive\",\"locked\":0}",
+                    0o600,
+                );
+                state.push_daemon_log("Scheduled Cell Lock cleared");
+            }
+            SchedAction::Nothing => {}
+        }
+    }
+}
+
+pub async fn tick_profiles_and_schedules(state: &AppState) {
+    // 1. QuecProfiles drift check every 5 min (monotonic clock, read-first, non-disruptive)
+    let mono_now = mono_secs();
+    let last_drift = LAST_DRIFT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let failover_active = crate::obs::failover::is_active();
+    if failover_active && mono_now.saturating_sub(last_drift) >= 300 {
+        // MBN select / APN rewrite can drop the bearer: not while it carries traffic.
+        crate::obs::failover::note_deferred("MBN/APN realignment");
+    } else if last_drift == 0 || mono_now.saturating_sub(last_drift) >= 300 {
+        LAST_DRIFT_SECS.store(mono_now, std::sync::atomic::Ordering::Relaxed);
+        sync_active_iccid_profile(state, mono_now).await;
+    }
 
     // 2. Scheduled Cell Lock & Scheduled Reboot in local wall-clock time
+    let now = now_secs();
     let (hhmm, now_min, weekday) = {
         let dt = crate::tz::local_at(now as i64);
         (
@@ -685,53 +837,7 @@ pub async fn tick_profiles_and_schedules(state: &AppState) {
         }
     }
 
-    let engaged = std::path::Path::new(&crate::paths::p(SCHED_ENGAGED_MARKER)).exists();
-    if cfg.cell_lock_sched_enabled || engaged {
-        let has_locks = !cfg.cell_lock_nr5g.is_empty() || !cfg.cell_lock_lte.is_empty();
-        let action = if cfg.cell_lock_sched_enabled {
-            cell_lock_sched_action(now_min, &cfg.cell_lock_start_time, &cfg.cell_lock_end_time, engaged, has_locks)
-        } else {
-            // schedule switched off while its lock was engaged: undo it
-            SchedAction::Release
-        };
-        // Engaging or releasing a lock re-selects the cell: hold the current
-        // state while carrying failover traffic; the next tick catches up.
-        let action = if action != SchedAction::Nothing && crate::obs::failover::is_active() {
-            crate::obs::failover::note_deferred("scheduled cell lock change");
-            SchedAction::Nothing
-        } else {
-            action
-        };
-        // Engaging / releasing a lock is a radio change: one at a time.
-        let _radio = if action != SchedAction::Nothing { Some(crate::radio::lock(state).await) } else { None };
-        match action {
-            SchedAction::Engage => {
-                if !cfg.cell_lock_nr5g.is_empty() {
-                    let cmd = format!("AT+QNWLOCK=\"common/5g\",{}", cfg.cell_lock_nr5g);
-                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
-                }
-                if !cfg.cell_lock_lte.is_empty() {
-                    let cmd = format!("AT+QNWLOCK=\"common/4g\",{}", cfg.cell_lock_lte);
-                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
-                }
-                let _ = fs::write(crate::paths::p(SCHED_ENGAGED_MARKER), b"1\n");
-                let _ = fs::write(crate::paths::p("/tmp/cell_lock_status.json"), "{\"status\":\"active\",\"locked\":1}");
-                state.push_daemon_log("Scheduled Cell Lock engaged");
-            }
-            SchedAction::Release => {
-                if !cfg.cell_lock_nr5g.is_empty() {
-                    let _ = state.smd.exec("AT+QNWLOCK=\"common/5g\",0", Priority::Background, Duration::from_secs(5)).await;
-                }
-                if !cfg.cell_lock_lte.is_empty() {
-                    let _ = state.smd.exec("AT+QNWLOCK=\"common/4g\",0", Priority::Background, Duration::from_secs(5)).await;
-                }
-                let _ = fs::remove_file(crate::paths::p(SCHED_ENGAGED_MARKER));
-                let _ = fs::write(crate::paths::p("/tmp/cell_lock_status.json"), "{\"status\":\"inactive\",\"locked\":0}");
-                state.push_daemon_log("Scheduled Cell Lock cleared");
-            }
-            SchedAction::Nothing => {}
-        }
-    }
+    tick_cell_lock_scheduler(state, &cfg, now_min).await;
 }
 
 /// Minutes-of-day window; `start > end` wraps past midnight.
@@ -890,6 +996,81 @@ mod tests {
                 // Valid fields + missing index -> NotFound (404)
                 let err = upsert_profile_noting(Some(999), valid(), "", ProfileOrigin::Api).await.unwrap_err();
                 assert_eq!(err, ProfileError::NotFound(999));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_boot_leak_clears_modem_lock_when_marker_missing_outside_window() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let sbx = crate::paths::TestSandbox::new("sched-boot-leak");
+        std::fs::create_dir_all(sbx.root.join("tmp/cellcore")).unwrap();
+        let lock_5g = std::sync::Arc::new(std::sync::Mutex::new("589,521310,30,41".to_string()));
+        let lock_5g_srv = lock_5g.clone();
+
+        let (a, mut b) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = b.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let body = if cmd == "AT+QNWLOCK=\"common/5g\"" {
+                        format!("+QNWLOCK: \"common/5g\",{}", *lock_5g_srv.lock().unwrap())
+                    } else if cmd == "AT+QNWLOCK=\"common/4g\"" {
+                        "+QNWLOCK: \"common/4g\",0".to_string()
+                    } else if let Some(val) = cmd.strip_prefix("AT+QNWLOCK=\"common/5g\",") {
+                        *lock_5g_srv.lock().unwrap() = val.trim().to_string();
+                        String::new()
+                    } else {
+                        String::new()
+                    };
+                    let reply = if body.is_empty() {
+                        format!("{cmd}\r\r\nOK\r\n")
+                    } else {
+                        format!("{cmd}\r\r\n{body}\r\nOK\r\n")
+                    };
+                    let _ = b.write_all(reply.as_bytes());
+                }
+            }
+        });
+        let fd_opt = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_opt.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, smd);
+                let cfg = crate::state::DaemonSettings {
+                    cell_lock_sched_enabled: true,
+                    cell_lock_start_time: "08:00".into(),
+                    cell_lock_end_time: "18:00".into(),
+                    cell_lock_nr5g: "589,521310,30,41".into(),
+                    ..Default::default()
+                };
+
+                // Outside schedule window (23:00) with missing /tmp marker, boot check sees live
+                // QNWLOCK on modem and immediately releases the leaked lock.
+                tick_cell_lock_scheduler(&app, &cfg, 23 * 60).await;
+                assert!(app.sched_boot_checked.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(*lock_5g.lock().unwrap(), "0");
+                assert!(!sbx.root.join("tmp/cellcore/cell_lock_sched_engaged").exists());
             })
             .await;
     }

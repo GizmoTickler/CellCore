@@ -160,10 +160,7 @@ async fn wan_restart_sequence(state: AppState) {
         {
             let cfun_str = parse_scalar_at_value(&cfun_res.body, "+CFUN:");
             if cfun_str.trim() != "1" {
-                let _ = state
-                    .smd
-                    .exec("AT+CFUN=1", Priority::Emergency, Duration::from_secs(10))
-                    .await;
+                let _ = crate::telemetry::ensure_cfun_one_with_retries(&state, Duration::from_secs(10)).await;
                 crate::handlers::forget_radio_mode(&state);
                 reset_cfun = true;
             }
@@ -192,10 +189,7 @@ async fn modem_reset_sequence(state: AppState) {
             .exec("AT+CFUN=0", Priority::Emergency, Duration::from_secs(10))
             .await;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = state
-            .smd
-            .exec("AT+CFUN=1", Priority::Emergency, Duration::from_secs(15))
-            .await;
+        let _ = crate::telemetry::ensure_cfun_one_with_retries(&state, Duration::from_secs(15)).await;
         crate::handlers::forget_radio_mode(&state);
         drop(guard);
     }

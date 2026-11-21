@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use md5::Md5;
@@ -18,6 +18,8 @@ const CRYPT_B64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk
 pub const SESSION_DIR: &str = "/tmp/cellcore/sessions";
 pub const SESSION_MAX_AGE_SECS: u64 = 28_800; // 8 hours
 pub const SESSION_IDLE_AGE_SECS: u64 = 7_200; // 2 hours
+pub const MAX_SESSIONS: usize = 64;
+pub const MAX_RATE_LIMIT_PEERS: usize = 256;
 const RATE_WINDOW_SECS: u64 = 60;
 const RATE_MAX_FAILS: u32 = 5;
 /// sha-crypt cost grows with len(password)^2; real passwords are far shorter.
@@ -32,11 +34,15 @@ pub struct SessionRecord {
     pub csrf_token: String,
     pub created_at: u64,
     pub last_seen: u64,
+    #[serde(skip, default = "Instant::now")]
+    pub created_mono: Instant,
+    #[serde(skip, default = "Instant::now")]
+    pub last_seen_mono: Instant,
 }
 
 #[derive(Debug)]
 struct RateEntry {
-    window_start: u64,
+    window_start: Instant,
     failures: u32,
 }
 
@@ -55,25 +61,60 @@ pub enum VerifyError {
     Busy,
 }
 
+fn is_session_expired_mono(rec: &SessionRecord, now_mono: Instant) -> bool {
+    now_mono.saturating_duration_since(rec.created_mono) > Duration::from_secs(SESSION_MAX_AGE_SECS)
+        || now_mono.saturating_duration_since(rec.last_seen_mono) > Duration::from_secs(SESSION_IDLE_AGE_SECS)
+}
+
 impl AuthStore {
     pub fn new(session_dir: impl Into<PathBuf>) -> Self {
         let dir = session_dir.into();
-        let mut loaded = HashMap::new();
+        let mut loaded: HashMap<String, SessionRecord> = HashMap::new();
         if let Ok(entries) = fs::read_dir(&dir) {
             let now = now_secs();
+            let now_mono = Instant::now();
+            let wall_valid = now >= crate::state::MIN_VALID_WALL_CLOCK_SECS;
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json")
                     && let Ok(text) = fs::read_to_string(&path)
-                    && let Ok(rec) = serde_json::from_str::<SessionRecord>(&text)
-                    && now.saturating_sub(rec.created_at) <= SESSION_MAX_AGE_SECS
-                    && now.saturating_sub(rec.last_seen) <= SESSION_IDLE_AGE_SECS
+                    && let Ok(mut rec) = serde_json::from_str::<SessionRecord>(&text)
                 {
-                    loaded.insert(rec.token.clone(), rec);
-                } else if path.is_file() {
+                    let wall_ok = if wall_valid && rec.created_at >= crate::state::MIN_VALID_WALL_CLOCK_SECS {
+                        now.saturating_sub(rec.created_at) <= SESSION_MAX_AGE_SECS
+                            && now.saturating_sub(rec.last_seen) <= SESSION_IDLE_AGE_SECS
+                    } else {
+                        true
+                    };
+                    if wall_ok {
+                        if wall_valid && rec.created_at >= crate::state::MIN_VALID_WALL_CLOCK_SECS {
+                            let age = Duration::from_secs(now.saturating_sub(rec.created_at));
+                            let idle = Duration::from_secs(now.saturating_sub(rec.last_seen));
+                            rec.created_mono = now_mono.checked_sub(age).unwrap_or(now_mono);
+                            rec.last_seen_mono = now_mono.checked_sub(idle).unwrap_or(now_mono);
+                        } else {
+                            rec.created_mono = now_mono;
+                            rec.last_seen_mono = now_mono;
+                        }
+                        loaded.insert(rec.token.clone(), rec);
+                        continue;
+                    }
+                }
+                if path.is_file() {
                     let _ = fs::remove_file(&path);
                 }
             }
+        }
+        while loaded.len() > MAX_SESSIONS {
+            let Some(oldest) = loaded
+                .iter()
+                .min_by_key(|(_, r)| r.last_seen_mono)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            loaded.remove(&oldest);
+            let _ = fs::remove_file(dir.join(format!("{oldest}.json")));
         }
         Self {
             session_dir: dir,
@@ -100,12 +141,26 @@ impl AuthStore {
     /// clears the counter via `clear_failures`.
     pub async fn begin_attempt(&self, ip: IpAddr) -> bool {
         let mut map = self.rate_limits.lock().await;
-        let now = now_secs();
+        let now = Instant::now();
+        let win = Duration::from_secs(RATE_WINDOW_SECS);
+        if !map.contains_key(&ip) && map.len() >= MAX_RATE_LIMIT_PEERS {
+            map.retain(|_, v| now.saturating_duration_since(v.window_start) <= win);
+            while map.len() >= MAX_RATE_LIMIT_PEERS {
+                let Some(oldest_ip) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.window_start)
+                    .map(|(k, _)| *k)
+                else {
+                    break;
+                };
+                map.remove(&oldest_ip);
+            }
+        }
         let entry = map.entry(ip).or_insert(RateEntry {
             window_start: now,
             failures: 0,
         });
-        if now.saturating_sub(entry.window_start) > RATE_WINDOW_SECS {
+        if now.saturating_duration_since(entry.window_start) > win {
             entry.window_start = now;
             entry.failures = 0;
         }
@@ -153,14 +208,46 @@ impl AuthStore {
         let token = random_hex(32)?;
         let csrf_token = random_hex(16)?;
         let now = now_secs();
+        let now_mono = Instant::now();
         let rec = SessionRecord {
             token: token.clone(),
             csrf_token,
             created_at: now,
             last_seen: now,
+            created_mono: now_mono,
+            last_seen_mono: now_mono,
         };
+        let mut evicted_any = false;
+        {
+            let mut sessions = self.sessions.lock().await;
+            let expired: Vec<String> = sessions
+                .iter()
+                .filter(|(_, r)| is_session_expired_mono(r, now_mono))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for tok in expired {
+                sessions.remove(&tok);
+                let _ = fs::remove_file(self.session_path(&tok));
+                evicted_any = true;
+            }
+            while sessions.len() >= MAX_SESSIONS {
+                let Some(oldest_tok) = sessions
+                    .iter()
+                    .min_by_key(|(_, r)| r.last_seen_mono)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                sessions.remove(&oldest_tok);
+                let _ = fs::remove_file(self.session_path(&oldest_tok));
+                evicted_any = true;
+            }
+            sessions.insert(token, rec.clone());
+        }
+        if evicted_any {
+            self.notify_revoked();
+        }
         self.persist_session(&rec);
-        self.sessions.lock().await.insert(token, rec.clone());
         Ok(rec)
     }
 
@@ -169,11 +256,11 @@ impl AuthStore {
             return None;
         }
         let now = now_secs();
+        let now_mono = Instant::now();
         let mut sessions = self.sessions.lock().await;
-        let expired = sessions.get(token).is_some_and(|rec| {
-            now.saturating_sub(rec.created_at) > SESSION_MAX_AGE_SECS
-                || now.saturating_sub(rec.last_seen) > SESSION_IDLE_AGE_SECS
-        });
+        let expired = sessions
+            .get(token)
+            .is_some_and(|rec| is_session_expired_mono(rec, now_mono));
         if expired {
             sessions.remove(token);
             let _ = fs::remove_file(self.session_path(token));
@@ -182,6 +269,7 @@ impl AuthStore {
         let rec = sessions.get_mut(token)?;
         if touch {
             rec.last_seen = now;
+            rec.last_seen_mono = now_mono;
             let cloned = rec.clone();
             drop(sessions);
             self.persist_session(&cloned);
@@ -215,14 +303,11 @@ impl AuthStore {
     }
 
     pub async fn prune_expired(&self) {
-        let now = now_secs();
+        let now_mono = Instant::now();
         let mut sessions = self.sessions.lock().await;
         let expired: Vec<String> = sessions
             .iter()
-            .filter(|(_, rec)| {
-                now.saturating_sub(rec.created_at) > SESSION_MAX_AGE_SECS
-                    || now.saturating_sub(rec.last_seen) > SESSION_IDLE_AGE_SECS
-            })
+            .filter(|(_, rec)| is_session_expired_mono(rec, now_mono))
             .map(|(k, _)| k.clone())
             .collect();
         let any_expired = !expired.is_empty();
@@ -236,7 +321,7 @@ impl AuthStore {
         }
 
         let mut rates = self.rate_limits.lock().await;
-        rates.retain(|_, v| now.saturating_sub(v.window_start) <= RATE_WINDOW_SECS);
+        rates.retain(|_, v| now_mono.saturating_duration_since(v.window_start) <= Duration::from_secs(RATE_WINDOW_SECS));
     }
 
     fn session_path(&self, token: &str) -> PathBuf {
@@ -809,6 +894,42 @@ mod tests {
         store.revoke_except(None).await;
         assert!(rx.has_changed().unwrap());
         assert!(store.validate_token(&b.token, false).await.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_and_rate_limit_caps_evict_oldest_monotonic_entries() {
+        let dir = std::env::temp_dir().join(format!("qm-auth-caps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = AuthStore::new(&dir);
+
+        let first = store.create_session().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = store.create_session().await.unwrap();
+        for _ in 2..MAX_SESSIONS {
+            let _ = store.create_session().await.unwrap();
+        }
+        assert_eq!(store.sessions.lock().await.len(), MAX_SESSIONS);
+
+        // Touch `first` so `second` becomes the oldest idle session.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(store.validate_token(&first.token, true).await.is_some());
+
+        let extra = store.create_session().await.unwrap();
+        assert_eq!(store.sessions.lock().await.len(), MAX_SESSIONS);
+        assert!(
+            store.validate_token(&second.token, false).await.is_none(),
+            "oldest idle session must be evicted at MAX_SESSIONS"
+        );
+        assert!(store.validate_token(&first.token, false).await.is_some());
+        assert!(store.validate_token(&extra.token, false).await.is_some());
+
+        // Cap rate_limits at MAX_RATE_LIMIT_PEERS (256).
+        for i in 0..(MAX_RATE_LIMIT_PEERS + 20) {
+            let peer = IpAddr::from([10, 99, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8]);
+            let _ = store.begin_attempt(peer).await;
+        }
+        assert!(store.rate_limits.lock().await.len() <= MAX_RATE_LIMIT_PEERS);
         let _ = fs::remove_dir_all(&dir);
     }
 }
