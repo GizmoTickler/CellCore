@@ -854,15 +854,16 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
     warnings
 }
 
-/// Alternate `eth0-*` PCIe MSI IRQs across single-CPU masks `"4"` (CPU 2) and `"8"` (CPU 3)
-/// so GICv3 does not steer multi-bit `"c"` solely onto its lowest set bit (CPU 2).
-pub(crate) fn pin_eth0_irqs_alternating() -> Vec<(String, &'static str)> {
+/// Enable hardware/kernel GRO forwarding offloads (`rx-gro-list`, `rx-udp-gro-forwarding`)
+/// on `eth0` and the active `rmnet_data*` interface (software netdev flags that never reset
+/// Realtek `r8125` + Qualcomm `ioss` hardware DMA rings), and pin `eth0-*` PCIe MSI IRQs
+/// onto CPUs 2–3 via `smp_affinity_list` (isolated from `ipcc_0` on CPU 0 and `gsi/IPA` on CPU 1).
+pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
     let mut assigned = Vec::new();
     let irqs_path = crate::paths::p("/proc/interrupts");
     let Ok(text) = fs::read_to_string(&irqs_path) else {
         return assigned;
     };
-    let mut idx = 0usize;
     for line in text.lines() {
         if !line.contains("eth0-") {
             continue;
@@ -870,28 +871,17 @@ pub(crate) fn pin_eth0_irqs_alternating() -> Vec<(String, &'static str)> {
         if let Some((num_raw, _)) = line.split_once(':') {
             let irq = num_raw.trim();
             if !irq.is_empty() && irq.bytes().all(|b| b.is_ascii_digit()) {
-                let mask = if idx.is_multiple_of(2) { "4" } else { "8" };
-                idx += 1;
-                let aff_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity"));
-                if Path::new(&aff_path).exists() {
-                    let _ = fs::write(&aff_path, format!("{mask}\n"));
-                } else {
-                    let list_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
-                    if Path::new(&list_path).exists() {
-                        let cpu = if mask == "4" { "2" } else { "3" };
-                        let _ = fs::write(&list_path, format!("{cpu}\n"));
-                    }
+                let list_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
+                if Path::new(&list_path).exists() {
+                    let _ = fs::write(&list_path, "2-3\n");
                 }
-                assigned.push((irq.to_string(), mask));
+                assigned.push((irq.to_string(), "2-3"));
             }
         }
     }
     assigned
 }
 
-/// Enable hardware/kernel GRO/GSO/TSO + UDP GRO forwarding while keeping `rx-gro-list off`
-/// (avoids `frag_list` linearization penalty on TCP/IPv6/WireGuard), and split `eth0-*` MSI IRQs
-/// evenly across CPU 2 (`"4"`) and CPU 3 (`"8"`), isolated from `ipcc_0` (CPU 0) and `gsi/IPA` (CPU 1).
 fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
     let mut ifaces: Vec<&str> = vec!["eth0"];
     if let Some(iface) = active_iface
@@ -905,44 +895,14 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
         if !Path::new(&sys_if).exists() {
             continue;
         }
-        if crate::uci::run_cmd_blocking_timeout(
+        let _ = crate::uci::run_cmd_blocking_timeout(
             "ethtool",
-            &[
-                "-K",
-                iface,
-                "gro",
-                "on",
-                "gso",
-                "on",
-                "tso",
-                "on",
-                "rx-gro-list",
-                "off",
-                "rx-udp-gro-forwarding",
-                "on",
-            ],
+            &["-K", iface, "rx-gro-list", "on", "rx-udp-gro-forwarding", "on"],
             Duration::from_secs(2),
-        )
-        .is_err()
-        {
-            let _ = crate::uci::run_cmd_blocking_timeout(
-                "ethtool",
-                &[
-                    "-K",
-                    iface,
-                    "gro",
-                    "on",
-                    "rx-gro-list",
-                    "off",
-                    "rx-udp-gro-forwarding",
-                    "on",
-                ],
-                Duration::from_secs(2),
-            );
-        }
+        );
     }
 
-    let _ = pin_eth0_irqs_alternating();
+    let _ = pin_eth0_irqs_to_cpu2_3();
 }
 
 pub(crate) fn parse_ipa_eth_driver(status_text: &str) -> Option<String> {
@@ -1203,7 +1163,6 @@ struct NativeHandles {
     last_v6_ip: Option<String>,
     last_v6_key: Option<(String, u8)>,
     last_link_mtu: u32,
-    wda_negotiated_ep: Option<(u32, u32)>,
     last_applied_sig: Option<AppliedCfgSig>,
     last_resolved_iface: Option<String>,
     applied_dns: Vec<String>,
@@ -1231,7 +1190,6 @@ impl NativeHandles {
             last_v6_ip: None,
             last_v6_key: None,
             last_link_mtu: 1500,
-            wda_negotiated_ep: None,
             last_applied_sig: None,
             last_resolved_iface: None,
             applied_dns: Vec::new(),
@@ -1880,7 +1838,6 @@ async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: 
     nh.last_v6_ip = None;
     nh.last_v6_key = None;
     nh.last_link_mtu = 1500;
-    nh.wda_negotiated_ep = None;
     nh.last_applied_sig = None;
     nh.last_resolved_iface = None;
 
@@ -2169,16 +2126,6 @@ async fn bring_up_native_family(
     Ok((cli, hdl, rt))
 }
 
-pub(crate) fn needs_wda_qmapv5_negotiation(fmt: Option<&WdaDataFormat>) -> bool {
-    let Some(f) = fmt else {
-        return true;
-    };
-    f.link_protocol != Some(wda::LINK_PROT_RAW_IP)
-        || f.dl_agg_protocol != Some(wda::AGG_QMAP_V5)
-        || f.ul_agg_protocol != Some(wda::AGG_QMAP_V5)
-        || f.dl_max_size.unwrap_or(0) < 32768
-}
-
 /// Resolve dual-stack cellular link MTU using `.min()` across valid reported `mtu4` / `mtu6`
 /// (`1280..=1500`), defaulting to `1500` only when neither family reports a valid MTU.
 pub(crate) fn resolve_dual_stack_link_mtu(mtu4: Option<u32>, mtu6: Option<u32>) -> u32 {
@@ -2216,13 +2163,11 @@ async fn apply_native_netlink(
         netlink::validate_managed_iface(&iface)?;
         netlink::validate_managed_table(table)?;
         let links = netlink::list_links()?;
-        netlink::ensure_rmnet_ipa_parent_mtu(&links);
         let link = netlink::resolve_rmnet_link(&links, &iface, mux_id)
             .ok_or_else(|| format!("interface {iface} not present in kernel netlink"))?;
         netlink::validate_managed_iface(&link.name)?;
         let resolved_iface = link.name.clone();
         let ifindex = link.ifindex;
-        let _ = netlink::ensure_rmnet_qmapv5_flags(&resolved_iface, ifindex);
         netlink::set_link_up(&resolved_iface, ifindex, true)?;
 
         let mtu4 = v4.as_ref().and_then(|r| r.mtu).filter(|m| (1280..=1500).contains(m));
@@ -2440,19 +2385,28 @@ fn handle_modem_ssr(
     nh.last_v4_ip = None;
     nh.last_v6_ip = None;
     nh.last_v6_key = None;
-    nh.wda_negotiated_ep = None;
 }
 
-async fn flush_conntrack_and_reload_odhcpd(v4_changed: bool, v6_changed: bool) {
-    if v4_changed || v6_changed {
+async fn flush_stale_wan_conntrack_and_reload_odhcpd(
+    prev_v4: Option<&str>,
+    v4_changed: bool,
+    had_prev_v6: bool,
+    v6_changed: bool,
+) {
+    // Only flush conntrack entries bound to a *previous* WAN IPv4 address when the bearer re-IPs;
+    // never run global `conntrack -F` (which drops LAN management SSH sessions!).
+    if v4_changed
+        && let Some(old_ip) = prev_v4
+        && old_ip.parse::<Ipv4Addr>().is_ok()
+    {
         for bin in ["/usr/sbin/conntrack", "/sbin/conntrack"] {
             if Path::new(&crate::paths::p(bin)).exists() {
-                let _ = run(bin, &["-F"], ExecOpts::new(3, 16 * KIB)).await;
+                let _ = run(bin, &["-D", "-q", old_ip], ExecOpts::new(3, 16 * KIB)).await;
                 break;
             }
         }
     }
-    if v6_changed {
+    if had_prev_v6 && v6_changed {
         let odhcpd = "/etc/init.d/odhcpd";
         if Path::new(&crate::paths::p(odhcpd)).exists() {
             let _ = run(odhcpd, &["reload"], ExecOpts::new(5, 16 * KIB)).await;
@@ -2633,48 +2587,6 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     let mut v6_rt = None;
                     let mut had_err = false;
 
-                    let need_wds_start = (cfg.ip_family.wants_v4() && nh.v4_client.is_none())
-                        || (cfg.ip_family.wants_v6() && nh.v6_client.is_none());
-                    let want_ep = (cfg.ep_type, cfg.ep_iface_id);
-                    if need_wds_start
-                        && needs_wda_qmapv5_negotiation(ph.wda_format.as_ref())
-                        && nh.wda_negotiated_ep != Some(want_ep)
-                        && let Some(wda_c) = ensure_probe_client(&mut ph.wda, b, SVC_WDA, "WDA", &ind_tx, Duration::from_secs(3)).await
-                    {
-                        match wda::set_data_format(
-                            wda_c.as_ref(),
-                            wda::LINK_PROT_RAW_IP,
-                            wda::AGG_QMAP_V5,
-                            wda::AGG_QMAP_V5,
-                            64,
-                            32768,
-                            16,
-                            16384,
-                            1,
-                            want_ep,
-                        )
-                        .await
-                        {
-                            Ok(fmt) => {
-                                ph.wda_format = Some(fmt.clone());
-                                ph.wda_ep = Some(want_ep);
-                                snap.wda_format = Some(fmt);
-                                nh.wda_negotiated_ep = Some(want_ep);
-                                state.push_daemon_log(
-                                    "dataplane: negotiated WDA QMAPv5 (dl=64/32768, ul=16/16384, flow_control=1)",
-                                );
-                            }
-                            Err(ref e) if is_transport_err(e) => {
-                                ph.wda = None;
-                                snap.warnings.push(format!("WDA QMAPv5 set_data_format: {e}"));
-                            }
-                            Err(e) => {
-                                nh.wda_negotiated_ep = Some(want_ep);
-                                snap.warnings.push(format!("WDA QMAPv5 set_data_format: {e}"));
-                            }
-                        }
-                    }
-
                     if cfg.ip_family.wants_v4() {
                         if let Some(cli) = nh.v4_client.clone().filter(|c| c.is_alive()) {
                             if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
@@ -2808,6 +2720,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                         match apply_native_netlink(&cfg, v4_rt.as_ref(), v6_rt.as_ref(), apply_v4, apply_v6).await {
                             Ok(applied) => {
+                                let prev_v4_for_ct = nh.last_v4_ip.clone();
+                                let had_prev_v6 = nh.last_v6_key.is_some();
                                 snap.netlink_updates += 1;
                                 let resolved_iface = applied.resolved_iface.clone();
                                 nh.last_link_mtu = applied.link_mtu;
@@ -2823,7 +2737,13 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 nh.last_applied_sig = Some(cur_sig);
                                 nh.last_resolved_iface = Some(resolved_iface.clone());
 
-                                flush_conntrack_and_reload_odhcpd(v4_changed, v6_changed).await;
+                                flush_stale_wan_conntrack_and_reload_odhcpd(
+                                    prev_v4_for_ct.as_deref(),
+                                    v4_changed,
+                                    had_prev_v6,
+                                    v6_changed,
+                                )
+                                .await;
 
                                 if cfg.kernel_tuning == KernelTuningProfile::HighThroughput {
                                     let tune_if = resolved_iface.clone();
@@ -3786,23 +3706,6 @@ mod tests {
         assert_eq!(resolve_dual_stack_link_mtu(None, None), 1500);
         assert_eq!(resolve_dual_stack_link_mtu(Some(0), Some(0)), 1500);
 
-        // WDA QMAPv5 negotiation check
-        assert!(needs_wda_qmapv5_negotiation(None));
-        assert!(needs_wda_qmapv5_negotiation(Some(&WdaDataFormat {
-            link_protocol: Some(wda::LINK_PROT_RAW_IP),
-            ul_agg_protocol: Some(wda::AGG_QMAP_V5),
-            dl_agg_protocol: Some(wda::AGG_QMAP_V5),
-            dl_max_size: Some(16384),
-            ..Default::default()
-        })));
-        assert!(!needs_wda_qmapv5_negotiation(Some(&WdaDataFormat {
-            link_protocol: Some(wda::LINK_PROT_RAW_IP),
-            ul_agg_protocol: Some(wda::AGG_QMAP_V5),
-            dl_agg_protocol: Some(wda::AGG_QMAP_V5),
-            dl_max_size: Some(32768),
-            ..Default::default()
-        })));
-
         let chain_with_handles = concat!(
             "table inet fw4 {\n",
             "\tchain accept_to_wan {\n",
@@ -3869,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_eth0_msi_irqs_alternating_across_cpu2_and_cpu3_masks() {
+    fn pins_eth0_msi_irqs_to_cpu2_3_via_smp_affinity_list() {
         let sbx = crate::paths::TestSandbox::new("eth0_irqs");
         sbx.write(
             "/proc/interrupts",
@@ -3879,28 +3782,14 @@ mod tests {
                 " 45:          0       9000          0          0   GICv3 210 Level     gsi\n",
                 " 81:          0          0       5000          0   PCI-MSI 524288 Edge      eth0-0\n",
                 " 82:          0          0       4000          0   PCI-MSI 524289 Edge      eth0-1\n",
-                " 83:          0          0       3000          0   PCI-MSI 524290 Edge      eth0-2\n",
-                " 84:          0          0       2000          0   PCI-MSI 524291 Edge      eth0-3\n",
             ),
         );
-        let p81 = sbx.write("/proc/irq/81/smp_affinity", "f\n");
-        let p82 = sbx.write("/proc/irq/82/smp_affinity", "f\n");
-        let p83 = sbx.write("/proc/irq/83/smp_affinity", "f\n");
-        let p84 = sbx.write("/proc/irq/84/smp_affinity", "f\n");
+        let p81 = sbx.write("/proc/irq/81/smp_affinity_list", "0-3\n");
+        let p82 = sbx.write("/proc/irq/82/smp_affinity_list", "0-3\n");
 
-        let assigned = pin_eth0_irqs_alternating();
-        assert_eq!(
-            assigned,
-            vec![
-                ("81".into(), "4"),
-                ("82".into(), "8"),
-                ("83".into(), "4"),
-                ("84".into(), "8"),
-            ]
-        );
-        assert_eq!(fs::read_to_string(p81).unwrap().trim(), "4");
-        assert_eq!(fs::read_to_string(p82).unwrap().trim(), "8");
-        assert_eq!(fs::read_to_string(p83).unwrap().trim(), "4");
-        assert_eq!(fs::read_to_string(p84).unwrap().trim(), "8");
+        let assigned = pin_eth0_irqs_to_cpu2_3();
+        assert_eq!(assigned, vec![("81".into(), "2-3"), ("82".into(), "2-3")]);
+        assert_eq!(fs::read_to_string(p81).unwrap().trim(), "2-3");
+        assert_eq!(fs::read_to_string(p82).unwrap().trim(), "2-3");
     }
 }

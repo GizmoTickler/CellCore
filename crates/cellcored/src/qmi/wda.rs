@@ -77,7 +77,7 @@ pub async fn get_data_format(
     Ok(parse_data_format_resp(&tlvs))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn set_data_format(
     client: &dyn QmiClient,
     link_protocol: u32,

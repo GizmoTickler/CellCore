@@ -45,16 +45,6 @@ const IFLA_LINKINFO_ATTR: u16 = 18;
 const IFLA_INFO_KIND_ATTR: u16 = 1;
 const IFLA_INFO_DATA_ATTR: u16 = 2;
 const IFLA_RMNET_MUX_ID_ATTR: u16 = 1;
-pub const IFLA_RMNET_FLAGS_ATTR: u16 = 2;
-
-pub const RMNET_FLAGS_INGRESS_DEAGGREGATION: u32 = 1 << 0;
-pub const RMNET_FLAGS_INGRESS_MAP_COMMANDS: u32 = 1 << 1;
-pub const RMNET_FLAGS_INGRESS_MAP_CKSUMV5: u32 = 1 << 4;
-pub const RMNET_FLAGS_EGRESS_MAP_CKSUMV5: u32 = 1 << 5;
-pub const RMNET_QMAPV5_FLAGS: u32 = RMNET_FLAGS_INGRESS_DEAGGREGATION
-    | RMNET_FLAGS_INGRESS_MAP_COMMANDS
-    | RMNET_FLAGS_INGRESS_MAP_CKSUMV5
-    | RMNET_FLAGS_EGRESS_MAP_CKSUMV5;
 
 const IFA_ADDRESS_ATTR: u16 = 1;
 const IFA_LOCAL_ATTR: u16 = 2;
@@ -680,16 +670,8 @@ pub fn get_iface_ipv4(name: &str) -> Option<Ipv4Addr> {
         .find_map(|a| a.address.parse::<Ipv4Addr>().ok())
 }
 
-/// Encode `struct ifla_rmnet_flags { u32 flags; u32 mask; }` for `IFLA_RMNET_FLAGS`.
-pub(crate) fn encode_rmnet_flags(flags: u32, mask: u32) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[0..4].copy_from_slice(&flags.to_ne_bytes());
-    out[4..8].copy_from_slice(&mask.to_ne_bytes());
-    out
-}
-
-/// Build a pure-Rust `RTM_NEWLINK` message creating `<iface>@<parent>` with `kind="rmnet"`,
-/// `mux_id`, and `IFLA_RMNET_FLAGS` enabling QMAPv5 deaggregation, MAP commands, and CKSUMV5.
+/// Build a pure-Rust `RTM_NEWLINK` message creating `<iface>@<parent>` with `kind="rmnet"` and `mux_id`,
+/// preserving Qualcomm IPA's factory-initialized parent MTU and `rmnet` hardware offload flags untouched.
 pub(crate) fn build_create_rmnet_link_msg(parent_ifindex: i32, iface: &str, mux_id: u16) -> Vec<u8> {
     let msg = IfInfoMsg {
         ifi_family: libc::AF_UNSPEC as u8,
@@ -716,11 +698,6 @@ pub(crate) fn build_create_rmnet_link_msg(parent_ifindex: i32, iface: &str, mux_
 
     let mut info_data = Vec::new();
     push_attr_bytes(&mut info_data, IFLA_RMNET_MUX_ID_ATTR, &mux_id.to_ne_bytes());
-    push_attr_bytes(
-        &mut info_data,
-        IFLA_RMNET_FLAGS_ATTR,
-        &encode_rmnet_flags(RMNET_QMAPV5_FLAGS, RMNET_QMAPV5_FLAGS),
-    );
 
     let mut link_info = Vec::new();
     push_attr_bytes(&mut link_info, IFLA_INFO_KIND_ATTR, b"rmnet\0");
@@ -728,71 +705,6 @@ pub(crate) fn build_create_rmnet_link_msg(parent_ifindex: i32, iface: &str, mux_
 
     b.push_attr(IFLA_LINKINFO_ATTR | NLA_F_NESTED_BIT, &link_info);
     b.finish()
-}
-
-/// Build an `RTM_NEWLINK` update enabling QMAPv5 `IFLA_RMNET_FLAGS` on an existing `rmnet` link.
-pub(crate) fn build_update_rmnet_flags_msg(ifindex: i32, flags: u32, mask: u32) -> Vec<u8> {
-    let msg = IfInfoMsg {
-        ifi_family: libc::AF_UNSPEC as u8,
-        _pad: 0,
-        ifi_type: 0,
-        ifi_index: ifindex,
-        ifi_flags: 0,
-        ifi_change: 0,
-    };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(&msg as *const IfInfoMsg as *const u8, mem::size_of::<IfInfoMsg>())
-    };
-    let mut b = NlBuilder::new(RTM_NEWLINK_OP, NLM_F_REQUEST_BIT | NLM_F_ACK_BIT, 23, bytes);
-    let mut info_data = Vec::new();
-    push_attr_bytes(&mut info_data, IFLA_RMNET_FLAGS_ATTR, &encode_rmnet_flags(flags, mask));
-    let mut link_info = Vec::new();
-    push_attr_bytes(&mut link_info, IFLA_INFO_KIND_ATTR, b"rmnet\0");
-    push_attr_bytes(&mut link_info, IFLA_INFO_DATA_ATTR | NLA_F_NESTED_BIT, &info_data);
-    b.push_attr(IFLA_LINKINFO_ATTR | NLA_F_NESTED_BIT, &link_info);
-    b.finish()
-}
-
-/// Build an `RTM_NEWLINK` message raising `rmnet_ipa0` parent MTU (`32768` or `9216`) for QMAPv5 super-frames.
-pub(crate) fn build_parent_mtu_msg(ifindex: i32, mtu: u32) -> Vec<u8> {
-    let msg = IfInfoMsg {
-        ifi_family: libc::AF_UNSPEC as u8,
-        _pad: 0,
-        ifi_type: 0,
-        ifi_index: ifindex,
-        ifi_flags: 0,
-        ifi_change: 0,
-    };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(&msg as *const IfInfoMsg as *const u8, mem::size_of::<IfInfoMsg>())
-    };
-    let mut b = NlBuilder::new(RTM_NEWLINK_OP, NLM_F_REQUEST_BIT | NLM_F_ACK_BIT, 24, bytes);
-    b.push_u32(IFLA_MTU_ATTR, mtu);
-    b.finish()
-}
-
-/// Ensure `rmnet_ipa0` parent interface MTU is at least `32768` (or `9216` fallback) so
-/// aggregated QMAPv5 DL super-frames are never dropped at the IPA RX boundary.
-pub fn ensure_rmnet_ipa_parent_mtu(links: &[NetlinkLink]) {
-    let Some(parent) = links.iter().find(|l| l.name == "rmnet_ipa0") else {
-        return;
-    };
-    if parent.mtu >= 32768 {
-        return;
-    }
-    if send_recv_netlink(&build_parent_mtu_msg(parent.ifindex, 32768)).is_ok() {
-        return;
-    }
-    if parent.mtu < 9216 {
-        let _ = send_recv_netlink(&build_parent_mtu_msg(parent.ifindex, 9216));
-    }
-}
-
-/// Ensure QMAPv5 `IFLA_RMNET_FLAGS` (`DEAGG | MAP_COMMANDS | CKSUMV5`) are set on a managed `rmnet` link.
-pub fn ensure_rmnet_qmapv5_flags(iface: &str, ifindex: i32) -> Result<(), String> {
-    validate_managed_iface(iface)?;
-    let req = build_update_rmnet_flags_msg(ifindex, RMNET_QMAPV5_FLAGS, RMNET_QMAPV5_FLAGS);
-    send_recv_netlink(&req).map(|_| ())
 }
 
 /// Build a pure-Rust `RTM_DELLINK` message for `ifindex`.
@@ -824,9 +736,7 @@ pub fn create_rmnet_link(parent_iface: &str, iface: &str, mux_id: u16) -> Result
         return Err(format!("invalid rmnet mux_id {mux_id} (expected 1..=254)"));
     }
     let links = list_links()?;
-    ensure_rmnet_ipa_parent_mtu(&links);
     if let Some(existing) = links.iter().find(|l| l.name == iface).cloned() {
-        let _ = ensure_rmnet_qmapv5_flags(&existing.name, existing.ifindex);
         return Ok((existing, false));
     }
     let parent = links
@@ -1411,21 +1321,6 @@ mod tests {
         let id_attrs = parse_attrs(info_data_val);
         let mux_val = id_attrs.iter().find(|(t, _)| *t == IFLA_RMNET_MUX_ID_ATTR).unwrap().1;
         assert_eq!(u16::from_ne_bytes(mux_val.try_into().unwrap()), 1);
-        let flags_val = id_attrs.iter().find(|(t, _)| *t == IFLA_RMNET_FLAGS_ATTR).unwrap().1;
-        assert_eq!(flags_val.len(), 8);
-        let flags = u32::from_ne_bytes(flags_val[0..4].try_into().unwrap());
-        let mask = u32::from_ne_bytes(flags_val[4..8].try_into().unwrap());
-        let expected_flags = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 5);
-        assert_eq!(flags, expected_flags);
-        assert_eq!(mask, expected_flags);
-        assert_eq!(RMNET_QMAPV5_FLAGS, expected_flags);
-
-        let upd = build_update_rmnet_flags_msg(17, RMNET_QMAPV5_FLAGS, RMNET_QMAPV5_FLAGS);
-        assert_eq!(u16::from_ne_bytes(upd[4..6].try_into().unwrap()), RTM_NEWLINK_OP);
-        let parent_mtu = build_parent_mtu_msg(9, 32768);
-        let pm_attrs = parse_attrs(&parent_mtu[nl_hdr_len + if_hdr_len..]);
-        let pm_val = pm_attrs.iter().find(|(t, _)| *t == IFLA_MTU_ATTR).unwrap().1;
-        assert_eq!(u32::from_ne_bytes(pm_val.try_into().unwrap()), 32768);
 
         let del = build_delete_link_msg(17);
         assert_eq!(u32::from_ne_bytes(del[0..4].try_into().unwrap()) as usize, del.len());

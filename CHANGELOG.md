@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1 — Preserve Hardware IPAv5 / `ioss` Ring Config & Late `START=95` Init Ordering
+
+- **Preserve Qualcomm IPAv5 + `ioss` Hardware Offload Ring Parameters (`dataplane.rs`, `netlink.rs`):**
+  - Removed live `WDA_SET_DATA_FORMAT` (`dl_max_size=32768`), `rmnet_ipa0` `32768` parent MTU override, and `IFLA_RMNET_FLAGS` (`CKSUMV5`) mutations on SDX75 Embedded IPA endpoints (`rmnet_ipa0` + `r8125` `ioss`), preserving Qualcomm's boot-initialized IPA GSI ring sizes that faulted when mutated on an active hardware pipe.
+  - Restored software-only `ethtool -K` GRO forwarding flags (`rx-gro-list on`, `rx-udp-gro-forwarding on`) and `smp_affinity_list` (`2-3`) so `r8125` + `ioss` DMA rings are never reset at runtime.
+  - Scoped `conntrack` cleanup on WAN re-IP to `conntrack -D -q <old_wan_ip>` (only when a previous WAN IP rotates, never global `conntrack -F` on initial attach) so LAN SSH sessions are never dropped during upgrades.
+  - Moved `/etc/init.d/cellcored` from `START=14` to `START=95` (`STOP=15`) so `network`, `dnsmasq`, and `dropbear` always start before `cellcored` on boot.
+
 ## 1.4.0 — Resiliency & Dead-Man's-Switch, QMAPv5/IRQ Dataplane Offloads, Proactive Alerts & Flash Longevity
 
 - **Resiliency & Autonomous Self-Healing (`telemetry.rs`, `profiles.rs`, `smd.rs`, `ipc.rs`, `reconcile.rs`, `main.rs`):**
