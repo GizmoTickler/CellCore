@@ -322,6 +322,8 @@ pub struct AntennaAlignState {
     pub nr5g_cqi: Option<i32>,
     pub ta_meters: Option<i64>,
     pub mimo_layers: Vec<CarrierMimoLayer>,
+    #[serde(skip)]
+    pub last_chain_ms: [u64; 4],
 }
 
 impl Default for AntennaAlignState {
@@ -358,8 +360,19 @@ impl Default for AntennaAlignState {
             nr5g_cqi: None,
             ta_meters: None,
             mimo_layers: Vec::new(),
+            last_chain_ms: [0; 4],
         }
     }
+}
+
+pub fn sanitize_antenna_label(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn default_cell_lock_deadman_enabled() -> bool {
@@ -416,6 +429,8 @@ pub struct DaemonSettings {
     pub preferred_sim_slot: u8,
     #[serde(default = "default_sim_failback_mins")]
     pub sim_failback_mins: u64,
+    #[serde(default)]
+    pub antenna_labels: [String; 4],
 }
 
 impl Default for DaemonSettings {
@@ -456,6 +471,7 @@ impl Default for DaemonSettings {
             cell_lock_deadman_secs: default_cell_lock_deadman_secs(),
             preferred_sim_slot: 0,
             sim_failback_mins: default_sim_failback_mins(),
+            antenna_labels: Default::default(),
         }
     }
 }
@@ -1347,5 +1363,14 @@ mod tests {
         // volatile paths and persistent *content* are not persistent writes
         let volatile = "fn f(config: &str) {\n    let src = crate::paths::p(&format!(\"/etc/config/{config}\"));\n    let body = std::fs::read(&src).unwrap();\n    let tmp = format!(\"/tmp/{config}\");\n    let _ = std::fs::write(&tmp, body);\n}\n";
         assert!(scan(volatile).is_empty(), "{:?}", scan(volatile));
+    }
+
+    #[test]
+    fn sanitize_antenna_label_trims_strips_ctrl_and_caps_len() {
+        assert_eq!(super::sanitize_antenna_label("  Jack 1 · Far Left \n\t "), "Jack 1 · Far Left");
+        let long = "A".repeat(60);
+        assert_eq!(super::sanitize_antenna_label(&long).len(), 32);
+        let cfg: super::DaemonSettings = serde_json::from_str("{}").expect("empty json defaults");
+        assert_eq!(cfg.antenna_labels, ["", "", "", ""]);
     }
 }

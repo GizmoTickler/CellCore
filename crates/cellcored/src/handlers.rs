@@ -1800,6 +1800,8 @@ pub struct AlignReq {
     #[serde(default)]
     reset_peaks: bool,
     #[serde(default)]
+    reset_chain: Option<u8>,
+    #[serde(default)]
     keep_awake: Option<bool>,
 }
 
@@ -1826,6 +1828,16 @@ pub async fn post_antenna_align(State(ctx): State<HttpCtx>, Json(body): Json<Ali
             a.peak_mean_rsrp = None;
             a.peak_mean_sinr = None;
             a.samples = 0;
+        } else if let Some(ch) = body.reset_chain
+            && (ch as usize) < 4
+        {
+            let idx = ch as usize;
+            if idx < a.peak_rsrp.len() {
+                a.peak_rsrp[idx] = a.rsrp.get(idx).copied().flatten();
+            }
+            if idx < a.peak_sinr.len() {
+                a.peak_sinr[idx] = a.sinr.get(idx).copied().flatten();
+            }
         }
         a.clone()
     };
@@ -3819,6 +3831,7 @@ pub struct SettingsReq {
     temperature_unit: Option<String>,
     measurement_unit: Option<String>,
     https_redirect: Option<bool>,
+    antenna_labels: Option<[String; 4]>,
 }
 
 pub async fn post_settings(State(ctx): State<HttpCtx>, Json(body): Json<SettingsReq>) -> Response {
@@ -3835,6 +3848,9 @@ pub async fn post_settings(State(ctx): State<HttpCtx>, Json(body): Json<Settings
     }
     if let Some(r) = body.https_redirect {
         s.https_redirect = r;
+    }
+    if let Some(labels) = body.antenna_labels {
+        s.antenna_labels = labels.map(|l| crate::state::sanitize_antenna_label(&l));
     }
     let _ = fs::create_dir_all(crate::paths::p(ETC_QM_DIR));
     let _ = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600);

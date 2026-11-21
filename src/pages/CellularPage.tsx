@@ -8,6 +8,7 @@ import { useSubRoute } from "../stores/route-store";
 import { useToastStore } from "../stores/toast-store";
 import type {
   AntennaAlignState,
+  DaemonSettings,
   MbnProfile,
   NeighborCellInfo,
   QuecProfileItem,
@@ -68,6 +69,8 @@ export function CellularPage() {
   const [confirmLink, setConfirmLink] = useState<null | "bands" | "nr" | "lte">(null);
 
   const modem = useWsStore((s) => s.modem);
+  const settings = useWsStore((s) => s.settings);
+  const setSettings = useWsStore((s) => s.setSettings);
   const antennaAlign = useWsStore((s) => s.antennaAlign);
   const setAntennaAlign = useWsStore((s) => s.setAntennaAlign);
   const sendWsCommand = useWsStore((s) => s.sendWsCommand);
@@ -172,23 +175,20 @@ export function CellularPage() {
 
   const [resetSeq, setResetSeq] = useState(0);
   const keepAwake = Boolean(antennaAlign?.keepAwake);
+  const userKeepAwakeRef = useRef<boolean | null>(null);
   const keepAwakeRef = useRef(keepAwake);
   keepAwakeRef.current = keepAwake;
 
-  // Activate 400 ms high-rate Antenna Alignment polling when on "align" tab, renew 300s lease every 120s, and clean up on exit/unmount
+  // Activate 400 ms high-rate Antenna Alignment polling when on "align" tab (auto-enabling 4x4 RX keep-awake unless explicitly turned off), renew 300s lease every 120s, and clean up on exit/unmount
   useEffect(() => {
     if (tab !== "align") return;
     let active = true;
     sendWsCommand({ action: "set_fast_rf", enabled: true });
-    void apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align")
-      .then((res) => {
-        if (active && res.align) setAntennaAlign(res.align);
-      })
-      .catch(() => {});
     const renew = () => {
+      const wantAwake = userKeepAwakeRef.current ?? true;
       void apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
         method: "POST",
-        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: keepAwakeRef.current }),
+        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: wantAwake }),
       })
         .then((res) => {
           if (active && res.align) setAntennaAlign(res.align);
@@ -533,7 +533,28 @@ export function CellularPage() {
       });
       if (res.align) setAntennaAlign(res.align);
       setResetSeq((n) => n + 1);
-      notify("ok", "Peaks reset");
+      notify("ok", "All peaks reset");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Reset failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resetAlignChainPeak(chainIdx: number) {
+    setBusy("align-reset");
+    try {
+      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
+        method: "POST",
+        body: JSON.stringify({
+          active: true,
+          resetPeaks: false,
+          resetChain: chainIdx,
+          keepAwake: keepAwakeRef.current,
+        }),
+      });
+      if (res.align) setAntennaAlign(res.align);
+      notify("ok", `RX${chainIdx} peak reset`);
     } catch (e) {
       notify("err", e instanceof Error ? e.message : "Reset failed");
     } finally {
@@ -542,6 +563,7 @@ export function CellularPage() {
   }
 
   async function toggleAlignKeepAwake(next: boolean) {
+    userKeepAwakeRef.current = next;
     setBusy("align-awake");
     try {
       const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
@@ -549,9 +571,25 @@ export function CellularPage() {
         body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: next }),
       });
       if (res.align) setAntennaAlign(res.align);
-      notify("ok", next ? "Keep 4×4 RX Awake enabled (64 KiB DL keep-alive)" : "Keep 4×4 RX Awake disabled");
+      notify("ok", next ? "4×4 RX Awake enabled" : "4×4 RX Awake paused");
     } catch (e) {
       notify("err", e instanceof Error ? e.message : "Failed toggling keep-awake");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveAntennaLabels(labels: [string, string, string, string]) {
+    setBusy("align-labels");
+    try {
+      const res = await apiFetch<{ status: string; settings?: DaemonSettings }>("/api/v1/system/settings", {
+        method: "POST",
+        body: JSON.stringify({ antennaLabels: labels }),
+      });
+      if (res.settings) setSettings(res.settings);
+      notify("ok", "Saved antenna jack labels");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Failed saving labels");
     } finally {
       setBusy(null);
     }
@@ -776,6 +814,9 @@ export function CellularPage() {
           onToggleKeepAwake={(next) => void toggleAlignKeepAwake(next)}
           busy={busy}
           onResetPeaks={() => void resetAlignPeaks()}
+          onResetChainPeak={(idx) => void resetAlignChainPeak(idx)}
+          antennaLabels={settings?.antennaLabels}
+          onSaveAntennaLabels={(labels) => void saveAntennaLabels(labels)}
         />
       )}
 

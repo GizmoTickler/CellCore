@@ -420,6 +420,7 @@ export function OverviewPage() {
           <div className="space-y-4">
             {[0, 1, 2, 3].map((i) => {
               const role = (["PRX · TX0", "DRX", "MIMO · TX1", "MIMO"] as const)[i];
+              const jackLabel = settings?.antennaLabels?.[i]?.trim() || "";
               const rsrp = mimo.rsrp[i];
               const q = signalQuality(rsrp, mimo.sinr[i]);
               const active = rsrp != null;
@@ -431,6 +432,11 @@ export function OverviewPage() {
                       <span className="rounded-md border border-line bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] font-semibold tracking-tight text-ink-2">
                         {role}
                       </span>
+                      {jackLabel && (
+                        <span className="rounded-md bg-ember-soft px-1.5 py-0.5 text-[10.5px] font-semibold text-ember-ink">
+                          {jackLabel}
+                        </span>
+                      )}
                       <span className="ml-0.5 text-[12px] font-medium text-muted">{active ? `SINR ${mimo.sinr[i] ?? "—"} dB` : "idle"}</span>
                     </span>
                     <span className={cn("text-[14px] font-bold qm-tabular shrink-0", active ? "text-ink" : "text-muted")}>{active ? `${rsrp} dBm` : "—"}</span>

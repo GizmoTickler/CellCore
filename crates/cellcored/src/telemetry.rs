@@ -48,11 +48,12 @@ static ALIGN_KEEP_AWAKE_SEQ: AtomicU64 = AtomicU64::new(1);
 static ALIGN_KEEP_AWAKE_INFLIGHT: AtomicBool = AtomicBool::new(false);
 static ALIGN_BEAM_ID_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
-const ALIGN_KEEP_AWAKE_INTERVAL_MS: u64 = 1800;
+const ALIGN_KEEP_AWAKE_INTERVAL_MS: u64 = 1000;
 const ALIGN_KEEP_AWAKE_HOST: &str = "speed.cloudflare.com";
 const ALIGN_KEEP_AWAKE_PORT: u16 = 80;
-const ALIGN_KEEP_AWAKE_PATH: &str = "/__down?bytes=65536";
+const ALIGN_KEEP_AWAKE_PATH: &str = "/__down?bytes=32768";
 const ALIGN_KEEP_AWAKE_MAX_BODY: usize = 256 * 1024;
+const ALIGN_SECONDARY_HOLD_MS: u64 = 2500;
 
 pub const DATA_USAGE_PATH: &str = "/etc/cellcore/data_usage.json";
 pub const DATA_USAGE_TMP_PATH: &str = "/tmp/cellcore/data_usage.json";
@@ -1839,15 +1840,36 @@ async fn poll_antenna_alignment(state: &AppState) {
     };
 
     let mut a = state.antenna_align.write().await;
+    let now_mono = mono_ms();
     let has_new_rsrp = mimo.rsrp.iter().any(|v| v.is_some());
     if has_new_rsrp {
-        a.rsrp = mimo.rsrp.clone();
-    }
-    if mimo.rsrq.iter().any(|v| v.is_some()) {
-        a.rsrq = mimo.rsrq.clone();
-    }
-    if mimo.sinr.iter().any(|v| v.is_some()) {
-        a.sinr = mimo.sinr.clone();
+        if a.rsrp.len() < 4 {
+            a.rsrp.resize(4, None);
+        }
+        if a.rsrq.len() < 4 {
+            a.rsrq.resize(4, None);
+        }
+        if a.sinr.len() < 4 {
+            a.sinr.resize(4, None);
+        }
+        for i in 0..4 {
+            let cur_r = mimo.rsrp.get(i).copied().flatten();
+            let cur_q = mimo.rsrq.get(i).copied().flatten();
+            let cur_s = mimo.sinr.get(i).copied().flatten();
+            if let Some(r) = cur_r {
+                a.rsrp[i] = Some(r);
+                a.rsrq[i] = cur_q;
+                a.sinr[i] = cur_s;
+                a.last_chain_ms[i] = now_mono;
+            } else if !a.keep_awake
+                || a.last_chain_ms[i] == 0
+                || now_mono.saturating_sub(a.last_chain_ms[i]) > ALIGN_SECONDARY_HOLD_MS
+            {
+                a.rsrp[i] = None;
+                a.rsrq[i] = None;
+                a.sinr[i] = None;
+            }
+        }
     }
     for i in 0..4 {
         if let Some(cur) = mimo.rsrp.get(i).copied().flatten() {
@@ -2599,6 +2621,8 @@ async fn connect_keepalive_stream(
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
             }
+        } else {
+            let _ = bind_socket_to_cellular_wan(sock.as_raw_fd(), addr.ip().is_loopback());
         }
         match tokio::time::timeout_at(deadline, sock.connect(addr)).await {
             Ok(Ok(stream)) => {

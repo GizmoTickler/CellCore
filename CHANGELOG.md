@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0 — Painless Per-Antenna Solo Aiming, Laptop Audio + Voice Readout & Guided Port Identifier
+
+- **Per-Antenna Solo Focus Mode (`AlignView.tsx`, `CellularPage.tsx`, `handlers.rs`):**
+  - Added 1-tap target selector (`All 4` vs solo `RX0` / `RX1` / `RX2` / `RX3`, plus click-to-solo on any antenna card and keyboard shortcuts `0`–`4`, `N`, `R`, `M`) with an across-the-room hero RSRP/SINR readout, per-antenna rolling 36 s history, `Prev / Next Antenna` stepping, and isolated single-chain peak reset (`resetChain` in `POST /api/v1/cellular/align`).
+- **Fixed Laptop Web Audio + Hands-Free Offline Voice Readout (`AlignView.tsx`):**
+  - Replaced the quiet `-29 dBFS` pure sine generator with a `DynamicsCompressorNode`-backed audible `triangle` + octave overtone synthesizer (`Tone` mode, dynamically scaled to a 20 dB live window around peak for crisp 1 dB pitch resolution), percussive `Geiger` clicks, synchronous user-gesture `AudioContext` unlock + `Test Sound` chime, 3-step volume control, and a new offline **`Voice`** mode (`window.speechSynthesis`) that speaks live RSRP and peaks out loud while hands are occupied.
+- **Guided `"Identify Jacks"` Port-Mapping Wizard & Device-Persisted Labels (`AlignView.tsx`, `OverviewPage.tsx`, `state.rs`, `handlers.rs`):**
+  - Added an interactive port-identification wizard that detects `≥4.5 dB` single-chain RSRP deltas when touching/loosening an antenna, 1-click hardware presets (including verified Quectel `RM551E-GL` sequential `Far Left=RX0, Ctr Left=RX2, Ctr Right=RX3, Far Right=RX1`), and persistent `antennaLabels` in `/etc/cellcore/config.json` displayed on both `Overview` and `Aim`.
+- **Auto-Wake 4×4 MIMO RX & Glitch-Free Secondary Chain Hold (`telemetry.rs`, `CellularPage.tsx`):**
+  - Automatically enables `4×4 RX Awake` (`1 Hz` `32 KiB` `SO_BINDTODEVICE` keep-alive burst) on entering `Aim` and holds secondary `RX2`/`RX3` readings across brief `<2.5 s` RRC transitions so secondary chains never flicker `—` mid-adjustment.
+
 ## 1.4.3 — Boot-Safe Dropbear Firewall Hardening (`Interface` Unset) & Dangling `ffs.adb` USB Fix
 
 - **Eliminate OpenWrt `S19dropbear` `Interface='lan'` `BOOT=1` Lockout Vector (`hardening.rs`, `dropbear-lan-watchdog`):**

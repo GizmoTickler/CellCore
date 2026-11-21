@@ -443,6 +443,7 @@ export interface DaemonSettings {
   cellLockNr5g: string;
   cellLockLtePersist: boolean;
   cellLockNr5gPersist: boolean;
+  antennaLabels?: string[];
 }
 
 /**
