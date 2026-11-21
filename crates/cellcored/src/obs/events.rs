@@ -36,10 +36,15 @@ pub enum EventKind {
     SmsReceived,
     /// WARP / Tailscale routing changes and tunnel fail-back.
     Vpn,
+    AntennaDegraded,
+    ThermalThrottle,
+    SarBackoff,
+    AirCipherNull,
+    ModemSsr,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 21] = [
+    pub const ALL: [EventKind; 26] = [
         EventKind::Handover,
         EventKind::BandChange,
         EventKind::RatChange,
@@ -61,6 +66,11 @@ impl EventKind {
         EventKind::StandbyLeak,
         EventKind::SmsReceived,
         EventKind::Vpn,
+        EventKind::AntennaDegraded,
+        EventKind::ThermalThrottle,
+        EventKind::SarBackoff,
+        EventKind::AirCipherNull,
+        EventKind::ModemSsr,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -86,6 +96,11 @@ impl EventKind {
             EventKind::StandbyLeak => "standby_leak",
             EventKind::SmsReceived => "sms_received",
             EventKind::Vpn => "vpn",
+            EventKind::AntennaDegraded => "antenna_degraded",
+            EventKind::ThermalThrottle => "thermal_throttle",
+            EventKind::SarBackoff => "sar_backoff",
+            EventKind::AirCipherNull => "air_cipher_null",
+            EventKind::ModemSsr => "modem_ssr",
         }
     }
 
@@ -108,6 +123,10 @@ impl EventKind {
                 | EventKind::OtaInstall
                 | EventKind::SmsReceived
                 | EventKind::Vpn
+                | EventKind::AntennaDegraded
+                | EventKind::ThermalThrottle
+                | EventKind::AirCipherNull
+                | EventKind::ModemSsr
         )
     }
 }
@@ -237,6 +256,11 @@ pub struct RadioView {
     /// Bearer addresses (v4 and v6) across active bearers.
     pub bearer_ips: BTreeSet<String>,
     pub public_ip: Option<String>,
+    /// Per-chain RSRP (dBm) across RX0..RX3 (`None` when absent/sentinel).
+    pub chain_rsrp: Vec<Option<f64>>,
+    pub any_throttling: Option<bool>,
+    pub sar_rf_state: Option<u32>,
+    pub null_cipher_alert: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -273,6 +297,16 @@ impl RadioView {
                 .filter(|ip| !ip.is_empty() && ip != "0.0.0.0" && ip != "::")
                 .collect(),
             public_ip: m.public_ip.clone().filter(|ip| !ip.is_empty()),
+            chain_rsrp: m
+                .mimo
+                .rsrp
+                .iter()
+                .take(4)
+                .map(|v| v.filter(|x| x.is_finite() && *x != -140.0 && *x != -32768.0))
+                .collect(),
+            any_throttling: None,
+            sar_rf_state: None,
+            null_cipher_alert: None,
         }
     }
 
@@ -344,6 +378,13 @@ pub struct SnapshotDetector {
     scc: Confirm<BTreeSet<(String, i64)>>,
     bearers: Confirm<BTreeSet<String>>,
     public_ip: Option<String>,
+    saw_multi_chain: bool,
+    antenna_degraded_streak: u32,
+    antenna_healthy_streak: u32,
+    antenna_degraded_active: bool,
+    throttling_active: bool,
+    last_sar_backoff: u32,
+    null_cipher_active: bool,
 }
 
 fn cell_label(s: &ServingView) -> String {
@@ -414,6 +455,62 @@ impl SnapshotDetector {
             self.cell = Some(cur.clone());
         }
 
+        // Antenna chain health (3 consecutive RRC-connected/active snapshots).
+        if let Some(cur) = v.serving.as_ref().filter(|_| v.registered() == Some(true)) {
+            let present: Vec<f64> = v
+                .chain_rsrp
+                .iter()
+                .take(4)
+                .filter_map(|x| *x)
+                .filter(|x| x.is_finite())
+                .collect();
+            let active_chains = present.len();
+            if active_chains >= 2 {
+                self.saw_multi_chain = true;
+            }
+            if cur.state == "CONNECT" && active_chains >= 1 {
+                let rat_up = cur.rat.to_ascii_uppercase();
+                let is_nr_or_lte = rat_up.contains("NR5G") || rat_up.contains("LTE");
+                let spread_db = (active_chains >= 2).then(|| {
+                    let hi = present.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let lo = present.iter().copied().fold(f64::INFINITY, f64::min);
+                    ((hi - lo) * 10.0).round() / 10.0
+                });
+                let spread_bad = spread_db.is_some_and(|sp| sp > 13.0);
+                let single_chain_drop = active_chains == 1 && is_nr_or_lte && self.saw_multi_chain;
+                if spread_bad || single_chain_drop {
+                    self.antenna_degraded_streak += 1;
+                    self.antenna_healthy_streak = 0;
+                    if !self.antenna_degraded_active && self.antenna_degraded_streak >= 3 {
+                        self.antenna_degraded_active = true;
+                        let title = if let Some(sp) = spread_db.filter(|&s| s > 13.0) {
+                            format!("Antenna RSRP imbalance ({sp:.1} dB spread across {active_chains} chains)")
+                        } else {
+                            format!("MIMO degraded to single receive chain on {}", cur.rat)
+                        };
+                        out.push(det(
+                            EventKind::AntennaDegraded,
+                            Severity::Warning,
+                            title,
+                            serde_json::json!({
+                                "activeChains": active_chains,
+                                "rsrpSpreadDb": spread_db,
+                                "chainRsrp": v.chain_rsrp,
+                                "rat": cur.rat,
+                                "band": cur.band,
+                            }),
+                        ));
+                    }
+                } else {
+                    self.antenna_degraded_streak = 0;
+                    self.antenna_healthy_streak += 1;
+                    if self.antenna_degraded_active && self.antenna_healthy_streak >= 3 {
+                        self.antenna_degraded_active = false;
+                    }
+                }
+            }
+        }
+
         // Carrier aggregation set (confirmed over two samples).
         if registered
             && let Some((old, new)) = self.scc.observe(v.scc.clone(), 2)
@@ -469,7 +566,65 @@ impl SnapshotDetector {
             }
             self.public_ip = Some(ip.clone());
         }
+
+        if let Some(throttling) = v.any_throttling {
+            out.extend(self.observe_thermal(throttling, serde_json::json!({ "anyThrottling": throttling })));
+        }
+        if let Some(sar) = v.sar_rf_state {
+            out.extend(self.observe_sar(sar));
+        }
+        if let Some(null_cipher) = v.null_cipher_alert {
+            out.extend(self.observe_null_cipher(null_cipher, serde_json::json!({ "nullCipherAlert": null_cipher })));
+        }
         out
+    }
+
+    pub fn observe_thermal(&mut self, any_throttling: bool, detail: serde_json::Value) -> Option<Detected> {
+        if any_throttling && !self.throttling_active {
+            self.throttling_active = true;
+            return Some(det(
+                EventKind::ThermalThrottle,
+                Severity::Warning,
+                "Modem QMI thermal mitigation active".into(),
+                detail,
+            ));
+        }
+        if !any_throttling {
+            self.throttling_active = false;
+        }
+        None
+    }
+
+    pub fn observe_sar(&mut self, sar_state: u32) -> Option<Detected> {
+        if sar_state > 0 && self.last_sar_backoff != sar_state {
+            self.last_sar_backoff = sar_state;
+            return Some(det(
+                EventKind::SarBackoff,
+                Severity::Warning,
+                format!("SAR RF transmit backoff active (state {sar_state})"),
+                serde_json::json!({ "sarState": sar_state }),
+            ));
+        }
+        if sar_state == 0 {
+            self.last_sar_backoff = 0;
+        }
+        None
+    }
+
+    pub fn observe_null_cipher(&mut self, null_cipher_alert: bool, detail: serde_json::Value) -> Option<Detected> {
+        if null_cipher_alert && !self.null_cipher_active {
+            self.null_cipher_active = true;
+            return Some(det(
+                EventKind::AirCipherNull,
+                Severity::Critical,
+                "Unencrypted air-interface cipher (NEA0/EEA0) while RRC Connected".into(),
+                detail,
+            ));
+        }
+        if !null_cipher_alert {
+            self.null_cipher_active = false;
+        }
+        None
     }
 }
 
@@ -478,6 +633,55 @@ pub fn on_snapshot(m: &ModemSnapshot) {
     let view = RadioView::from_snapshot(m);
     let found = lock(&obs().detector).observe(&view, now_secs());
     for d in found {
+        emit(d.kind, d.severity, d.title, d.detail);
+    }
+}
+
+/// QMI DSP telemetry hook: checks TMD thermal throttling and SAR backoff state.
+pub fn on_dsp_telemetry(dsp: &crate::qmi::dsp::DspTelemetrySnapshot) {
+    if !dsp.qrtr_available {
+        return;
+    }
+    let mut found = Vec::new();
+    {
+        let mut det = lock(&obs().detector);
+        let active_devs: Vec<serde_json::Value> = dsp
+            .tmd_devices
+            .iter()
+            .filter(|d| d.throttling)
+            .map(|d| serde_json::json!({ "device": d.name, "level": d.current_level, "max": d.max_level }))
+            .collect();
+        if let Some(d) = det.observe_thermal(dsp.any_throttling, serde_json::json!({ "devices": active_devs })) {
+            found.push(d);
+        }
+        if let Some(sar) = dsp.sar_rf_state
+            && let Some(d) = det.observe_sar(sar)
+        {
+            found.push(d);
+        }
+    }
+    for d in found {
+        emit(d.kind, d.severity, d.title, d.detail);
+    }
+}
+
+/// SDX75 PHY diagnostics hook: checks RRC-Connected null air-cipher alert (`NEA0`/`EEA0`).
+pub fn on_phy_diagnostics(phy: &crate::radio_tuning::PhyDiagnostics) {
+    let Some(sec) = phy.air_security.as_ref() else {
+        return;
+    };
+    let found = {
+        let mut det = lock(&obs().detector);
+        det.observe_null_cipher(
+            sec.null_cipher_alert,
+            serde_json::json!({
+                "rat": sec.rat,
+                "cipherName": sec.cipher_name,
+                "integrityName": sec.integrity_name,
+            }),
+        )
+    };
+    if let Some(d) = found {
         emit(d.kind, d.severity, d.title, d.detail);
     }
 }
@@ -525,6 +729,7 @@ pub fn check_ota_status() {
             return;
         }
         p.last_ota_started_at = st.started_at;
+        obs().mark_state_dirty();
     }
     let ok = st.state == "succeeded";
     emit(
@@ -696,5 +901,76 @@ mod tests {
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.as_str()));
         }
+        assert!(EventKind::AntennaDegraded.notify_default());
+        assert!(EventKind::ThermalThrottle.notify_default());
+        assert!(!EventKind::SarBackoff.notify_default());
+        assert!(EventKind::AirCipherNull.notify_default());
+        assert!(EventKind::ModemSsr.notify_default());
+    }
+
+    #[test]
+    fn antenna_degraded_requires_three_connected_snapshots_and_detects_spread_or_chain_loss() {
+        let mut d = SnapshotDetector::default();
+        let mut healthy = view(serving("CONNECT", "NR5G-SA", "n41", 258, 521310));
+        healthy.chain_rsrp = vec![Some(-88.0), Some(-90.0), Some(-89.0), Some(-91.0)];
+        assert!(settle(&mut d, &healthy, 0).is_empty());
+
+        // RRC Idle (NOCONN) with sleeping secondary chains must NOT trigger AntennaDegraded!
+        let mut idle_one_chain = view(serving("NOCONN", "NR5G-SA", "n41", 258, 521310));
+        idle_one_chain.chain_rsrp = vec![Some(-88.0), None, None, None];
+        for t in 10..16 {
+            assert!(d.observe(&idle_one_chain, t).is_empty(), "idle chain sleep at {t}");
+        }
+
+        // 2-snapshot RSRP spread blip (>13 dB) clears on 3rd healthy snapshot without firing.
+        let mut spread_bad = healthy.clone();
+        spread_bad.chain_rsrp = vec![Some(-84.0), Some(-86.0), Some(-85.0), Some(-101.0)]; // 17 dB spread
+        assert!(d.observe(&spread_bad, 20).is_empty());
+        assert!(d.observe(&spread_bad, 21).is_empty());
+        assert!(d.observe(&healthy, 22).is_empty());
+
+        // 3 consecutive RRC-connected snapshots with >13 dB spread triggers AntennaDegraded once.
+        assert!(d.observe(&spread_bad, 30).is_empty());
+        assert!(d.observe(&spread_bad, 31).is_empty());
+        let ev1 = d.observe(&spread_bad, 32);
+        assert_eq!(kinds(&ev1), vec![EventKind::AntennaDegraded]);
+        assert_eq!(ev1[0].detail["rsrpSpreadDb"], 17.0);
+        assert!(d.observe(&spread_bad, 33).is_empty(), "no duplicate spam while still degraded");
+
+        // Recover across 3 healthy connected snapshots, then drop to 1 chain -> triggers again!
+        for t in 40..43 {
+            assert!(d.observe(&healthy, t).is_empty());
+        }
+        let mut single_chain = healthy.clone();
+        single_chain.chain_rsrp = vec![Some(-88.0), None, None, None];
+        assert!(d.observe(&single_chain, 50).is_empty());
+        assert!(d.observe(&single_chain, 51).is_empty());
+        let ev2 = d.observe(&single_chain, 52);
+        assert_eq!(kinds(&ev2), vec![EventKind::AntennaDegraded]);
+        assert_eq!(ev2[0].detail["activeChains"], 1);
+    }
+
+    #[test]
+    fn detects_thermal_throttle_sar_backoff_and_null_cipher_edges() {
+        let mut d = SnapshotDetector::default();
+        let mut v = view(serving("CONNECT", "NR5G-SA", "n41", 258, 521310));
+        assert!(settle(&mut d, &v, 0).is_empty());
+
+        v.any_throttling = Some(true);
+        v.sar_rf_state = Some(2);
+        v.null_cipher_alert = Some(true);
+        let evs = d.observe(&v, 10);
+        assert_eq!(
+            kinds(&evs),
+            vec![EventKind::ThermalThrottle, EventKind::SarBackoff, EventKind::AirCipherNull]
+        );
+        // Holding state does not re-fire; clearing and re-entering fires again.
+        assert!(d.observe(&v, 11).is_empty());
+        v.any_throttling = Some(false);
+        v.sar_rf_state = Some(0);
+        v.null_cipher_alert = Some(false);
+        assert!(d.observe(&v, 12).is_empty());
+        v.any_throttling = Some(true);
+        assert_eq!(kinds(&d.observe(&v, 13)), vec![EventKind::ThermalThrottle]);
     }
 }

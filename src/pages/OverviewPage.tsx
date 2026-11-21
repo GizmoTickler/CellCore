@@ -419,17 +419,21 @@ export function OverviewPage() {
           />
           <div className="space-y-4">
             {[0, 1, 2, 3].map((i) => {
+              const role = (["PRX · TX0", "DRX", "MIMO · TX1", "MIMO"] as const)[i];
               const rsrp = mimo.rsrp[i];
               const q = signalQuality(rsrp, mimo.sinr[i]);
               const active = rsrp != null;
               return (
                 <div key={i}>
                   <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-[13px] font-bold text-ink">
-                      RX{i}
-                      <span className="ml-2 text-[12px] font-medium text-muted">{active ? `SINR ${mimo.sinr[i] ?? "—"} dB` : "idle"}</span>
+                    <span className="flex flex-wrap items-center gap-1.5 text-[13px] font-bold text-ink">
+                      <span>RX{i}</span>
+                      <span className="rounded-md border border-line bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] font-semibold tracking-tight text-ink-2">
+                        {role}
+                      </span>
+                      <span className="ml-0.5 text-[12px] font-medium text-muted">{active ? `SINR ${mimo.sinr[i] ?? "—"} dB` : "idle"}</span>
                     </span>
-                    <span className={cn("text-[14px] font-bold qm-tabular", active ? "text-ink" : "text-muted")}>{active ? `${rsrp} dBm` : "—"}</span>
+                    <span className={cn("text-[14px] font-bold qm-tabular shrink-0", active ? "text-ink" : "text-muted")}>{active ? `${rsrp} dBm` : "—"}</span>
                   </div>
                   <Meter
                     className="mt-1.5"

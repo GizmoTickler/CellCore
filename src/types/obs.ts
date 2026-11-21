@@ -23,7 +23,12 @@ export type EventType =
   | "usage_threshold"
   | "standby_leak"
   | "sms_received"
-  | "vpn";
+  | "vpn"
+  | "antenna_degraded"
+  | "thermal_throttle"
+  | "sar_backoff"
+  | "air_cipher_null"
+  | "modem_ssr";
 
 export interface ObsEvent {
   id: number;

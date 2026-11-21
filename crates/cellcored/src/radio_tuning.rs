@@ -4,7 +4,10 @@
 //! diagnostics (`CSI`, `TX Power + HPUE Headroom`, `Pathloss`, `DL/UL MCS`, `SSB Beams`,
 //! `5QI / QoS`, `AMBR`, `Air Cipher / Integrity`, `RRC State`, `C-RNTI`, `MIMO layers`, `SFE`).
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicI8, Ordering},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -22,6 +25,27 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Max NR-ARFCN value per 3GPP TS 38.104 (0..=3,279,165).
 const MAX_NR_ARFCN: u32 = 3_279_165;
 
+/// Cached `AT+QMAP="SFE"` state (`-1` = unknown, `0` = off, `1` = on) so background
+/// 30 s PHY polls never hammer slow `at_fwd`.
+static SFE_AT_CACHE: AtomicI8 = AtomicI8::new(-1);
+
+pub fn set_cached_sfe_state(enabled: Option<bool>) {
+    let val = match enabled {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    SFE_AT_CACHE.store(val, Ordering::Relaxed);
+}
+
+fn get_cached_sfe_state() -> Option<bool> {
+    match SFE_AT_CACHE.load(Ordering::Relaxed) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
 /// Non-disruptive SDX75 telemetry counters enabled once on boot so live PHY/QoS/Security
 /// metrics are populated immediately without affecting the RF link.
 const PHY_ENABLE_KEYS: &[&str] = &[
@@ -32,6 +56,9 @@ const PHY_ENABLE_KEYS: &[&str] = &[
     "ssb_beam_id",
     "used_algo",
     "nr5g_mimo_layers",
+    "nr5g_mimo",
+    "rrc_time_info",
+    "freq_info",
     "c_rnti",
     "rrc_state",
     "csi_ctrl",
@@ -146,6 +173,7 @@ pub struct PhyDiagnostics {
     pub nr5g_csi: Option<CsiMetrics>,
     pub lte_csi: Option<CsiMetrics>,
     pub nr5g_mimo_layers: Option<u32>,
+    pub nr5g_active_rank: Option<u32>,
     pub nr5g_tx_pwr: Option<String>,
     pub nr5g_tx_pwr_detail: Option<TxPowerDetail>,
     pub nr5g_pathloss_db: Option<i32>,
@@ -157,6 +185,7 @@ pub struct PhyDiagnostics {
     pub nr5g_ambr: Option<String>,
     pub air_security: Option<AirSecurityInfo>,
     pub rrc_state: Option<RrcStateInfo>,
+    pub rrc_time_summary: Option<String>,
     pub c_rnti: Option<u32>,
     pub overheat_ind: Option<bool>,
     pub sfe_enabled: Option<bool>,
@@ -211,6 +240,69 @@ pub struct RadioTuningPatch {
     pub event_a3_enabled: Option<bool>,
     pub event_a3_offset: Option<u8>,
     pub sim_slot: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RadioTuningHttpPatch {
+    pub lte_ca_enabled: Option<bool>,
+    pub nr_ca_enabled: Option<bool>,
+    pub lte4mimo_enabled: Option<bool>,
+    pub nr4mimo_enabled: Option<bool>,
+    pub nr_ul256qam_fr1: Option<bool>,
+    pub nr_ul256qam_fr2: Option<bool>,
+    pub dss_enabled: Option<bool>,
+    pub nrdc_enabled: Option<bool>,
+    pub rat_acq_order: Option<String>,
+    pub lte_cdrx_enabled: Option<bool>,
+    pub nr_cdrx_enabled: Option<bool>,
+    pub rrc_inactive_enabled: Option<bool>,
+    pub data_centric: Option<bool>,
+    pub overheat_ind_enabled: Option<bool>,
+    pub lte_band_priority: Option<Vec<String>>,
+    pub nr5g_band_priority: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
+    pub nr5g_pref_freq_list: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
+    pub nr5g_earfcn_lock: Option<Vec<String>>,
+    pub event_a3_enabled: Option<bool>,
+    pub event_a3_offset: Option<u8>,
+    pub sim_slot: Option<u8>,
+    pub sar_backoff_lock_zero: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub force: Option<bool>,
+}
+
+impl RadioTuningHttpPatch {
+    fn split(self) -> (RadioTuningPatch, Option<bool>) {
+        (
+            RadioTuningPatch {
+                lte_ca_enabled: self.lte_ca_enabled,
+                nr_ca_enabled: self.nr_ca_enabled,
+                lte4mimo_enabled: self.lte4mimo_enabled,
+                nr4mimo_enabled: self.nr4mimo_enabled,
+                nr_ul256qam_fr1: self.nr_ul256qam_fr1,
+                nr_ul256qam_fr2: self.nr_ul256qam_fr2,
+                dss_enabled: self.dss_enabled,
+                nrdc_enabled: self.nrdc_enabled,
+                rat_acq_order: self.rat_acq_order,
+                lte_cdrx_enabled: self.lte_cdrx_enabled,
+                nr_cdrx_enabled: self.nr_cdrx_enabled,
+                rrc_inactive_enabled: self.rrc_inactive_enabled,
+                data_centric: self.data_centric,
+                overheat_ind_enabled: self.overheat_ind_enabled,
+                lte_band_priority: self.lte_band_priority,
+                nr5g_band_priority: self.nr5g_band_priority,
+                nr5g_pref_freq_list: self.nr5g_pref_freq_list,
+                nr5g_earfcn_lock: self.nr5g_earfcn_lock,
+                event_a3_enabled: self.event_a3_enabled,
+                event_a3_offset: self.event_a3_offset,
+                sim_slot: self.sim_slot,
+            },
+            self.sar_backoff_lock_zero,
+        )
+    }
 }
 
 impl RadioTuningPatch {
@@ -461,6 +553,94 @@ pub(crate) fn parse_mimo_layers(body: &str) -> Option<u32> {
         [0, ..] => None,
         [single] if (1..=8).contains(single) => Some(*single as u32),
         _ => None,
+    }
+}
+
+/// Parse `+QNWCFG: "nr5g_mimo",1,<rank>` (or single-int `<rank>`).
+pub(crate) fn parse_nr5g_mimo_rank(body: &str) -> Option<u32> {
+    let tail = extract_keyed_tail(body, "nr5g_mimo")?;
+    let vals = parse_ints(&tail);
+    match vals.as_slice() {
+        [1, rank, ..] if (1..=8).contains(rank) => Some(*rank as u32),
+        [0, ..] => None,
+        [single] if (1..=8).contains(single) => Some(*single as u32),
+        _ => None,
+    }
+}
+
+/// Parse `+QNWCFG: "rrc_time_info",...` into a compact human summary.
+pub(crate) fn parse_rrc_time_info(body: &str) -> Option<String> {
+    let tails = extract_all_keyed_tails(body, "rrc_time_info");
+    if tails.is_empty() {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for tail in tails {
+        let parts: Vec<&str> = tail.split(',').map(|s| s.trim().trim_matches('"')).collect();
+        if parts.is_empty() || parts[0] == "0" {
+            continue;
+        }
+        if parts.len() >= 4
+            && parts[0] == "1"
+            && parts[1].bytes().any(|b| b.is_ascii_alphabetic())
+        {
+            let rat = parts[1];
+            let conn = parts[2].parse::<u64>().ok();
+            let idle = parts[3].parse::<u64>().ok();
+            let inact = parts.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            if let (Some(c), Some(i)) = (conn, idle) {
+                if c == 0 && i == 0 && inact == 0 {
+                    continue;
+                }
+                if inact > 0 {
+                    segments.push(format!("{rat} Connected {c}s · Idle {i}s · Inactive {inact}s"));
+                } else {
+                    segments.push(format!("{rat} Connected {c}s · Idle {i}s"));
+                }
+                continue;
+            }
+        }
+        let nums: Vec<u64> = parts.iter().filter_map(|s| s.parse::<u64>().ok()).collect();
+        match nums.as_slice() {
+            [1, lte_c, lte_i, nr_c, nr_i, ..] => {
+                if *nr_c > 0 || *nr_i > 0 {
+                    segments.push(format!("NR5G Connected {nr_c}s · Idle {nr_i}s"));
+                } else if *lte_c > 0 || *lte_i > 0 {
+                    segments.push(format!("LTE Connected {lte_c}s · Idle {lte_i}s"));
+                }
+            }
+            [1, conn, idle, inact] => {
+                if *conn > 0 || *idle > 0 || *inact > 0 {
+                    if *inact > 0 {
+                        segments.push(format!("Connected {conn}s · Idle {idle}s · Inactive {inact}s"));
+                    } else {
+                        segments.push(format!("Connected {conn}s · Idle {idle}s"));
+                    }
+                }
+            }
+            [1, conn, idle] => {
+                if *conn > 0 || *idle > 0 {
+                    segments.push(format!("Connected {conn}s · Idle {idle}s"));
+                }
+            }
+            _ => {
+                let clean = tail.trim_matches('"').trim();
+                if !clean.is_empty() && clean != "0" && clean != "1,0,0" && clean != "1,0,0,0" {
+                    segments.push(clean.to_string());
+                }
+            }
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join(" | "))
+}
+
+pub(crate) fn resolve_overheat_ind(dsp: &crate::qmi::dsp::DspTelemetrySnapshot) -> Option<bool> {
+    if dsp.any_throttling {
+        Some(true)
+    } else if dsp.qrtr_available {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -843,20 +1023,28 @@ fn parse_phy_from_bodies(
     nr5g_csi: &str,
     lte_csi: &str,
     mimo_layers: &str,
+    nr5g_mimo: &str,
     tx_pwr: &str,
     ambr: &str,
     overheat: Option<bool>,
-    sfe: &str,
+    sfe: Option<bool>,
     pathloss: &str,
     dl_mcs: &str,
     ul_mcs: &str,
     ssb_beam: &str,
     qos: &str,
     rrc: &str,
+    rrc_time: &str,
     used_algo: &str,
     c_rnti: &str,
 ) -> PhyDiagnostics {
     let rrc_state = parse_rrc_state(rrc);
+    let nr5g_mimo_layers = parse_mimo_layers(mimo_layers);
+    let raw_rank = parse_nr5g_mimo_rank(nr5g_mimo);
+    let nr5g_active_rank = match (raw_rank, nr5g_mimo_layers) {
+        (Some(r), Some(l)) => Some(r.max(l)),
+        (r, l) => r.or(l),
+    };
     let ambr_caps = parse_nr5g_ambr_list(ambr);
     let ambr_summary = if let Some(first) = ambr_caps.first() {
         Some(format!("DL {} / UL {} Mbps ({})", first.dl_mbps, first.ul_mbps, first.apn))
@@ -868,7 +1056,8 @@ fn parse_phy_from_bodies(
     PhyDiagnostics {
         nr5g_csi: parse_csi(nr5g_csi, "nr5g_csi"),
         lte_csi: parse_csi(lte_csi, "lte_csi"),
-        nr5g_mimo_layers: parse_mimo_layers(mimo_layers),
+        nr5g_mimo_layers,
+        nr5g_active_rank,
         nr5g_tx_pwr: parse_nr5g_tx_pwr(tx_pwr),
         nr5g_tx_pwr_detail: parse_nr5g_tx_pwr_detail(tx_pwr),
         nr5g_pathloss_db: parse_pathloss_db(pathloss),
@@ -880,9 +1069,10 @@ fn parse_phy_from_bodies(
         nr5g_ambr: ambr_summary,
         air_security: parse_used_algo(used_algo, rrc_state.as_ref()),
         rrc_state,
+        rrc_time_summary: parse_rrc_time_info(rrc_time),
         c_rnti: parse_c_rnti(c_rnti),
         overheat_ind: overheat,
-        sfe_enabled: parse_sfe_enabled(sfe),
+        sfe_enabled: sfe,
     }
 }
 
@@ -891,7 +1081,9 @@ pub(crate) fn parse_snapshot(resps: &[Option<String>]) -> (RadioTuningState, Phy
     let (ul256_fr1, ul256_fr2) = parse_two_bools(body(4), "nr5g_ul_256qam");
     let (a3_en, a3_off) = parse_event_a3(body(31));
 
-    let overheat = parse_bool_normal(body(19), "overheat_ind");
+    // `"overheat_ind"` in AT+QNWCFG is whether overheat URC reporting is enabled, NOT live throttling!
+    let overheat_cfg_enabled = parse_bool_normal(body(19), "overheat_ind");
+    let sfe = parse_sfe_enabled(body(20));
     let tuning = RadioTuningState {
         lte_ca_enabled: parse_bool_inverted(body(0), "disable_lte_ca"),
         nr_ca_enabled: parse_bool_inverted(body(1), "disable_nr_ca"),
@@ -908,7 +1100,7 @@ pub(crate) fn parse_snapshot(resps: &[Option<String>]) -> (RadioTuningState, Phy
         nr_cdrx_enabled: parse_bool_normal(body(9), "nr5g_cdrx"),
         rrc_inactive_enabled: parse_bool_normal(body(10), "rrc_inactive"),
         data_centric: parse_bool_normal(body(11), "ue_usage_setting"),
-        overheat_ind_enabled: overheat,
+        overheat_ind_enabled: overheat_cfg_enabled,
         lte_band_priority: parse_band_priority(body(12), "lte_band_priority"),
         nr5g_band_priority: parse_band_priority(body(13), "nr5g_band_priority"),
         nr5g_pref_freq_list: parse_arfcn_list(body(29), "nr5g_pref_freq_list"),
@@ -923,16 +1115,18 @@ pub(crate) fn parse_snapshot(resps: &[Option<String>]) -> (RadioTuningState, Phy
         body(14),
         body(15),
         body(16),
+        body(34),
         body(17),
         body(18),
-        overheat,
-        body(20),
+        None,
+        sfe,
         body(21),
         body(22),
         body(23),
         body(24),
         body(25),
         body(26),
+        body(35),
         body(27),
         body(28),
     );
@@ -975,15 +1169,17 @@ const READ_CMDS: &[&str] = &[
     r#"AT+QNWCFG="event_a3_offset""#,      // 31
     "AT+QUIMSLOT?",                        // 32
     "AT+QSIMDET?",                         // 33
+    r#"AT+QNWCFG="nr5g_mimo""#,            // 34
+    r#"AT+QNWCFG="rrc_time_info""#,        // 35
 ];
 
 const PHY_POLL_CMDS: &[&str] = &[
     r#"AT+QNWCFG="nr5g_csi""#,         // 0
     r#"AT+QNWCFG="lte_csi""#,          // 1
     r#"AT+QNWCFG="nr5g_mimo_layers""#, // 2
-    r#"AT+QNWCFG="nr5g_tx_pwr""#,      // 3
-    r#"AT+QNWCFG="nr5g_ambr""#,        // 4
-    r#"AT+QNWCFG="overheat_ind""#,     // 5
+    r#"AT+QNWCFG="nr5g_mimo""#,        // 3
+    r#"AT+QNWCFG="nr5g_tx_pwr""#,      // 4
+    r#"AT+QNWCFG="nr5g_ambr""#,        // 5
     r#"AT+QMAP="SFE""#,                // 6
     r#"AT+QNWCFG="nr5g_pathloss""#,    // 7
     r#"AT+QNWCFG="nr5g_dlMCS""#,       // 8
@@ -991,11 +1187,12 @@ const PHY_POLL_CMDS: &[&str] = &[
     r#"AT+QNWCFG="ssb_beam_id""#,      // 10
     r#"AT+QNWCFG="nr5g_qos""#,         // 11
     r#"AT+QNWCFG="rrc_state""#,        // 12
-    r#"AT+QNWCFG="used_algo""#,        // 13
-    r#"AT+QNWCFG="c_rnti""#,           // 14
+    r#"AT+QNWCFG="rrc_time_info""#,    // 13
+    r#"AT+QNWCFG="used_algo""#,        // 14
+    r#"AT+QNWCFG="c_rnti""#,           // 15
 ];
 
-/// Enable non-disruptive SDX75 PHY telemetry counters once on startup.
+/// Enable non-disruptive SDX75 PHY telemetry counters once on startup (and post-SSR).
 pub async fn enable_phy_telemetry_counters(app: &crate::state::AppState) {
     let cmds: Vec<(String, Duration)> = PHY_ENABLE_KEYS
         .iter()
@@ -1005,34 +1202,74 @@ pub async fn enable_phy_telemetry_counters(app: &crate::state::AppState) {
 }
 
 /// Lightweight PHY-only poll used by the 30 s background loop to keep Prometheus
-/// metrics warm without querying all 34 tuning keys.
+/// metrics warm without querying all 36 tuning keys.
+/// Skips `lte_csi` on `NR5G-SA` and caches `AT+QMAP="SFE"` in `SFE_AT_CACHE`.
 pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagnostics, String> {
-    let cmds: Vec<(String, Duration)> = PHY_POLL_CMDS
-        .iter()
-        .map(|&c| (c.to_string(), READ_TIMEOUT))
-        .collect();
+    let skip_lte_csi = app
+        .modem
+        .read()
+        .await
+        .serving
+        .as_ref()
+        .is_some_and(|s| s.rat == "NR5G-SA");
+    let native_mode = crate::dataplane::is_native_mode();
+    let cached_sfe = if native_mode {
+        Some(crate::dataplane::is_sfe_loaded())
+    } else {
+        get_cached_sfe_state()
+    };
+
+    let mut active_indices = Vec::with_capacity(PHY_POLL_CMDS.len());
+    let mut cmds = Vec::with_capacity(PHY_POLL_CMDS.len());
+    for (idx, &cmd) in PHY_POLL_CMDS.iter().enumerate() {
+        if idx == 1 && skip_lte_csi {
+            continue;
+        }
+        if idx == 6 && cached_sfe.is_some() {
+            continue;
+        }
+        active_indices.push(idx);
+        cmds.push((cmd.to_string(), READ_TIMEOUT));
+    }
+
     let results = app
         .smd
         .exec_batch(cmds, Priority::Telemetry)
         .await
         .map_err(|e| format!("AT queue error: {e}"))?;
-    let bodies: Vec<Option<String>> = results
-        .into_iter()
-        .map(|r| match r {
-            Ok(resp) if resp.ok => Some(resp.body),
-            _ => None,
-        })
-        .collect();
+    let mut bodies: Vec<Option<String>> = vec![None; PHY_POLL_CMDS.len()];
+    for (slot_idx, res) in active_indices.into_iter().zip(results) {
+        if let Ok(resp) = res
+            && resp.ok
+        {
+            bodies[slot_idx] = Some(resp.body);
+        }
+    }
+
     let body = |idx: usize| bodies.get(idx).and_then(|o| o.as_deref()).unwrap_or("");
-    let overheat = parse_bool_normal(body(5), "overheat_ind");
+    let sfe = match cached_sfe {
+        Some(v) => Some(v),
+        None => {
+            let parsed = parse_sfe_enabled(body(6));
+            if parsed.is_some() {
+                set_cached_sfe_state(parsed);
+            }
+            parsed
+        }
+    };
+    let overheat = {
+        let dsp = app.dsp_telemetry.read().await;
+        resolve_overheat_ind(&dsp)
+    };
     let phy = parse_phy_from_bodies(
         body(0),
         body(1),
         body(2),
         body(3),
         body(4),
+        body(5),
         overheat,
-        body(6),
+        sfe,
         body(7),
         body(8),
         body(9),
@@ -1041,29 +1278,48 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
         body(12),
         body(13),
         body(14),
+        body(15),
     );
+    crate::obs::events::on_phy_diagnostics(&phy);
     *app.phy_diag.write().await = phy.clone();
     Ok(phy)
 }
 
 pub async fn read_tuning_snapshot(app: &crate::state::AppState) -> Result<(RadioTuningState, PhyDiagnostics), String> {
-    let cmds: Vec<(String, Duration)> = READ_CMDS
-        .iter()
-        .map(|&c| (c.to_string(), READ_TIMEOUT))
-        .collect();
+    let native_mode = crate::dataplane::is_native_mode();
+    let mut active_indices = Vec::with_capacity(READ_CMDS.len());
+    let mut cmds = Vec::with_capacity(READ_CMDS.len());
+    for (idx, &c) in READ_CMDS.iter().enumerate() {
+        if idx == 20 && native_mode {
+            continue;
+        }
+        active_indices.push(idx);
+        cmds.push((c.to_string(), READ_TIMEOUT));
+    }
     let results = app
         .smd
         .exec_batch(cmds, Priority::Interactive)
         .await
         .map_err(|e| format!("AT queue error: {e}"))?;
-    let bodies: Vec<Option<String>> = results
-        .into_iter()
-        .map(|r| match r {
-            Ok(resp) if resp.ok => Some(resp.body),
-            _ => None,
-        })
-        .collect();
-    let (tuning, phy) = parse_snapshot(&bodies);
+    let mut bodies: Vec<Option<String>> = vec![None; READ_CMDS.len()];
+    for (slot_idx, res) in active_indices.into_iter().zip(results) {
+        if let Ok(resp) = res
+            && resp.ok
+        {
+            bodies[slot_idx] = Some(resp.body);
+        }
+    }
+    let (tuning, mut phy) = parse_snapshot(&bodies);
+    if native_mode {
+        phy.sfe_enabled = Some(crate::dataplane::is_sfe_loaded());
+    } else if phy.sfe_enabled.is_some() {
+        set_cached_sfe_state(phy.sfe_enabled);
+    }
+    {
+        let dsp = app.dsp_telemetry.read().await;
+        phy.overheat_ind = resolve_overheat_ind(&dsp);
+    }
+    crate::obs::events::on_phy_diagnostics(&phy);
     *app.phy_diag.write().await = phy.clone();
     Ok((tuning, phy))
 }
@@ -1106,7 +1362,15 @@ pub async fn apply_tuning_patch(
     app: &crate::state::AppState,
     req: RadioTuningPatch,
 ) -> Result<Vec<String>, (StatusCode, String, Vec<String>)> {
-    if req.is_empty() {
+    apply_tuning_patch_ext(app, req, None).await
+}
+
+async fn apply_tuning_patch_ext(
+    app: &crate::state::AppState,
+    req: RadioTuningPatch,
+    sar_backoff_lock_zero: Option<bool>,
+) -> Result<Vec<String>, (StatusCode, String, Vec<String>)> {
+    if req.is_empty() && sar_backoff_lock_zero != Some(true) {
         return Err((StatusCode::BAD_REQUEST, "No radio tuning fields specified".into(), Vec::new()));
     }
     let norm_rat_order = match req.rat_acq_order.as_deref() {
@@ -1312,6 +1576,24 @@ pub async fn apply_tuning_patch(
         }
     }
 
+    if sar_backoff_lock_zero == Some(true) {
+        match crate::qmi::dsp::set_sar_rf_state(0).await {
+            Ok(()) => {
+                applied.push("sarBackoffLockZero".into());
+                let mut dsp = app.dsp_telemetry.write().await;
+                dsp.sar_rf_state = Some(0);
+                dsp.sar_label = crate::qmi::dsp::sar_state_label(Some(0));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("sarBackoffLockZero QMI SAR failed: {e}"),
+                    applied,
+                ));
+            }
+        }
+    }
+
     *app.tuning_cache.write().await = None;
     let summary = applied.join(", ");
     app.push_daemon_log(format!("cellular: radio tuning updated ({summary})"));
@@ -1319,8 +1601,12 @@ pub async fn apply_tuning_patch(
     Ok(applied)
 }
 
-pub async fn post_tuning(State(ctx): State<HttpCtx>, Json(req): Json<RadioTuningPatch>) -> Response {
-    match apply_tuning_patch(&ctx.app, req).await {
+pub async fn post_tuning(
+    State(ctx): State<HttpCtx>,
+    Json(req): Json<RadioTuningHttpPatch>,
+) -> Response {
+    let (patch, sar_lock_zero) = req.split();
+    match apply_tuning_patch_ext(&ctx.app, patch, sar_lock_zero).await {
         Ok(applied) => Json(serde_json::json!({
             "status": "ok",
             "applied": applied,
@@ -1457,8 +1743,26 @@ mod tests {
         assert!(parse_used_algo(r#"+QNWCFG: "used_algo",1,12,0,0"#, Some(&connected)).unwrap().null_cipher_alert);
         assert!(!parse_used_algo(r#"+QNWCFG: "used_algo",1,12,2,2"#, Some(&connected)).unwrap().null_cipher_alert);
         assert_eq!(phy.c_rnti, Some(47956));
-        assert_eq!(phy.overheat_ind, Some(true));
+        assert_eq!(phy.overheat_ind, None);
         assert_eq!(phy.sfe_enabled, Some(false));
+
+        // nr5g_mimo + rrc_time_info + QMI TMD overheat resolution
+        assert_eq!(parse_nr5g_mimo_rank(r#"+QNWCFG: "nr5g_mimo",1,4"#), Some(4));
+        assert_eq!(parse_nr5g_mimo_rank(r#"+QNWCFG: "nr5g_mimo",0,0"#), None);
+        assert_eq!(
+            parse_rrc_time_info(r#"+QNWCFG: "rrc_time_info",1,"NR5G",1420,85,12"#).as_deref(),
+            Some("NR5G Connected 1420s · Idle 85s · Inactive 12s")
+        );
+        assert_eq!(
+            parse_rrc_time_info(r#"+QNWCFG: "rrc_time_info",1,300,45"#).as_deref(),
+            Some("Connected 300s · Idle 45s")
+        );
+        let mut dsp = crate::qmi::dsp::DspTelemetrySnapshot::default();
+        assert_eq!(resolve_overheat_ind(&dsp), None);
+        dsp.qrtr_available = true;
+        assert_eq!(resolve_overheat_ind(&dsp), Some(false));
+        dsp.any_throttling = true;
+        assert_eq!(resolve_overheat_ind(&dsp), Some(true));
     }
 
     #[test]

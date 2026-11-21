@@ -9,7 +9,7 @@
 use std::{
     collections::VecDeque,
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -96,17 +96,18 @@ pub struct EpisodeSummary {
 /// Throughput side of the decision, with hysteresis: on after the average
 /// has stayed >= baseline for `sustain_secs`, off after it has stayed below
 /// half the baseline for `release_secs`.
+/// Uses monotonic `Instant` so NTP clock jumps never trigger false failover episodes.
 #[derive(Debug, Default, Clone)]
 pub struct ThroughputDetector {
     window: VecDeque<u64>,
-    above_since: Option<u64>,
-    below_since: Option<u64>,
+    above_since: Option<Instant>,
+    below_since: Option<Instant>,
     pub active: bool,
     pub avg_bps: u64,
 }
 
 impl ThroughputDetector {
-    pub fn tick(&mut self, now: u64, bps: u64, cfg: &FailoverConfig) -> bool {
+    pub fn tick(&mut self, mono_now: Instant, bps: u64, cfg: &FailoverConfig) -> bool {
         if self.window.len() >= AVG_WINDOW {
             self.window.pop_front();
         }
@@ -114,29 +115,42 @@ impl ThroughputDetector {
         self.avg_bps = self.window.iter().sum::<u64>() / self.window.len() as u64;
         let base = cfg.baseline_bps.max(1);
         if self.avg_bps >= base {
-            self.above_since.get_or_insert(now);
+            self.above_since.get_or_insert(mono_now);
             self.below_since = None;
         } else if self.avg_bps < base / 2 {
-            self.below_since.get_or_insert(now);
+            self.below_since.get_or_insert(mono_now);
             self.above_since = None;
         } else {
             // Between half and full baseline: hold the current state.
             self.above_since = None;
             self.below_since = None;
         }
-        if !self.active && self.above_since.is_some_and(|t| now.saturating_sub(t) >= cfg.sustain_secs) {
+        if !self.active
+            && self
+                .above_since
+                .is_some_and(|t| mono_now.saturating_duration_since(t) >= Duration::from_secs(cfg.sustain_secs))
+        {
             self.active = true;
-        } else if self.active && self.below_since.is_some_and(|t| now.saturating_sub(t) >= cfg.release_secs) {
+        } else if self.active
+            && self
+                .below_since
+                .is_some_and(|t| mono_now.saturating_duration_since(t) >= Duration::from_secs(cfg.release_secs))
+        {
             self.active = false;
         }
         self.active
     }
 }
 
-/// Combine the hint and the throughput detector. A fresh hint wins.
-pub fn decide(hint: Option<(Role, u64)>, throughput_active: bool, now: u64, cfg: &FailoverConfig) -> (bool, Option<Source>) {
+/// Combine the hint and the throughput detector. A fresh hint (monotonic TTL) wins.
+pub fn decide(
+    hint: Option<(Role, Instant)>,
+    throughput_active: bool,
+    mono_now: Instant,
+    cfg: &FailoverConfig,
+) -> (bool, Option<Source>) {
     if let Some((role, at)) = hint
-        && now.saturating_sub(at) <= cfg.hint_ttl_secs
+        && mono_now.saturating_duration_since(at) <= Duration::from_secs(cfg.hint_ttl_secs)
     {
         return (role == Role::Active, Some(Source::Hint));
     }
@@ -157,10 +171,11 @@ pub struct FailoverRuntime {
     pub throughput: ThroughputDetector,
     pub active: bool,
     pub source: Option<Source>,
-    /// When the current state (active or standby) began.
+    /// When the current state (active or standby) began (unix seconds).
     pub since: u64,
-    pub hint: Option<(Role, u64)>,
+    pub hint: Option<(Role, Instant)>,
     pub episode: Option<Episode>,
+    episode_started_mono: Option<Instant>,
     pub last_episode: Option<EpisodeSummary>,
     /// Work already reported as deferred in this episode (one event each).
     pub deferred_noted: Vec<&'static str>,
@@ -176,17 +191,32 @@ impl FailoverRuntime {
         self.source = Some(ep.source);
         self.since = ep.started_at;
         self.episode = Some(ep);
+        self.episode_started_mono = None;
         ACTIVE.store(true, Ordering::Relaxed);
     }
 
     /// One second of input. Pure apart from the struct itself.
-    pub fn tick(&mut self, now: u64, bps: u64, bytes: u64, cfg: &FailoverConfig) -> Option<Transition> {
-        let tp = self.throughput.tick(now, bps, cfg);
-        self.apply_decision(tp, now, bytes, cfg)
+    pub fn tick(
+        &mut self,
+        now: u64,
+        mono_now: Instant,
+        bps: u64,
+        bytes: u64,
+        cfg: &FailoverConfig,
+    ) -> Option<Transition> {
+        let tp = self.throughput.tick(mono_now, bps, cfg);
+        self.apply_decision(tp, now, mono_now, bytes, cfg)
     }
 
-    pub fn apply_decision(&mut self, tp: bool, now: u64, bytes: u64, cfg: &FailoverConfig) -> Option<Transition> {
-        let (want, source) = decide(self.hint, tp, now, cfg);
+    pub fn apply_decision(
+        &mut self,
+        tp: bool,
+        now: u64,
+        mono_now: Instant,
+        bytes: u64,
+        cfg: &FailoverConfig,
+    ) -> Option<Transition> {
+        let (want, source) = decide(self.hint, tp, mono_now, cfg);
         if let Some(ep) = self.episode.as_mut() {
             ep.bytes = ep.bytes.saturating_add(bytes);
         }
@@ -203,6 +233,7 @@ impl FailoverRuntime {
             let ep = Episode { started_at: now, bytes: 0, source: source.unwrap_or(Source::Throughput) };
             self.source = source;
             self.episode = Some(ep.clone());
+            self.episode_started_mono = Some(mono_now);
             Some(Transition::Started(ep))
         } else {
             self.source = None;
@@ -211,10 +242,15 @@ impl FailoverRuntime {
                 bytes: 0,
                 source: Source::Throughput,
             });
+            let duration_secs = self
+                .episode_started_mono
+                .take()
+                .map(|t| mono_now.saturating_duration_since(t).as_secs())
+                .unwrap_or_else(|| now.saturating_sub(ep.started_at));
             let sum = EpisodeSummary {
                 started_at: ep.started_at,
                 ended_at: now,
-                duration_secs: now.saturating_sub(ep.started_at),
+                duration_secs,
                 bytes: ep.bytes,
                 source: ep.source,
             };
@@ -243,6 +279,7 @@ fn emit_transition(tr: Transition) {
     match tr {
         Transition::Started(ep) => {
             lock(&obs().persisted).failover_episodes += 1;
+            obs().mark_state_dirty();
             emit(
                 EventKind::FailoverStart,
                 Severity::Warning,
@@ -254,6 +291,7 @@ fn emit_transition(tr: Transition) {
             );
         }
         Transition::Ended(sum) => {
+            obs().mark_state_dirty();
             emit(
                 EventKind::FailoverEnd,
                 Severity::Info,
@@ -271,10 +309,11 @@ fn emit_transition(tr: Transition) {
 
 /// Called every second by the obs loop.
 pub fn on_tick(now: u64, bps: u64, bytes: u64) {
+    let mono_now = Instant::now();
     let cfg = lock(&obs().config).failover.clone();
     let tr = {
         let mut f = lock(&obs().failover);
-        let tr = f.tick(now, bps, bytes, &cfg);
+        let tr = f.tick(now, mono_now, bps, bytes, &cfg);
         ACTIVE.store(f.active, Ordering::Relaxed);
         tr
     };
@@ -286,12 +325,13 @@ pub fn on_tick(now: u64, bps: u64, bytes: u64) {
 /// `r10-modem-ctl role active|standby` (IPC).
 pub fn set_hint(role: Role) -> String {
     let now = now_secs();
+    let mono_now = Instant::now();
     let cfg = lock(&obs().config).failover.clone();
     let tr = {
         let mut f = lock(&obs().failover);
-        f.hint = Some((role, now));
+        f.hint = Some((role, mono_now));
         let tp = f.throughput.active;
-        let tr = f.apply_decision(tp, now, 0, &cfg);
+        let tr = f.apply_decision(tp, now, mono_now, 0, &cfg);
         ACTIVE.store(f.active, Ordering::Relaxed);
         tr
     };
@@ -307,12 +347,13 @@ pub fn status_json() -> serde_json::Value {
     let cfg = lock(&obs().config).failover.clone();
     let episodes = lock(&obs().persisted).failover_episodes;
     let f = lock(&obs().failover);
-    let now = now_secs();
+    let mono_now = Instant::now();
     let hint = f.hint.map(|(r, at)| {
+        let age = mono_now.saturating_duration_since(at).as_secs();
         serde_json::json!({
             "role": r,
-            "ageSecs": now.saturating_sub(at),
-            "fresh": now.saturating_sub(at) <= cfg.hint_ttl_secs,
+            "ageSecs": age,
+            "fresh": age <= cfg.hint_ttl_secs,
         })
     });
     serde_json::json!({
@@ -355,7 +396,10 @@ pub fn defer_scheduled_reboot(now: u64) {
     let first = {
         let mut p = lock(&obs().persisted);
         let first = p.deferred_reboot_at.is_none();
-        p.deferred_reboot_at.get_or_insert(now);
+        if first {
+            p.deferred_reboot_at = Some(now);
+            obs().mark_state_dirty();
+        }
         first
     };
     if first {
@@ -392,6 +436,7 @@ pub async fn check_deferred_reboot(state: &AppState, now: u64) {
         DeferredReboot::Wait => {}
         DeferredReboot::Drop => {
             lock(&obs().persisted).deferred_reboot_at = None;
+            obs().mark_state_dirty();
             emit(
                 EventKind::ScheduledReboot,
                 Severity::Warning,
@@ -401,6 +446,7 @@ pub async fn check_deferred_reboot(state: &AppState, now: u64) {
         }
         DeferredReboot::Run => {
             lock(&obs().persisted).deferred_reboot_at = None;
+            obs().mark_state_dirty();
             emit(
                 EventKind::ScheduledReboot,
                 Severity::Info,
@@ -431,6 +477,7 @@ pub fn disruptive_action(method: &Method, path: &str) -> Option<&'static str> {
         ("POST", "/api/v1/cellular/bands") => Some("band lock"),
         ("POST", "/api/v1/cellular/mode") => Some("network mode change"),
         ("POST" | "DELETE", "/api/v1/cellular/cell-lock") => Some("cell lock"),
+        ("POST", "/api/v1/cellular/tuning") => Some("radio tuning"),
         ("POST", "/api/v1/cellular/mbn") => Some("MBN change"),
         ("POST", "/api/v1/admin/software/self-upgrade") => Some("CellCore self-upgrade"),
         ("POST", "/api/v1/system/reboot") => Some("reboot"),
@@ -541,18 +588,20 @@ mod tests {
     #[test]
     fn throughput_needs_sustain_and_releases_with_hysteresis() {
         let c = cfg();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
         let mut d = ThroughputDetector::default();
         // a 5 s burst does not count
         for t in 0..5 {
-            assert!(!d.tick(t, 50_000, &c));
+            assert!(!d.tick(at(t), 50_000, &c));
         }
         for t in 5..30 {
-            d.tick(t, 0, &c);
+            d.tick(at(t), 0, &c);
         }
         assert!(!d.active);
         let mut went_active = None;
         for t in 100..200 {
-            if d.tick(t, 5000, &c) && went_active.is_none() {
+            if d.tick(at(t), 5000, &c) && went_active.is_none() {
                 went_active = Some(t);
             }
         }
@@ -560,12 +609,12 @@ mod tests {
         assert_eq!(went_active, Some(131));
         // between half and full baseline: holds
         for t in 200..400 {
-            assert!(d.tick(t, 700, &c), "hysteresis band holds active at {t}");
+            assert!(d.tick(at(t), 700, &c), "hysteresis band holds active at {t}");
         }
         // below half: releases after release_secs (+ window drain)
         let mut released = None;
         for t in 400..600 {
-            if !d.tick(t, 0, &c) && released.is_none() {
+            if !d.tick(at(t), 0, &c) && released.is_none() {
                 released = Some(t);
             }
         }
@@ -574,30 +623,58 @@ mod tests {
     }
 
     #[test]
-    fn fresh_hint_wins_then_expires() {
+    fn fresh_hint_wins_then_expires_on_monotonic_instant() {
         let c = cfg();
-        assert_eq!(decide(Some((Role::Standby, 100)), true, 150, &c), (false, Some(Source::Hint)));
-        assert_eq!(decide(Some((Role::Active, 100)), false, 280, &c), (true, Some(Source::Hint)));
-        assert_eq!(decide(Some((Role::Active, 100)), false, 281, &c), (false, None), "stale hint ignored");
-        assert_eq!(decide(Some((Role::Standby, 100)), true, 281, &c), (true, Some(Source::Throughput)));
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(decide(Some((Role::Standby, at(100))), true, at(150), &c), (false, Some(Source::Hint)));
+        assert_eq!(decide(Some((Role::Active, at(100))), false, at(280), &c), (true, Some(Source::Hint)));
+        assert_eq!(decide(Some((Role::Active, at(100))), false, at(281), &c), (false, None), "stale hint ignored");
+        assert_eq!(decide(Some((Role::Standby, at(100))), true, at(281), &c), (true, Some(Source::Throughput)));
         let mut off = c.clone();
         off.throughput_detect = false;
-        assert_eq!(decide(None, true, 0, &off), (false, None));
+        assert_eq!(decide(None, true, at(0), &off), (false, None));
+    }
+
+    #[test]
+    fn ntp_wall_clock_jump_does_not_trigger_false_failover_or_expire_hint() {
+        let c = cfg();
+        let t0 = Instant::now();
+        let mut f = FailoverRuntime {
+            hint: Some((Role::Standby, t0)),
+            ..Default::default()
+        };
+        // Standby hint arrives before NTP sync (unix epoch = 120), plus a 1 s traffic spike.
+        assert_eq!(f.tick(120, t0, 50_000, 5000, &c), None);
+        assert!(!f.active);
+
+        // NTP jumps wall clock by +1.79 billion seconds 1 monotonic second later!
+        let ntp_now = 1_795_200_000;
+        assert_eq!(f.tick(ntp_now, t0 + Duration::from_secs(1), 50_000, 5000, &c), None);
+        assert!(!f.active, "NTP jump must not expire fresh standby hint or satisfy sustain_secs");
+
+        // Even without a hint, a 1 s burst across an NTP wall-clock jump must NOT trigger sustain!
+        let mut f2 = FailoverRuntime::default();
+        assert_eq!(f2.tick(100, t0, 50_000, 1000, &c), None);
+        assert_eq!(f2.tick(ntp_now, t0 + Duration::from_secs(1), 50_000, 1000, &c), None);
+        assert!(!f2.active, "ThroughputDetector must use monotonic Instant");
     }
 
     #[test]
     fn episodes_record_duration_and_bytes() {
         let c = cfg();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
         let mut f = FailoverRuntime::default();
-        assert_eq!(f.tick(1, 0, 0, &c), None);
-        f.hint = Some((Role::Active, 10));
-        let Some(Transition::Started(ep)) = f.tick(10, 0, 0, &c) else { panic!("start") };
+        assert_eq!(f.tick(1, at(1), 0, 0, &c), None);
+        f.hint = Some((Role::Active, at(10)));
+        let Some(Transition::Started(ep)) = f.tick(10, at(10), 0, 0, &c) else { panic!("start") };
         assert_eq!(ep.source, Source::Hint);
         for t in 11..=70 {
-            assert_eq!(f.tick(t, 0, 1000, &c), None);
+            assert_eq!(f.tick(t, at(t), 0, 1000, &c), None);
         }
-        f.hint = Some((Role::Standby, 71));
-        let Some(Transition::Ended(sum)) = f.tick(71, 0, 500, &c) else { panic!("end") };
+        f.hint = Some((Role::Standby, at(71)));
+        let Some(Transition::Ended(sum)) = f.tick(71, at(71), 0, 500, &c) else { panic!("end") };
         assert_eq!(sum.duration_secs, 61);
         assert_eq!(sum.bytes, 60 * 1000 + 500);
         assert!(!f.active);
@@ -617,6 +694,11 @@ mod tests {
         let null = serde_json::Value::Null;
         let scan = disruptive_action(&Method::POST, "/api/v1/cellular/scan");
         assert!(scan.is_some());
+        let tuning = disruptive_action(&Method::POST, "/api/v1/cellular/tuning");
+        assert_eq!(tuning, Some("radio tuning"));
+        assert_eq!(guard_verdict(true, tuning, "/api/v1/cellular/tuning", &serde_json::json!({"nrCaEnabled":true}), None), GuardVerdict::Block);
+        assert_eq!(guard_verdict(true, tuning, "/api/v1/cellular/tuning", &serde_json::json!({"nrCaEnabled":true,"force":true}), None), GuardVerdict::Forced);
+        assert!(disruptive_action(&Method::GET, "/api/v1/cellular/tuning").is_none());
         assert_eq!(guard_verdict(false, scan, "/api/v1/cellular/scan", &null, None), GuardVerdict::Pass);
         assert_eq!(guard_verdict(true, scan, "/api/v1/cellular/scan", &null, None), GuardVerdict::Block);
         assert_eq!(guard_verdict(true, scan, "/api/v1/cellular/scan", &null, Some("force=true")), GuardVerdict::Forced);

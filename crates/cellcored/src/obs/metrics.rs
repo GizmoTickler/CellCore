@@ -169,12 +169,15 @@ pub async fn gather(state: &AppState) -> MetricsInput {
     let p = lock(&o.persisted).clone();
     let failover = {
         let f = lock(&o.failover);
+        let mono_now = std::time::Instant::now();
         FailoverView {
             active: f.active,
             source: f.source,
             avg_bps: f.throughput.avg_bps,
             baseline_bps,
-            hint_fresh: f.hint.is_some_and(|(_, at)| now.saturating_sub(at) <= hint_ttl),
+            hint_fresh: f.hint.is_some_and(|(_, at)| {
+                mono_now.saturating_duration_since(at) <= std::time::Duration::from_secs(hint_ttl)
+            }),
             episodes_total: p.failover_episodes,
             episode_secs: f.episode.as_ref().map(|e| now.saturating_sub(e.started_at)).unwrap_or(0),
             episode_bytes: f.episode.as_ref().map(|e| e.bytes).unwrap_or(0),
@@ -337,6 +340,46 @@ pub fn render(m: &MetricsInput) -> String {
         _ => 0.0,
     };
     p.gauge("registered", "1 when registered on the network.", registered);
+    let present_rsrp: Vec<f64> = modem
+        .mimo
+        .rsrp
+        .iter()
+        .take(4)
+        .filter_map(|v| v.filter(|x| x.is_finite()))
+        .collect();
+    if registered == 1.0 {
+        p.head(
+            "antenna_chain_present",
+            "1 if the receive antenna chain reports a valid RSRP reading, 0 otherwise.",
+            "gauge",
+        );
+        for i in 0..4 {
+            let ok = modem
+                .mimo
+                .rsrp
+                .get(i)
+                .and_then(|v| *v)
+                .is_some_and(f64::is_finite);
+            p.sample("antenna_chain_present", &[("chain", &i.to_string())], b(ok));
+        }
+    }
+    if registered == 1.0 || !present_rsrp.is_empty() {
+        p.gauge(
+            "antenna_active_chains",
+            "Number of active receive antenna chains reporting RSRP.",
+            present_rsrp.len() as f64,
+        );
+    }
+    if !present_rsrp.is_empty() {
+        let max_r = present_rsrp.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min_r = present_rsrp.iter().copied().fold(f64::INFINITY, f64::min);
+        let spread = ((max_r - min_r) * 100.0).round() / 100.0;
+        p.gauge(
+            "antenna_rsrp_spread_db",
+            "RSRP spread (max - min, dB) across active receive antenna chains.",
+            spread,
+        );
+    }
     if let Some(s) = modem.serving.as_ref() {
         p.head("serving_cell_info", "Serving cell identity (value is always 1).", "gauge");
         p.sample(
@@ -355,10 +398,45 @@ pub fn render(m: &MetricsInput) -> String {
         p.opt_gauge("serving_rsrq_db", "Serving cell RSRQ (dB).", s.rsrq);
         p.opt_gauge("serving_sinr_db", "Serving cell SINR (dB).", s.sinr);
         p.opt_gauge("tx_power_dbm", "UE transmit power reported for the serving cell (dBm).", s.tx_power);
+        p.opt_gauge("nsa_nr5g_rsrp_dbm", "EN-DC 5G NR NSA secondary leg RSRP (dBm).", s.nsa_nr5g_rsrp);
+        p.opt_gauge("nsa_nr5g_sinr_db", "EN-DC 5G NR NSA secondary leg SINR (dB).", s.nsa_nr5g_sinr);
     }
     let ca_mhz: f64 = modem.carriers.iter().filter_map(|c| c.bandwidth_mhz).sum();
     p.gauge("ca_components", "Aggregated component carriers (PCC + SCCs).", modem.carriers.len() as f64);
     p.gauge("ca_bandwidth_mhz", "Total aggregated downlink bandwidth (MHz).", ca_mhz);
+    let ul_carriers_count = modem.carriers.iter().filter(|c| c.ul_configured).count();
+    let scc_ul = modem
+        .carriers
+        .iter()
+        .any(|c| c.role.eq_ignore_ascii_case("SCC") && c.ul_configured);
+    p.gauge(
+        "ul_ca_active",
+        "1 when uplink carrier aggregation (UL CA) is active.",
+        b(ul_carriers_count > 1 || scc_ul),
+    );
+    let ul_bw_mhz: f64 = if !modem.carriers.is_empty() {
+        modem
+            .carriers
+            .iter()
+            .filter(|c| c.ul_configured)
+            .filter_map(|c| {
+                if c.role.eq_ignore_ascii_case("PCC") {
+                    c.ul_bandwidth_mhz
+                        .or_else(|| modem.serving.as_ref().and_then(|s| s.ul_bandwidth_mhz))
+                        .or(c.bandwidth_mhz)
+                } else {
+                    c.ul_bandwidth_mhz.or(c.bandwidth_mhz)
+                }
+            })
+            .sum()
+    } else {
+        modem
+            .serving
+            .as_ref()
+            .and_then(|s| s.ul_bandwidth_mhz)
+            .unwrap_or(0.0)
+    };
+    p.gauge("ul_bandwidth_mhz", "Total configured uplink bandwidth (MHz).", ul_bw_mhz);
     if !modem.carriers.is_empty() {
         p.head("ca_component_bandwidth_mhz", "Bandwidth of each component carrier (MHz).", "gauge");
         for (i, c) in modem.carriers.iter().take(8).enumerate() {
@@ -488,6 +566,16 @@ pub fn render(m: &MetricsInput) -> String {
         p.gauge("speedtest_last_upload_mbps", "Last speedtest upload (Mbit/s).", st.upload_mbps);
         p.gauge("speedtest_last_ping_ms", "Last speedtest idle latency (ms).", st.ping_ms);
         p.gauge("speedtest_last_jitter_ms", "Last speedtest jitter (ms).", st.jitter_ms);
+        p.opt_gauge(
+            "speedtest_dl_loaded_latency_ms",
+            "Last speedtest download loaded latency IQM (ms).",
+            st.dl_latency_iqm,
+        );
+        p.opt_gauge(
+            "speedtest_ul_loaded_latency_ms",
+            "Last speedtest upload loaded latency IQM (ms).",
+            st.ul_latency_iqm,
+        );
     }
 
     // --- system ------------------------------------------------------------
@@ -550,6 +638,16 @@ pub fn render(m: &MetricsInput) -> String {
 
     // --- native dataplane -----------------------------------------------
     let dp = &m.dataplane;
+    p.opt_gauge(
+        "ipa_hardware_offload_pct",
+        "Percentage of Ethernet packets offloaded in Qualcomm IPA hardware.",
+        dp.ipa_hardware_offload_pct.map(f64::from),
+    );
+    p.counter(
+        "qrtr_ssr_total",
+        "Modem subsystem restarts (SSR) observed on the QRTR control bus.",
+        dp.qrtr_ssr_total as f64,
+    );
     if !dp.mode.is_empty() {
         p.head("dataplane_mode", "Active dataplane mode (one-hot: native or legacy).", "gauge");
         for mode in ["native", "legacy"] {
@@ -566,6 +664,10 @@ pub fn render(m: &MetricsInput) -> String {
 
     // --- SDX75 PHY / QoS / Security telemetry ---------------------------
     let phy = &m.phy;
+    if let Some(csi) = phy.nr5g_csi.as_ref() {
+        p.gauge("nr5g_csi_ri", "5G NR Channel State Information Rank Indicator (RI).", f64::from(csi.ri));
+        p.gauge("nr5g_csi_cqi", "5G NR Channel State Information Channel Quality Indicator (CQI).", f64::from(csi.cqi));
+    }
     if let Some(tx) = phy.nr5g_tx_pwr_detail.as_ref() {
         p.head("nr5g_tx_power_dbm", "5G NR uplink transmit power by channel (dBm).", "gauge");
         p.sample("nr5g_tx_power_dbm", &[("channel", "pusch")], f64::from(tx.pusch_dbm));
@@ -584,6 +686,11 @@ pub fn render(m: &MetricsInput) -> String {
         p.gauge("nr5g_ul_mod_order", "5G NR uplink modulation order (0=QPSK,1=16QAM,2=64QAM,3=256QAM).", f64::from(ul.mod_order));
     }
     p.opt_gauge("nr5g_mimo_layers", "5G NR active MIMO spatial layers.", phy.nr5g_mimo_layers.map(f64::from));
+    p.opt_gauge(
+        "nr5g_active_rank",
+        "5G NR active spatial MIMO rank.",
+        phy.nr5g_active_rank.or(phy.nr5g_mimo_layers).map(f64::from),
+    );
     if let Some(beam) = phy.ssb_beams.iter().find(|b| b.is_serving).or_else(|| phy.ssb_beams.first()) {
         p.gauge("nr5g_ssb_beam_id", "Serving 5G NR Synchronization Signal Block (SSB) beam index.", f64::from(beam.beam_id));
     }
@@ -816,5 +923,73 @@ mod tests {
         assert_eq!(line_value(&t, "cellcore_qmi_tmd_throttling ").as_deref(), Some("0"));
         assert_eq!(line_value(&t, "cellcore_qmi_tmd_mitigation_level{device=\"pa\"}").as_deref(), Some("0"));
         assert_eq!(line_value(&t, "cellcore_qmi_sar_state ").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn renders_v140_antenna_ul_ca_nsa_speedtest_and_ipa_metrics() {
+        let mut m = sample_input();
+        // RX0=-90, RX1=-96, RX2=None, RX3=-102 -> 3 active chains, spread = 12 dB
+        m.modem.mimo.rsrp = vec![Some(-90.0), Some(-96.0), None, Some(-102.0)];
+        if let Some(s) = m.modem.serving.as_mut() {
+            s.nsa_nr5g_rsrp = Some(-93.5);
+            s.nsa_nr5g_sinr = Some(16.0);
+        }
+        m.modem.carriers = vec![
+            CarrierComponent {
+                role: "PCC".into(),
+                band: "n41".into(),
+                bandwidth_mhz: Some(100.0),
+                ul_configured: true,
+                ul_bandwidth_mhz: Some(100.0),
+                ..Default::default()
+            },
+            CarrierComponent {
+                role: "SCC".into(),
+                band: "n41".into(),
+                bandwidth_mhz: Some(40.0),
+                ul_configured: true,
+                ul_bandwidth_mhz: Some(40.0),
+                ..Default::default()
+            },
+        ];
+        m.phy.nr5g_csi = Some(crate::radio_tuning::CsiMetrics {
+            mcs: 27,
+            ri: 4,
+            cqi: 15,
+            pmi: 3,
+        });
+        m.phy.nr5g_active_rank = Some(4);
+        m.last_speedtest = Some(SpeedtestRun {
+            ts: 1_700_000_000,
+            download_mbps: 820.0,
+            upload_mbps: 115.0,
+            ping_ms: 18.0,
+            jitter_ms: 2.5,
+            dl_latency_iqm: Some(31.5),
+            ul_latency_iqm: Some(44.0),
+            ..Default::default()
+        });
+        m.dataplane.mode = "native";
+        m.dataplane.ipa_hardware_offload_pct = Some(98);
+        m.dataplane.qrtr_ssr_total = 2;
+
+        let t = render(&m);
+        assert_eq!(line_value(&t, "cellcore_antenna_chain_present{chain=\"0\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_antenna_chain_present{chain=\"1\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_antenna_chain_present{chain=\"2\"}").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_antenna_chain_present{chain=\"3\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_antenna_active_chains ").as_deref(), Some("3"));
+        assert_eq!(line_value(&t, "cellcore_antenna_rsrp_spread_db ").as_deref(), Some("12"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_csi_ri ").as_deref(), Some("4"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_csi_cqi ").as_deref(), Some("15"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_active_rank ").as_deref(), Some("4"));
+        assert_eq!(line_value(&t, "cellcore_ul_ca_active ").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_ul_bandwidth_mhz ").as_deref(), Some("140"));
+        assert_eq!(line_value(&t, "cellcore_nsa_nr5g_rsrp_dbm ").as_deref(), Some("-93.5"));
+        assert_eq!(line_value(&t, "cellcore_nsa_nr5g_sinr_db ").as_deref(), Some("16"));
+        assert_eq!(line_value(&t, "cellcore_speedtest_dl_loaded_latency_ms ").as_deref(), Some("31.5"));
+        assert_eq!(line_value(&t, "cellcore_speedtest_ul_loaded_latency_ms ").as_deref(), Some("44"));
+        assert_eq!(line_value(&t, "cellcore_ipa_hardware_offload_pct ").as_deref(), Some("98"));
+        assert_eq!(line_value(&t, "cellcore_qrtr_ssr_total ").as_deref(), Some("2"));
     }
 }

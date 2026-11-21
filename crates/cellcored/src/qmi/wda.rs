@@ -40,6 +40,8 @@ pub struct WdaDataFormat {
     pub ul_max_datagrams: Option<u32>,
     pub ul_max_size: Option<u32>,
     pub dl_min_padding: Option<u32>,
+    #[serde(default)]
+    pub flow_control: Option<u8>,
 }
 
 fn parse_data_format_resp(tlvs: &[(u8, Vec<u8>)]) -> WdaDataFormat {
@@ -50,9 +52,10 @@ fn parse_data_format_resp(tlvs: &[(u8, Vec<u8>)]) -> WdaDataFormat {
         dl_agg_protocol: read_u32_le(tlvs, 0x13),
         dl_max_datagrams: read_u32_le(tlvs, 0x15),
         dl_max_size: read_u32_le(tlvs, 0x16),
-        ul_max_datagrams: read_u32_le(tlvs, 0x17),
-        ul_max_size: read_u32_le(tlvs, 0x18),
+        ul_max_datagrams: read_u32_le(tlvs, 0x17).or_else(|| read_u32_le(tlvs, 0x1D)),
+        ul_max_size: read_u32_le(tlvs, 0x18).or_else(|| read_u32_le(tlvs, 0x1E)),
         dl_min_padding: read_u32_le(tlvs, 0x1A),
+        flow_control: read_u8(tlvs, 0x1B),
     }
 }
 
@@ -74,7 +77,7 @@ pub async fn get_data_format(
     Ok(parse_data_format_resp(&tlvs))
 }
 
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_data_format(
     client: &dyn QmiClient,
     link_protocol: u32,
@@ -82,6 +85,9 @@ pub async fn set_data_format(
     dl_agg: u32,
     dl_max_dgrams: u32,
     dl_max_size: u32,
+    ul_max_dgrams: u32,
+    ul_max_size: u32,
+    flow_control: u8,
     ep: (u32, u32),
 ) -> Result<WdaDataFormat, QmiError> {
     let mut w = TlvWriter::new();
@@ -95,6 +101,10 @@ pub async fn set_data_format(
     ep_bytes.extend_from_slice(&ep.0.to_le_bytes());
     ep_bytes.extend_from_slice(&ep.1.to_le_bytes());
     w.push_bytes(0x17, &ep_bytes)?;
+    w.push_u32(0x1A, 0)
+        .push_u8(0x1B, flow_control)
+        .push_u32(0x1D, ul_max_dgrams)
+        .push_u32(0x1E, ul_max_size);
     let tlvs = client
         .rpc(WDA_SET_DATA_FORMAT, w.finish(), Duration::from_secs(5))
         .await?;
@@ -120,7 +130,8 @@ mod tests {
                 .push_u32(0x12, AGG_QMAP_V5)
                 .push_u32(0x13, AGG_QMAP_V5)
                 .push_u32(0x15, 32)
-                .push_u32(0x16, 16384);
+                .push_u32(0x16, 16384)
+                .push_u8(0x1B, 1);
             let mut out = parse_tlvs(&make_result_ok_tlv())?;
             out.extend(parse_tlvs(&w.finish())?);
             Ok(out)
@@ -131,5 +142,59 @@ mod tests {
         assert_eq!(fmt.dl_agg_protocol, Some(AGG_QMAP_V5));
         assert_eq!(fmt.dl_max_datagrams, Some(32));
         assert_eq!(fmt.dl_max_size, Some(16384));
+        assert_eq!(fmt.flow_control, Some(1));
+    }
+
+    #[tokio::test]
+    async fn encodes_qmapv5_set_data_format_tlvs() {
+        let mock = MockQmiClient::new(|msg_id, req_bytes| {
+            assert_eq!(msg_id, WDA_SET_DATA_FORMAT);
+            let req_tlvs = parse_tlvs(req_bytes)?;
+            assert_eq!(read_u32_le(&req_tlvs, 0x11), Some(LINK_PROT_RAW_IP));
+            assert_eq!(read_u32_le(&req_tlvs, 0x12), Some(AGG_QMAP_V5));
+            assert_eq!(read_u32_le(&req_tlvs, 0x13), Some(AGG_QMAP_V5));
+            assert_eq!(read_u32_le(&req_tlvs, 0x15), Some(64));
+            assert_eq!(read_u32_le(&req_tlvs, 0x16), Some(32768));
+            assert_eq!(read_u32_le(&req_tlvs, 0x1A), Some(0));
+            assert_eq!(read_u8(&req_tlvs, 0x1B), Some(1));
+            assert_eq!(read_u32_le(&req_tlvs, 0x1D), Some(16));
+            assert_eq!(read_u32_le(&req_tlvs, 0x1E), Some(16384));
+
+            let mut w = TlvWriter::new();
+            w.push_u8(0x10, 0)
+                .push_u32(0x11, LINK_PROT_RAW_IP)
+                .push_u32(0x12, AGG_QMAP_V5)
+                .push_u32(0x13, AGG_QMAP_V5)
+                .push_u32(0x15, 64)
+                .push_u32(0x16, 32768)
+                .push_u32(0x17, 16)
+                .push_u32(0x18, 16384)
+                .push_u32(0x1A, 0)
+                .push_u8(0x1B, 1);
+            let mut out = parse_tlvs(&make_result_ok_tlv())?;
+            out.extend(parse_tlvs(&w.finish())?);
+            Ok(out)
+        });
+        let fmt = set_data_format(
+            &mock,
+            LINK_PROT_RAW_IP,
+            AGG_QMAP_V5,
+            AGG_QMAP_V5,
+            64,
+            32768,
+            16,
+            16384,
+            1,
+            (EP_TYPE_EMBEDDED, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fmt.dl_agg_protocol, Some(AGG_QMAP_V5));
+        assert_eq!(fmt.dl_max_datagrams, Some(64));
+        assert_eq!(fmt.dl_max_size, Some(32768));
+        assert_eq!(fmt.ul_max_datagrams, Some(16));
+        assert_eq!(fmt.ul_max_size, Some(16384));
+        assert_eq!(fmt.dl_min_padding, Some(0));
+        assert_eq!(fmt.flow_control, Some(1));
     }
 }

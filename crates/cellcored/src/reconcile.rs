@@ -69,6 +69,31 @@ pub fn run_boot_reconcile(enforce_uhttpd_loopback: bool) -> ReconcileReport {
             .to_string();
     }
 
+    // 2b. Disable Qualcomm crash-dump xbl_ramdump trap & ensure MSS remoteproc SSR recovery
+    let dload_path_s = crate::paths::p("/sys/module/qcom_dload_mode/parameters/download_mode");
+    let dload_path = Path::new(&dload_path_s);
+    if dload_path.exists()
+        && fs::read_to_string(dload_path).unwrap_or_default().trim() == "1"
+    {
+        if let Err(e) = fs::write(dload_path, "0") {
+            warnings.push(format!("qcom_dload_mode write failed: {e}"));
+        } else {
+            actions.push("Disabled Qualcomm xbl_ramdump download_mode (1 -> 0)".into());
+        }
+    }
+
+    let rproc_path_s = crate::paths::p("/sys/class/remoteproc/remoteproc0/recovery");
+    let rproc_path = Path::new(&rproc_path_s);
+    if rproc_path.exists()
+        && fs::read_to_string(rproc_path).unwrap_or_default().trim() == "disabled"
+    {
+        if let Err(e) = fs::write(rproc_path, "enabled") {
+            warnings.push(format!("remoteproc0 recovery write failed: {e}"));
+        } else {
+            actions.push("Enabled MSS remoteproc0 SSR recovery".into());
+        }
+    }
+
     // 3. Conntrack hashsize / limits & SIP ALG suppression
     let hash_path_s = crate::paths::p("/sys/module/nf_conntrack/parameters/hashsize");
     let hash_path = Path::new(&hash_path_s);
@@ -109,6 +134,30 @@ pub fn run_boot_reconcile(enforce_uhttpd_loopback: bool) -> ReconcileReport {
         "nf_conntrack_udp_timeout_stream",
         &mut actions,
     );
+    for (p, v, lbl) in [
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal",
+            "1",
+            "nf_conntrack_tcp_be_liberal",
+        ),
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established",
+            "7200",
+            "nf_conntrack_tcp_timeout_established",
+        ),
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait",
+            "30",
+            "nf_conntrack_tcp_timeout_fin_wait",
+        ),
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait",
+            "30",
+            "nf_conntrack_tcp_timeout_time_wait",
+        ),
+    ] {
+        set_sysctl_if_different(p, v, lbl, &mut actions);
+    }
     // Security baseline sysctls (loose reverse-path filter + anti-redirect/source-route)
     for (p, v, lbl) in [
         ("/proc/sys/net/ipv4/conf/all/rp_filter", "2", "rp_filter"),
@@ -604,6 +653,37 @@ fn ensure_usb_gadget_bound(actions: &mut Vec<String>, warnings: &mut Vec<String>
     cur
 }
 
+pub fn build_mtu_firewall_script(ifaces: &[String], mtu_val: u32) -> String {
+    let mut out = String::new();
+    for iface in ifaces {
+        let trimmed = iface.trim();
+        if !trimmed.starts_with("rmnet_data") && !trimmed.starts_with("wwan") {
+            continue;
+        }
+        if !trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) {
+            continue;
+        }
+        out.push_str(&format!("ip link set {trimmed} mtu {mtu_val}\n"));
+        if (1280..1500).contains(&mtu_val) {
+            let mss4 = mtu_val - 40;
+            let mss6 = mtu_val - 60;
+            out.push_str(&format!(
+                "iptables -t mangle -C FORWARD -o {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss4} 2>/dev/null || iptables -t mangle -A FORWARD -o {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss4}\n"
+            ));
+            out.push_str(&format!(
+                "iptables -t mangle -C FORWARD -i {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss4} 2>/dev/null || iptables -t mangle -A FORWARD -i {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss4}\n"
+            ));
+            out.push_str(&format!(
+                "ip6tables -t mangle -C FORWARD -o {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss6} 2>/dev/null || ip6tables -t mangle -A FORWARD -o {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss6}\n"
+            ));
+            out.push_str(&format!(
+                "ip6tables -t mangle -C FORWARD -i {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss6} 2>/dev/null || ip6tables -t mangle -A FORWARD -i {trimmed} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss6}\n"
+            ));
+        }
+    }
+    out
+}
+
 fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String>) {
     // Ethernet PHY speed limit
     if let Some(limit) = uci_get_blocking("cellcore.eth_link.speed_limit")
@@ -642,7 +722,7 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
         }
     }
 
-    // MTU
+    // MTU + symmetric TCPMSS clamping
     let mtu_s = crate::paths::p("/etc/firewall.user.mtu");
     let mtu_file = Path::new(&mtu_s);
     if let Ok(content) = fs::read_to_string(mtu_file)
@@ -654,8 +734,27 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
         && (1280..=1500).contains(&mtu_val)
     {
         let m_str = mtu_val.to_string();
-        for iface in detect_wan_rmnet_ifaces_blocking() {
-            let _ = run_cmd_blocking("ip", &["link", "set", &iface, "mtu", &m_str]);
+        let mut ifaces = detect_wan_rmnet_ifaces_blocking();
+        for line in content.lines() {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() >= 5 && toks[0] == "ip" && toks[1] == "link" && toks[2] == "set" {
+                let cand = toks[3].to_string();
+                if (cand.starts_with("rmnet_data") || cand.starts_with("wwan"))
+                    && !ifaces.contains(&cand)
+                {
+                    ifaces.push(cand);
+                }
+            }
+        }
+        for iface in &ifaces {
+            let _ = run_cmd_blocking("ip", &["link", "set", iface, "mtu", &m_str]);
+        }
+        if mtu_val < 1500 && !ifaces.is_empty() {
+            let desired = build_mtu_firewall_script(&ifaces, mtu_val);
+            if !desired.is_empty() && !content.contains("TCPMSS") {
+                let _ = write_atomic("/etc/firewall.user.mtu", &desired, 0o644);
+            }
+            let _ = Command::new(crate::paths::p("/bin/sh")).arg(mtu_file).output();
         }
         actions.push(format!("Verified WAN MTU={m_str}"));
     }
@@ -808,10 +907,68 @@ mod tests {
         let env = crate::paths::TestSandbox::new("reconcile-conntrack");
         let p_max = env.write("/proc/sys/net/netfilter/nf_conntrack_max", "65536\n");
         let p_hash = env.write("/sys/module/nf_conntrack/parameters/hashsize", "8192\n");
+        let p_lib = env.write("/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal", "0\n");
+        let p_est = env.write("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established", "432000\n");
+        let p_fin = env.write("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait", "120\n");
+        let p_tw = env.write("/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait", "120\n");
         let rep = run_boot_reconcile(false);
         assert_eq!(std::fs::read_to_string(&p_max).unwrap().trim(), "65536");
         assert_eq!(std::fs::read_to_string(&p_hash).unwrap().trim(), "16384");
+        assert_eq!(std::fs::read_to_string(&p_lib).unwrap().trim(), "1");
+        assert_eq!(std::fs::read_to_string(&p_est).unwrap().trim(), "7200");
+        assert_eq!(std::fs::read_to_string(&p_fin).unwrap().trim(), "30");
+        assert_eq!(std::fs::read_to_string(&p_tw).unwrap().trim(), "30");
         assert_eq!(rep.conntrack_max, 65536);
         assert_eq!(rep.conntrack_hashsize, 16384);
+    }
+
+    #[test]
+    fn mtu_firewall_helper_emits_symmetric_v4_v6_tcpmss_clamping() {
+        let script = build_mtu_firewall_script(&["rmnet_data0".into()], 1420);
+        assert!(script.starts_with("ip link set rmnet_data0 mtu 1420\n"));
+        assert!(script.contains("-o rmnet_data0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380"));
+        assert!(script.contains("-i rmnet_data0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380"));
+        assert!(script.contains("ip6tables -t mangle"));
+        assert!(script.contains("-o rmnet_data0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360"));
+        assert!(script.contains("-i rmnet_data0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360"));
+
+        let s1500 = build_mtu_firewall_script(&["rmnet_data0".into()], 1500);
+        assert_eq!(s1500, "ip link set rmnet_data0 mtu 1500\n");
+        assert!(build_mtu_firewall_script(&["br-lan".into(), "eth0".into()], 1420).is_empty());
+    }
+
+    #[test]
+    fn reconcile_disables_qcom_dload_mode_and_enables_remoteproc_recovery() {
+        let env = crate::paths::TestSandbox::new("reconcile-dload-rproc");
+        let p_dload = env.write("/sys/module/qcom_dload_mode/parameters/download_mode", "1\n");
+        let p_rproc = env.write("/sys/class/remoteproc/remoteproc0/recovery", "disabled\n");
+
+        let rep1 = run_boot_reconcile(false);
+        assert_eq!(std::fs::read_to_string(&p_dload).unwrap().trim(), "0");
+        assert_eq!(std::fs::read_to_string(&p_rproc).unwrap().trim(), "enabled");
+        assert!(
+            rep1.actions
+                .iter()
+                .any(|a| a == "Disabled Qualcomm xbl_ramdump download_mode (1 -> 0)"),
+            "{:?}",
+            rep1.actions
+        );
+        assert!(
+            rep1.actions
+                .iter()
+                .any(|a| a == "Enabled MSS remoteproc0 SSR recovery"),
+            "{:?}",
+            rep1.actions
+        );
+
+        let rep2 = run_boot_reconcile(false);
+        assert!(
+            !rep2
+                .actions
+                .iter()
+                .any(|a| a.contains("xbl_ramdump") || a.contains("remoteproc0")),
+            "second run must be idempotent: {:?}",
+            rep2.actions
+        );
     }
 }
