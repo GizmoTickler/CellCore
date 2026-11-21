@@ -1151,6 +1151,355 @@ pub async fn post_acme_issue(State(ctx): State<HttpCtx>) -> Response {
     .into_response()
 }
 
+pub fn reset_acme_cert_and_disable() -> Result<(), String> {
+    for p in [ACME_CERT_PATH, ACME_KEY_PATH] {
+        let mapped = crate::paths::p(p);
+        if let Err(e) = fs::remove_file(&mapped)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("remove {mapped}: {e}"));
+        }
+    }
+    let mut cfg = load_config();
+    cfg.enabled = false;
+    save_config(&cfg)?;
+    Ok(())
+}
+
+pub async fn delete_acme(State(ctx): State<HttpCtx>) -> Response {
+    if let Err(e) = reset_acme_cert_and_disable() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "error": e })),
+        )
+            .into_response();
+    }
+    ctx.app.push_daemon_log("ACME certificate removed and auto-renewal disabled (falling back to self-signed TLS)");
+    let cfg = load_config();
+    let cert = inspect_active_cert().await;
+    let status = run_state().read().await.clone();
+    Json(serde_json::json!({
+        "status": "ok",
+        "cert": cert,
+        "config": redacted_config(&cfg),
+        "runState": status,
+    }))
+    .into_response()
+}
+
+fn parse_issuer_cli(s: &str) -> Result<AcmeIssuer, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "letsencrypt" | "le" => Ok(AcmeIssuer::Letsencrypt),
+        "letsencrypt-staging" | "le-staging" => Ok(AcmeIssuer::LetsencryptStaging),
+        "zerossl" => Ok(AcmeIssuer::Zerossl),
+        "google" | "gts" => Ok(AcmeIssuer::Google),
+        "google-staging" | "gts-staging" => Ok(AcmeIssuer::GoogleStaging),
+        "custom" => Ok(AcmeIssuer::Custom),
+        other => Err(format!(
+            "unsupported --issuer {other:?} (allowed: letsencrypt, letsencrypt-staging, zerossl, google, google-staging, custom)"
+        )),
+    }
+}
+
+fn parse_validation_cli(s: &str) -> Result<ValidationMethod, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "dns-01" | "dns01" | "dns" => Ok(ValidationMethod::Dns01),
+        "http-01" | "http01" | "http" => Ok(ValidationMethod::Http01),
+        other => Err(format!("unsupported --validation {other:?} (allowed: dns-01, http-01)")),
+    }
+}
+
+fn parse_dns_provider_cli(s: &str) -> Result<DnsProvider, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "cloudflare" => Ok(DnsProvider::Cloudflare),
+        "route53" => Ok(DnsProvider::Route53),
+        "digitalocean" => Ok(DnsProvider::Digitalocean),
+        "hetzner" => Ok(DnsProvider::Hetzner),
+        "porkbun" => Ok(DnsProvider::Porkbun),
+        "duckdns" => Ok(DnsProvider::Duckdns),
+        "desec" => Ok(DnsProvider::Desec),
+        "rfc2136" | "knot" | "nsupdate" => Ok(DnsProvider::Rfc2136),
+        "webhook" => Ok(DnsProvider::Webhook),
+        other => Err(format!(
+            "unsupported --dns-provider {other:?} (allowed: cloudflare, route53, digitalocean, hetzner, porkbun, duckdns, desec, rfc2136, webhook)"
+        )),
+    }
+}
+
+fn apply_cli_config_args(cfg: &mut AcmeConfig, args: &[String]) -> Result<(), String> {
+    let mut i = 0usize;
+    let mut touched = false;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+            *idx += 1;
+            args.get(*idx)
+                .cloned()
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+        match flag {
+            "--enabled" => {
+                let v = next_val(&mut i, "--enabled")?;
+                cfg.enabled = match v.to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => return Err(format!("invalid --enabled value {v:?} (expected true|false)")),
+                };
+                touched = true;
+            }
+            "--issuer" => {
+                cfg.issuer = parse_issuer_cli(&next_val(&mut i, "--issuer")?)?;
+                touched = true;
+            }
+            "--directory-url" => {
+                cfg.custom_directory_url = next_val(&mut i, "--directory-url")?.trim().to_string();
+                touched = true;
+            }
+            "--email" => {
+                cfg.email = next_val(&mut i, "--email")?.trim().to_string();
+                touched = true;
+            }
+            "--domains" => {
+                let raw = next_val(&mut i, "--domains")?;
+                cfg.domains = raw
+                    .split([',', ' '])
+                    .map(|d| d.trim().to_ascii_lowercase())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                touched = true;
+            }
+            "--validation" => {
+                cfg.validation = parse_validation_cli(&next_val(&mut i, "--validation")?)?;
+                touched = true;
+            }
+            "--eab-kid" => {
+                cfg.eab_kid = next_val(&mut i, "--eab-kid")?.trim().to_string();
+                touched = true;
+            }
+            "--eab-hmac" => {
+                cfg.eab_hmac_key = next_val(&mut i, "--eab-hmac")?.trim().to_string();
+                touched = true;
+            }
+            "--clear-eab" => {
+                cfg.eab_kid.clear();
+                cfg.eab_hmac_key.clear();
+                touched = true;
+            }
+            "--dns-provider" => {
+                cfg.dns_provider = parse_dns_provider_cli(&next_val(&mut i, "--dns-provider")?)?;
+                touched = true;
+            }
+            "--dns-cred" => {
+                let kv = next_val(&mut i, "--dns-cred")?;
+                let Some((k, v)) = kv.split_once('=') else {
+                    return Err("--dns-cred must be in KEY=VALUE format".into());
+                };
+                let k = k.trim();
+                if k.is_empty() {
+                    return Err("--dns-cred key must not be empty".into());
+                }
+                if v.trim().is_empty() {
+                    cfg.dns_credentials.remove(k);
+                } else {
+                    cfg.dns_credentials.insert(k.to_string(), v.trim().to_string());
+                }
+                touched = true;
+            }
+            "--propagation" => {
+                let raw = next_val(&mut i, "--propagation")?;
+                let secs = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --propagation seconds {raw:?}"))?;
+                cfg.propagation_seconds = secs.clamp(5, 300);
+                touched = true;
+            }
+            "--renew-days" => {
+                let raw = next_val(&mut i, "--renew-days")?;
+                let days = raw
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --renew-days {raw:?}"))?;
+                cfg.renew_before_days = days.clamp(1, 60);
+                touched = true;
+            }
+            other => return Err(format!("unknown flag: {other}")),
+        }
+        i += 1;
+    }
+    if !touched {
+        return Err("no config flags supplied".into());
+    }
+    for d in &cfg.domains {
+        let bare = d.trim_start_matches("*.");
+        if bare.is_empty() || !bare.contains('.') || bare.contains(['/', ' ', ';', '\'', '"']) {
+            return Err(format!("invalid domain name: {d:?}"));
+        }
+    }
+    if cfg.issuer == AcmeIssuer::Custom {
+        cfg.issuer.directory_url(&cfg.custom_directory_url)?;
+    }
+    Ok(())
+}
+
+fn print_acme_cli_usage() {
+    eprintln!(
+        "Usage: cellctl acme <status [--json] | config [OPTIONS] | issue | reset>\n\n\
+         Subcommands:\n\
+         \x20 status [--json]      Show active TLS cert and redacted ACME configuration\n\
+         \x20 config [OPTIONS]     Update ACME settings atomically in /etc/cellcore/acme.json\n\
+         \x20   --enabled <true|false>\n\
+         \x20   --issuer <letsencrypt|letsencrypt-staging|zerossl|google|google-staging|custom>\n\
+         \x20   --directory-url <https://...>\n\
+         \x20   --email <addr>\n\
+         \x20   --domains <d1,d2>\n\
+         \x20   --validation <dns-01|http-01>\n\
+         \x20   --eab-kid <kid> --eab-hmac <key> | --clear-eab\n\
+         \x20   --dns-provider <cloudflare|route53|digitalocean|hetzner|porkbun|duckdns|desec|rfc2136|webhook>\n\
+         \x20   --dns-cred <KEY=VALUE> (repeatable)\n\
+         \x20   --propagation <5..300> --renew-days <1..60>\n\
+         \x20 issue                Issue or renew certificate now (uses running daemon IPC if active)\n\
+         \x20 reset                Remove ACME cert/key and disable auto-renewal (reverts to self-signed)"
+    );
+}
+
+/// CLI entrypoint for `cellctl acme ...` / `cellcored acme ...`.
+pub fn run_cli(args: &[String]) -> i32 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    match sub {
+        "help" | "-h" | "--help" => {
+            print_acme_cli_usage();
+            0
+        }
+        "status" => {
+            let as_json = args.iter().any(|a| a == "--json");
+            let cfg = load_config();
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("acme: runtime init failed: {e}");
+                    return 1;
+                }
+            };
+            let cert = rt.block_on(inspect_active_cert());
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "cert": cert,
+                        "config": redacted_config(&cfg),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                fn show(s: &str) -> &str {
+                    let t = s.trim();
+                    if t.is_empty() { "none" } else { t }
+                }
+                println!(
+                    "cert_source={} subject={} issuer={} not_after={} days_remaining={}",
+                    cert.source,
+                    show(&cert.subject),
+                    show(&cert.issuer),
+                    show(&cert.not_after),
+                    cert.days_remaining
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                );
+                println!(
+                    "acme_enabled={} issuer={} validation={:?} domains={} dns_provider={} has_eab={}",
+                    cfg.enabled,
+                    cfg.issuer.key_tag(),
+                    cfg.validation,
+                    if cfg.domains.is_empty() { "none".to_string() } else { cfg.domains.join(",") },
+                    cfg.dns_provider.as_str(),
+                    !cfg.eab_hmac_key.trim().is_empty(),
+                );
+            }
+            0
+        }
+        "config" => {
+            let mut cfg = load_config();
+            if let Err(e) = apply_cli_config_args(&mut cfg, &args[1..]) {
+                eprintln!("acme config error: {e}");
+                print_acme_cli_usage();
+                return 2;
+            }
+            if let Err(e) = save_config(&cfg) {
+                eprintln!("acme config save failed: {e}");
+                return 1;
+            }
+            println!(
+                "ok=1 issuer={} validation={:?} domains={} enabled={}",
+                cfg.issuer.key_tag(),
+                cfg.validation,
+                if cfg.domains.is_empty() { "none".to_string() } else { cfg.domains.join(",") },
+                cfg.enabled
+            );
+            0
+        }
+        "issue" => {
+            // Prefer IPC into the running daemon so HTTP-01 challenges are served on port :80
+            // and the Web UI reflects live progress.
+            match crate::cli::call_daemon_sync_timeout(
+                &crate::ipc::IpcRequest::AcmeIssue,
+                Duration::from_secs(360),
+            ) {
+                Ok(resp) if resp.ok => {
+                    print!("{}", resp.output);
+                    0
+                }
+                Ok(resp) => {
+                    eprintln!("acme issue failed: {}", resp.error.unwrap_or_else(|| "unknown error".into()));
+                    1
+                }
+                Err(_) => {
+                    // Daemon not running: run directly in-process (works for DNS-01).
+                    let cfg = load_config();
+                    if cfg.domains.is_empty() {
+                        eprintln!("acme issue failed: no domains configured");
+                        return 1;
+                    }
+                    if cfg.validation == ValidationMethod::Http01 {
+                        eprintln!("acme issue failed: HTTP-01 requires running cellcored daemon");
+                        return 1;
+                    }
+                    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("acme: runtime init failed: {e}");
+                            return 1;
+                        }
+                    };
+                    match rt.block_on(issue_certificate(cfg)) {
+                        Ok(msg) => {
+                            println!("{msg}");
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("acme issue failed: {e}");
+                            1
+                        }
+                    }
+                }
+            }
+        }
+        "reset" => match reset_acme_cert_and_disable() {
+            Ok(()) => {
+                println!("ok=1 acme_reset=1 note=reverts_to_self_signed_within_60s");
+                0
+            }
+            Err(e) => {
+                eprintln!("acme reset failed: {e}");
+                1
+            }
+        },
+        other => {
+            eprintln!("unknown acme subcommand: {other}");
+            print_acme_cli_usage();
+            2
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,5 +1567,43 @@ mod tests {
         assert_eq!(&sig[..32], &[0xaa; 32]);
         assert_eq!(sig[32], 0x00);
         assert_eq!(&sig[33..], &[0xbb; 31]);
+    }
+
+    #[test]
+    fn cli_config_flags_parse_all_fields_and_validate() {
+        let mut cfg = AcmeConfig::default();
+        let args: Vec<String> = [
+            "--enabled", "true",
+            "--issuer", "google",
+            "--email", "ops@example.com",
+            "--domains", "gw0.example.com,gw1.example.com",
+            "--validation", "dns-01",
+            "--eab-kid", "kid123",
+            "--eab-hmac", "hmac456",
+            "--dns-provider", "rfc2136",
+            "--dns-cred", "server=192.168.120.53:53",
+            "--dns-cred", "tsigName=acme.",
+            "--propagation", "20",
+            "--renew-days", "15",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        apply_cli_config_args(&mut cfg, &args).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.issuer, AcmeIssuer::Google);
+        assert_eq!(cfg.email, "ops@example.com");
+        assert_eq!(cfg.domains, vec!["gw0.example.com", "gw1.example.com"]);
+        assert_eq!(cfg.validation, ValidationMethod::Dns01);
+        assert_eq!(cfg.eab_kid, "kid123");
+        assert_eq!(cfg.eab_hmac_key, "hmac456");
+        assert_eq!(cfg.dns_provider, DnsProvider::Rfc2136);
+        assert_eq!(cfg.dns_credentials.get("server").map(String::as_str), Some("192.168.120.53:53"));
+        assert_eq!(cfg.dns_credentials.get("tsigName").map(String::as_str), Some("acme."));
+        assert_eq!(cfg.propagation_seconds, 20);
+        assert_eq!(cfg.renew_before_days, 15);
+
+        let bad_args = vec!["--domains".into(), "bad domain".into()];
+        assert!(apply_cli_config_args(&mut cfg, &bad_args).is_err());
     }
 }

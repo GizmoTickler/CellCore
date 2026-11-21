@@ -308,8 +308,10 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
               <div className="flex flex-col sm:flex-row gap-2.5">
                 <div className="flex gap-1.5 min-w-0 sm:flex-1">
                   {engine === "native" ? (
-                    <div className="flex h-12 flex-1 items-center rounded-2xl border border-line bg-sunk/60 px-4 text-[13px] font-medium text-ink-2 truncate">
-                      Cloudflare Anycast · 4-stream HTTP + concurrent DL/UL bufferbloat probe
+                    <div className="flex min-h-12 flex-1 items-center rounded-2xl border border-line bg-sunk/60 px-4 py-2.5 text-[12.5px] leading-snug font-medium text-ink-2 min-w-0">
+                      <span className="min-w-0 break-words">
+                        Cloudflare Anycast · 8-stream HTTP + loaded bufferbloat
+                      </span>
                     </div>
                   ) : (
                     <>

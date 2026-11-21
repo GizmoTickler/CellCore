@@ -370,7 +370,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/system/reboot", post(handlers::post_reboot))
         .route("/api/v1/system/ota", get(handlers::get_ota).post(handlers::post_ota))
         .route("/api/v1/system/settings", get(handlers::get_settings).post(handlers::post_settings))
-        .route("/api/v1/system/acme", get(crate::acme::get_acme).put(crate::acme::put_acme))
+        .route("/api/v1/system/acme", get(crate::acme::get_acme).put(crate::acme::put_acme).delete(crate::acme::delete_acme))
         .route("/api/v1/system/acme/issue", post(crate::acme::post_acme_issue))
         .route("/api/v1/system/password", post(handlers::post_change_password))
         .route("/api/v1/auth/logout", post(handlers::post_logout))

@@ -30,10 +30,13 @@ const STDERR_TAIL_BYTES: usize = 2048;
 
 const NATIVE_DEFAULT_HOST: &str = "speed.cloudflare.com";
 const NATIVE_DEFAULT_PORT: u16 = 80;
-const NATIVE_STREAMS: usize = 4;
-const NATIVE_DL_SECS: u64 = 8;
-const NATIVE_UL_SECS: u64 = 7;
-const NATIVE_WARMUP_SECS: f64 = 1.0;
+const NATIVE_DL_STREAMS: usize = 8;
+const NATIVE_UL_STREAMS: usize = 6;
+const NATIVE_DL_CHUNK_BYTES: usize = 90_000_000;
+const NATIVE_UL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const NATIVE_DL_SECS: u64 = 10;
+const NATIVE_UL_SECS: u64 = 8;
+const NATIVE_WARMUP_SECS: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpeedtestEngine {
@@ -679,17 +682,40 @@ pub async fn start_speedtest_with_engine(
 // Pure-Rust Native Multi-Stream Speedtest & Loaded Bufferbloat Engine
 // ---------------------------------------------------------------------------
 
-async fn connect_native_socket(addr: SocketAddr, bypass_dev: Option<&str>) -> Result<TcpStream, String> {
+async fn connect_native_socket(
+    addr: SocketAddr,
+    bypass_dev: Option<&str>,
+    rcvbuf: Option<i32>,
+    sndbuf: Option<i32>,
+) -> Result<TcpStream, String> {
     let sock = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
     }
     .map_err(|e| format!("socket: {e}"))?;
 
-    if let Some(dev) = bypass_dev {
-        let mut ifname = dev.as_bytes().to_vec();
-        ifname.push(0);
-        unsafe {
+    unsafe {
+        if let Some(sz) = rcvbuf {
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&sz as *const i32) as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+        if let Some(sz) = sndbuf {
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&sz as *const i32) as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+        if let Some(dev) = bypass_dev {
+            let mut ifname = dev.as_bytes().to_vec();
+            ifname.push(0);
             let _ = libc::setsockopt(
                 sock.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -705,6 +731,15 @@ async fn connect_native_socket(addr: SocketAddr, bypass_dev: Option<&str>) -> Re
         .map_err(|e| format!("connect: {e}"))?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
+}
+
+fn parse_http_status(headers: &str) -> u16 {
+    headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0)
 }
 
 async fn read_http_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
@@ -744,9 +779,10 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 async fn probe_http_rtt(
     stream: &mut TcpStream,
     host: &str,
+    meas_id: u64,
 ) -> Result<(f64, String), String> {
     let req = format!(
-        "GET /__down?bytes=0 HTTP/1.1\r\nHost: {host}\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
+        "GET /__down?measId={meas_id}&bytes=0 HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
     );
     let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(3), stream.write_all(req.as_bytes()))
@@ -775,17 +811,18 @@ async fn probe_http_rtt(
 async fn native_dl_worker(
     addr: SocketAddr,
     host: String,
+    meas_id: u64,
     bypass_dev: Option<String>,
     bytes_total: Arc<AtomicU64>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let req = format!(
-        "GET /__down?bytes=25000000 HTTP/1.1\r\nHost: {host}\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
+        "GET /__down?measId={meas_id}&bytes={NATIVE_DL_CHUNK_BYTES} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
     );
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 256 * 1024];
     while !*stop_rx.borrow() {
-        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref()).await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), Some(2 * 1024 * 1024), None).await else {
+            tokio::time::sleep(Duration::from_millis(120)).await;
             continue;
         };
         while !*stop_rx.borrow() {
@@ -795,7 +832,16 @@ async fn native_dl_worker(
             let Ok((hdr, rest)) = read_http_headers(&mut stream).await else {
                 break;
             };
-            let target = parse_content_length(&hdr).unwrap_or(25_000_000);
+            let status = parse_http_status(&hdr);
+            if status == 429 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                break;
+            }
+            if !(200..300).contains(&status) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                break;
+            }
+            let target = parse_content_length(&hdr).unwrap_or(NATIVE_DL_CHUNK_BYTES);
             let mut got = rest.len();
             bytes_total.fetch_add(got as u64, Ordering::Relaxed);
             let mut eof = false;
@@ -826,18 +872,20 @@ async fn native_dl_worker(
 async fn native_ul_worker(
     addr: SocketAddr,
     host: String,
+    meas_id: u64,
     bypass_dev: Option<String>,
     bytes_total: Arc<AtomicU64>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
-    const CHUNK_TOTAL: usize = 4 * 1024 * 1024;
     let header = format!(
-        "POST /__up HTTP/1.1\r\nHost: {host}\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nContent-Type: application/octet-stream\r\nContent-Length: {CHUNK_TOTAL}\r\nConnection: keep-alive\r\n\r\n"
+        "POST /__up?measId={meas_id} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nContent-Type: application/octet-stream\r\nContent-Length: {NATIVE_UL_CHUNK_BYTES}\r\nConnection: keep-alive\r\n\r\n"
     );
-    let payload = vec![0x5Au8; 65536];
+    let payload = vec![0x5Au8; 128 * 1024];
     while !*stop_rx.borrow() {
-        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref()).await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Keep SO_SNDBUF bounded (128 KiB per stream) so cellular uploads don't
+        // experience fake initial buffer-fill spikes followed by drain stalls.
+        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), None, Some(128 * 1024)).await else {
+            tokio::time::sleep(Duration::from_millis(120)).await;
             continue;
         };
         while !*stop_rx.borrow() {
@@ -846,8 +894,8 @@ async fn native_ul_worker(
             }
             let mut sent = 0usize;
             let mut failed = false;
-            while sent < CHUNK_TOTAL && !*stop_rx.borrow() {
-                let to_send = (CHUNK_TOTAL - sent).min(payload.len());
+            while sent < NATIVE_UL_CHUNK_BYTES && !*stop_rx.borrow() {
+                let to_send = (NATIVE_UL_CHUNK_BYTES - sent).min(payload.len());
                 tokio::select! {
                     _ = stop_rx.changed() => break,
                     res = stream.write_all(&payload[..to_send]) => {
@@ -867,6 +915,11 @@ async fn native_ul_worker(
             let Ok((hdr, rest)) = read_http_headers(&mut stream).await else {
                 break;
             };
+            let status = parse_http_status(&hdr);
+            if status == 429 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                break;
+            }
             if let Some(cl) = parse_content_length(&hdr)
                 && cl > rest.len()
             {
@@ -887,6 +940,7 @@ async fn native_ul_worker(
 async fn native_loaded_ping_worker(
     addr: SocketAddr,
     host: String,
+    meas_id: u64,
     bypass_dev: Option<String>,
     samples: Arc<Mutex<Vec<f64>>>,
     mut stop_rx: watch::Receiver<bool>,
@@ -894,10 +948,10 @@ async fn native_loaded_ping_worker(
     let mut stream_opt: Option<TcpStream> = None;
     while !*stop_rx.borrow() {
         if stream_opt.is_none() {
-            stream_opt = connect_native_socket(addr, bypass_dev.as_deref()).await.ok();
+            stream_opt = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await.ok();
         }
         if let Some(s) = stream_opt.as_mut() {
-            match probe_http_rtt(s, &host).await {
+            match probe_http_rtt(s, &host, meas_id).await {
                 Ok((rtt, _)) => {
                     if let Ok(mut g) = samples.lock() {
                         g.push(rtt);
@@ -910,7 +964,7 @@ async fn native_loaded_ping_worker(
         }
         tokio::select! {
             _ = stop_rx.changed() => break,
-            _ = tokio::time::sleep(Duration::from_millis(220)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
 }
@@ -1002,7 +1056,10 @@ async fn run_native_pipeline(
     };
 
     // --- Phase 1: Idle Latency & Edge Discovery ---
-    let mut ping_stream = connect_native_socket(addr, bypass_dev.as_deref()).await?;
+    let meas_id = now_secs()
+        .wrapping_mul(1_000_003)
+        .wrapping_add(u64::from(std::process::id()));
+    let mut ping_stream = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await?;
     let mut idle_rtts: Vec<f64> = Vec::with_capacity(9);
     let mut ext_ip: Option<String> = None;
     let mut colo: Option<String> = None;
@@ -1011,7 +1068,7 @@ async fn run_native_pipeline(
         if *cancel_rx.borrow() {
             return Ok(());
         }
-        let (rtt, hdr) = probe_http_rtt(&mut ping_stream, host).await?;
+        let (rtt, hdr) = probe_http_rtt(&mut ping_stream, host, meas_id).await?;
         if i == 0 {
             let (ip, c) = parse_cf_meta_headers(&hdr);
             ext_ip = ip;
@@ -1047,6 +1104,7 @@ async fn run_native_pipeline(
         state,
         addr,
         host,
+        meas_id,
         bypass_dev.clone(),
         "download",
         20,
@@ -1060,14 +1118,15 @@ async fn run_native_pipeline(
         return Ok(());
     }
 
-    // Brief 300ms pause to let buffers drain before upload phase
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Brief 400ms pause to let buffers drain before upload phase
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     // --- Phase 3: Multi-Stream Upload + Loaded Latency ---
     let (ul_mbps, ul_iqm) = run_native_transfer_phase(
         state,
         addr,
         host,
+        meas_id,
         bypass_dev,
         "upload",
         60,
@@ -1140,6 +1199,7 @@ async fn run_native_transfer_phase(
     state: &AppState,
     addr: SocketAddr,
     host: &str,
+    meas_id: u64,
     bypass_dev: Option<String>,
     phase: &str,
     prog_base: u8,
@@ -1152,21 +1212,27 @@ async fn run_native_transfer_phase(
     let bytes_total = Arc::new(AtomicU64::new(0));
     let rtt_samples = Arc::new(Mutex::new(Vec::<f64>::new()));
 
-    let mut handles = Vec::with_capacity(NATIVE_STREAMS + 1);
-    for _ in 0..NATIVE_STREAMS {
+    let streams = if phase == "download" {
+        NATIVE_DL_STREAMS
+    } else {
+        NATIVE_UL_STREAMS
+    };
+    let mut handles = Vec::with_capacity(streams + 1);
+    for _ in 0..streams {
         let b = Arc::clone(&bytes_total);
         let rx = phase_stop_rx.clone();
         let h = host.to_string();
         let dev = bypass_dev.clone();
         if phase == "download" {
-            handles.push(tokio::spawn(native_dl_worker(addr, h, dev, b, rx)));
+            handles.push(tokio::spawn(native_dl_worker(addr, h, meas_id, dev, b, rx)));
         } else {
-            handles.push(tokio::spawn(native_ul_worker(addr, h, dev, b, rx)));
+            handles.push(tokio::spawn(native_ul_worker(addr, h, meas_id, dev, b, rx)));
         }
     }
     handles.push(tokio::spawn(native_loaded_ping_worker(
         addr,
         host.to_string(),
+        meas_id,
         bypass_dev,
         Arc::clone(&rtt_samples),
         phase_stop_rx,
@@ -1174,8 +1240,8 @@ async fn run_native_transfer_phase(
 
     let start = Instant::now();
     let total_dur = Duration::from_secs(duration_secs.max(1));
-    let mut prev_bytes = 0u64;
-    let mut prev_t = start;
+    let mut window: std::collections::VecDeque<(Instant, u64)> = std::collections::VecDeque::with_capacity(8);
+    window.push_back((start, 0));
     let mut warmup_mark: Option<(Instant, u64)> = None;
 
     loop {
@@ -1192,10 +1258,18 @@ async fn run_native_transfer_phase(
         let now = Instant::now();
         let elapsed = now.duration_since(start);
         let cur_bytes = bytes_total.load(Ordering::Relaxed);
-        let dt = now.duration_since(prev_t).as_secs_f64().max(0.05);
-        let inst_mbps = round2(((cur_bytes.saturating_sub(prev_bytes) as f64) * 8.0) / (dt * 1_000_000.0));
-        prev_bytes = cur_bytes;
-        prev_t = now;
+        window.push_back((now, cur_bytes));
+        // 1.0-second rolling sliding window eliminates 250 ms cellular TDD/HARQ sawtooth noise
+        while window.len() > 2
+            && window
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(1050))
+        {
+            window.pop_front();
+        }
+        let (win_t, win_b) = window.front().copied().unwrap_or((start, 0));
+        let dt = now.duration_since(win_t).as_secs_f64().max(0.1);
+        let smooth_mbps = round2(((cur_bytes.saturating_sub(win_b) as f64) * 8.0) / (dt * 1_000_000.0));
 
         if warmup_mark.is_none() && elapsed.as_secs_f64() >= warmup_secs {
             warmup_mark = Some((now, cur_bytes));
@@ -1210,16 +1284,16 @@ async fn run_native_transfer_phase(
             live.phase = phase.into();
             live.progress = progress;
             if phase == "download" {
-                live.download_mbps = Some(inst_mbps);
+                live.download_mbps = Some(smooth_mbps);
                 live.dl_latency_iqm = iqm;
             } else {
-                live.upload_mbps = Some(inst_mbps);
+                live.upload_mbps = Some(smooth_mbps);
                 live.ul_latency_iqm = iqm;
             }
             live.samples.push(SpeedtestSample {
                 ts: now_secs() * 1000,
                 phase: phase.into(),
-                mbps: inst_mbps,
+                mbps: smooth_mbps,
                 latency_iqm: iqm,
             });
             if live.samples.len() > 160 {
@@ -1329,7 +1403,7 @@ mod tests {
                             break;
                         };
                         let first = hdr.lines().next().unwrap_or("");
-                        if first.starts_with("GET /__down?bytes=0") {
+                        if first.contains("bytes=0") {
                             let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncf-meta-ip: 198.51.100.7\r\ncf-ray: abcdef123456-IAD\r\nConnection: keep-alive\r\n\r\n";
                             if sock.write_all(resp.as_bytes()).await.is_err() {
                                 break;

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1 — `cellctl acme` CLI, `DELETE /api/v1/system/acme` & Mobile Speedtest Polish
+
+- **ACME CLI (`cellctl acme` & `cellcored acme`):**
+  - Added `cellctl acme status [--json]`, `cellctl acme config [flags]` (issuer, email, domains, `dns-01`/`http-01`, EAB KID/HMAC, all 9 DNS providers + repeatable `--dns-cred KEY=VALUE`), `cellctl acme issue` (dispatches via daemon IPC so both `http-01` and `dns-01` work seamlessly from SSH), and `cellctl acme reset`.
+  - Also wired `cellctl overlay` directly into `cellctl`.
+- **ACME Reset API:** Added `DELETE /api/v1/system/acme` to remove `/etc/ssl/acme/{fullchain,privkey}.pem` and disable auto-renewal (reverting cleanly to self-signed TLS).
+- **Mobile UI Polish:** Fixed text clipping on narrow mobile viewports in the Native Rust Cloudflare Speedtest description pill so it wraps cleanly without overflow.
+- **Native Rust Speedtest Cellular Performance Upgrade:** Upgraded to 8 DL streams (`90 MB` continuous chunks, `2 MiB` `SO_RCVBUF`, `256 KiB` read buffer) + 6 UL streams (`16 MB` chunks, bounded `128 KiB` `SO_SNDBUF`), `measId` + HTTP `429` backoff handling to prevent Cloudflare rate-limit valleys, 2 s slow-start warmup exclusion, and 1 s rolling sliding-window smoothing for clean cellular traces.
+
 ## 1.2.0 — SDX75 Deep PHY/QoS/Security Telemetry, QMI DSP Services & Native Rust Speedtest
 
 - **SDX75 Live PHY, QoS & Air-Interface Security Telemetry (`Cellular → Bands & Tuning`):**

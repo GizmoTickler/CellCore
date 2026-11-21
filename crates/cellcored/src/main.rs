@@ -125,6 +125,10 @@ fn main() {
             let code = overlay::run_cli(&args[2..]);
             process::exit(code);
         }
+        Some("acme") => {
+            let code = acme::run_cli(&args[2..]);
+            process::exit(code);
+        }
         Some("reconcile") => {
             let report = run_boot_reconcile(true);
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
@@ -286,7 +290,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.2.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.2.1");
     }
 
     #[test]

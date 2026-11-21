@@ -222,6 +222,8 @@ pub enum IpcRequest {
     Metrics,
     /// Route10's failover hint: "active" | "standby".
     Role { role: String },
+    /// Trigger ACME certificate issuance inside the running daemon (supports both HTTP-01 and DNS-01).
+    AcmeIssue,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -464,6 +466,35 @@ pub(crate) async fn dispatch_ipc(
                 error: Some("role must be active or standby".into()),
             },
         },
+        IpcRequest::AcmeIssue => {
+            let cfg = crate::acme::load_config();
+            if cfg.domains.is_empty() {
+                return IpcResponse {
+                    ok: false,
+                    output: String::new(),
+                    error: Some("No ACME domains configured. Run `cellctl acme config --domains ...` first.".into()),
+                };
+            }
+            state.audit.event("ipc", "acme-issue", "ACME issuance requested over IPC");
+            match crate::acme::issue_certificate(cfg).await {
+                Ok(msg) => {
+                    state.push_daemon_log(format!("ACME (CLI): {msg}"));
+                    IpcResponse {
+                        ok: true,
+                        output: format!("{msg}\n"),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    state.push_daemon_log(format!("ACME (CLI) failed: {e}"));
+                    IpcResponse {
+                        ok: false,
+                        output: String::new(),
+                        error: Some(e),
+                    }
+                }
+            }
+        }
         IpcRequest::Reconcile => {
             state.audit.event("ipc", "reconcile", "boot reconcile requested over IPC");
             let report = tokio::task::spawn_blocking(move || run_boot_reconcile(enforce_uhttpd_loopback))

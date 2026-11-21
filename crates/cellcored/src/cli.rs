@@ -501,8 +501,9 @@ pub fn run_cellctl(args: &[String]) -> i32 {
         }
         "verify" => run_verify(&args[1..]),
         "upgrade" => run_upgrade(&args[1..]),
+        "acme" => crate::acme::run_cli(&args[1..]),
         _ => {
-            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|verify [--expect-wan 0|1]|upgrade [--check|--yes]|speedtest|lan>");
+            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|verify [--expect-wan 0|1]|upgrade [--check|--yes]|acme <status|config|issue|reset>|overlay <status|pivot|remount-rw|revert>|speedtest|lan>");
             2
         }
     }
