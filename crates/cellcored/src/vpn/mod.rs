@@ -14,6 +14,7 @@ pub mod policy;
 pub mod teams;
 pub mod validate;
 
+mod cloudflared;
 mod pkg;
 mod tailscale;
 mod warp;
@@ -89,6 +90,11 @@ pub fn routes() -> Router<HttpCtx> {
         .route("/api/v1/vpn/tailscale/login", post(tailscale::post_login))
         .route("/api/v1/vpn/tailscale/logout", post(tailscale::post_logout))
         .route("/api/v1/vpn/tailscale/settings", post(tailscale::post_settings))
+        .route("/api/v1/vpn/cloudflared", get(cloudflared::get_cloudflared))
+        .route("/api/v1/vpn/cloudflared/config", post(cloudflared::post_config))
+        .route("/api/v1/vpn/cloudflared/service", post(cloudflared::post_service))
+        .route("/api/v1/vpn/cloudflared/install", post(cloudflared::post_install))
+        .route("/api/v1/vpn/cloudflared/remove", post(cloudflared::post_remove))
         .route("/api/v1/vpn/packages", get(pkg::get_packages).post(pkg::post_package))
 }
 

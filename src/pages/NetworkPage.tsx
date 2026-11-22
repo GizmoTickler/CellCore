@@ -23,10 +23,11 @@ export function NetworkPage() {
   const qc = useQueryClient();
   const push = useToastStore((s) => s.push);
   const [tab, setTab] = useSubRoute<Tab>("/network", TABS, "lan");
-  // 4.1.1 bookmarks: #/network/vpn was the Tailscale view.
+  // Legacy & convenience aliases: #/network/vpn -> tailscale; #/network/cloudflare or #/network/tunnel -> warp.
   const rawSub = useRouteStore((s) => s.sub);
   useEffect(() => {
     if (rawSub === "vpn") navigate("/network", "tailscale");
+    else if (rawSub === "cloudflare" || rawSub === "tunnel") navigate("/network", "warp");
   }, [rawSub]);
   const [busy, setBusy] = useState<string | null>(null);
 

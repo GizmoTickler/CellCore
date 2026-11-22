@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.0 — Native UI-Managed Cloudflare Tunnel (`cloudflared`) & Unified `Network → Cloudflare` Hub
+
+- **Full Cloudflare Tunnel (`cloudflared`) Backend (`crates/cellcored/src/vpn/cloudflared.rs`, `vpn/mod.rs`, `audit.rs`):**
+  - Added `/api/v1/vpn/cloudflared` (`GET` live status, installed version, edge colos, HA connection count, requests served, syslog tail, and install job state), `/config` (`POST` write-only `0600` tunnel token, `edgeIpVersion` `auto`/`6`/`4`, `protocol` `http2`/`quic`/`auto`, optional WARP private `/32` loopback IP on `lo`, and boot autostart), `/service` (`start`/`stop`/`restart`/`enable`/`disable`), `/install` (detached 1-click official `cloudflared-linux-arm64` download + `--version` verification), and `/remove` (typed confirmation).
+  - Auto-adopts existing `/etc/init.d/cloudflared` settings when `cloudflared.json` is absent and keeps `tunnelToken` write-only and redacted from audit logs and `ps` argv (`--token-file`).
+- **Unified `Network → Cloudflare` Tab (`WarpView.tsx`, `CloudflaredView.tsx`, `nav.ts`, `NetworkPage.tsx`):**
+  - Renamed `Network → WARP` to **`Network → Cloudflare`** (preserving `#/network/warp` and aliasing `#/network/cloudflare` and `#/network/tunnel`) with a clear 2-pill switcher between **Remote Access (Tunnel)** (default when `cloudflared` is installed) and **Outbound VPN (WARP)**.
+
 ## 1.6.0 — Holistic Stability, Dataplane Safety, Self-Healing UI, Flash Longevity & Cloudflare Tunnel Observability
 
 - **Dataplane Safety, Conntrack/SSR Cleanup & Offload Tuning (`dataplane.rs`, `netlink.rs`, `reconcile.rs`, `handlers.rs`):**

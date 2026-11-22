@@ -130,6 +130,40 @@ export interface TailscaleStatus {
   job: PkgJobView;
 }
 
+export interface CloudflaredConfig {
+  edgeIpVersion: "auto" | "6" | "4";
+  protocol: "http2" | "quic" | "auto";
+  loopbackIp: string | null;
+  autostart: boolean;
+  metricsPort: number;
+}
+
+export interface CloudflaredJob {
+  state: "running" | "succeeded" | "failed" | string;
+  action: string;
+  startedAt: number;
+  finishedAt?: number | null;
+  exitCode?: number | null;
+  versionAfter?: string | null;
+  message?: string | null;
+}
+
+export interface CloudflaredStatus {
+  installed: boolean;
+  version: string | null;
+  tokenConfigured: boolean;
+  service: { running: boolean; enabledAtBoot: boolean };
+  config: CloudflaredConfig;
+  metrics: {
+    connected: boolean;
+    haConnections: number;
+    edgeLocations: string[];
+    totalRequests: number;
+  };
+  logs: string[];
+  job: { job: CloudflaredJob | null; log: string[] };
+}
+
 export function vpnPost<T = Record<string, unknown>>(path: string, body: unknown = {}): Promise<T> {
   return apiFetch<T>(`${VPN}${path}`, { method: "POST", body: JSON.stringify(body) });
 }

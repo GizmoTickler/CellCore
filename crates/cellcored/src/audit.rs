@@ -441,9 +441,10 @@ pub const SHOWN_KEYS: &[&str] = &[
     // admin module
     "hostname", "timezone", "zonename", "ntpEnabled", "ntpServers", "port", "proto", "src", "dest", "srcDport", "destIp",
     "destPort", "family", "section", "mac", "ip", "leasetime", "package", "packages", "includeIdentifiers",
-    // vpn module (secrets such as licenseKey, teamToken, clientId/Secret, authKey stay redacted)
+    // vpn module (secrets such as licenseKey, teamToken, clientId/Secret, authKey, tunnelToken stay redacted)
     "team", "acceptRoutes", "advertiseRoutes", "advertiseExitNode", "exitNode", "ssh", "shieldsUp", "keepalive",
     "endpoint", "autostart", "deleteAccount", "force", "lanDevice",
+    "edgeIpVersion", "protocol", "loopbackIp", "deleteToken", "deleteBinary",
 ];
 
 /// Substrings that make a key secret regardless of the allowlist.

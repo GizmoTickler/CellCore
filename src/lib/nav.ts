@@ -54,7 +54,7 @@ export const NAV: NavSection[] = [
       { id: "policy", label: "TTL · MTU · DNS", hint: "Packet header and resolver policy", keywords: "ttl hop limit mtu dns" },
       { id: "usage", label: "Data Usage", hint: "Daily and monthly cellular totals", keywords: "usage data quota bytes monthly" },
       { id: "dataplane", label: "Data Plane", hint: "Native QRTR/QMI, Netlink, IPA offload and kernel tuning", keywords: "dataplane qrtr qmi netlink ipa offload rmnet qmap rps fq_codel" },
-      { id: "warp", label: "WARP", hint: "Cloudflare WARP / Zero Trust tunnel and routing", keywords: "warp cloudflare 1.1.1.1 wireguard zero trust teams vpn tunnel wgcf" },
+      { id: "warp", label: "Cloudflare", hint: "Remote Access (Cloudflare Tunnel) & Outbound VPN (WARP)", keywords: "cloudflare tunnel cloudflared warp 1.1.1.1 wireguard zero trust teams vpn remote access ssh wgcf" },
       { id: "tailscale", label: "Tailscale", hint: "Tailnet access, subnet routes and exit nodes", keywords: "tailscale vpn mesh remote tailnet exit node subnet ssh" },
     ],
   },

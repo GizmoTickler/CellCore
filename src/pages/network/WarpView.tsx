@@ -1,15 +1,16 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Cloud, KeyRound, RefreshCw, Route as RouteIcon, Settings2, ShieldCheck } from "lucide-react";
+import { Cloud, KeyRound, Route as RouteIcon, Settings2, ShieldCheck } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { isCancelled } from "../../lib/disruptive";
 import { cn, formatBytes } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, Input, LiveDot, Skeleton, Switch } from "../../components/ui";
 import { useToastStore } from "../../stores/toast-store";
 import { useWsStore } from "../../stores/ws-store";
-import { LoadError, Notice, adminSend, errText, useGuarded } from "../admin/shared";
+import { LoadError, Notice, errText, useGuarded } from "../admin/shared";
 import { ApplyNote, BigValue } from "./shared";
 import { Fact, PackageCard } from "./VpnParts";
+import { CloudflaredView } from "./CloudflaredView";
 import { VPN, ageText, vpnPost, vpnPostGuarded, type WarpMode, type WarpStatus, type WgcfAccount } from "./vpn-api";
 
 const KEY = ["vpn", "warp"];
@@ -44,8 +45,66 @@ function verdict(d: WarpStatus) {
 }
 
 export function WarpView() {
-  const toast = useToastStore((s) => s.push);
   const internals = useWsStore((s) => s.internals);
+  const cfPresent = Boolean(internals?.cloudflaredPresent || internals?.cloudflaredRunning);
+  const cfUp = Boolean(internals?.cloudflaredUp);
+  const cfHa = internals?.cloudflaredHaConnections ?? 0;
+
+  const [pane, setPane] = useState<"tunnel" | "warp">(cfPresent ? "tunnel" : "warp");
+  const userPicked = useRef(false);
+  useEffect(() => {
+    if (!userPicked.current && cfPresent) setPane("tunnel");
+  }, [cfPresent]);
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            userPicked.current = true;
+            setPane("tunnel");
+          }}
+          className={cn(
+            "inline-flex items-center gap-2 rounded-full border px-4 py-2 text-[13px] font-medium transition cursor-pointer",
+            pane === "tunnel"
+              ? "border-ember bg-ember-soft text-ink"
+              : "border-line bg-surface text-ink-2 hover:border-line-strong"
+          )}
+        >
+          <ShieldCheck className="h-4 w-4" />
+          <span>Remote Access (Tunnel)</span>
+          {cfPresent && (
+            <Badge variant={cfUp ? "success" : "warning"}>
+              {cfUp ? `${cfHa} HA` : "Down"}
+            </Badge>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            userPicked.current = true;
+            setPane("warp");
+          }}
+          className={cn(
+            "inline-flex items-center gap-2 rounded-full border px-4 py-2 text-[13px] font-medium transition cursor-pointer",
+            pane === "warp"
+              ? "border-ember bg-ember-soft text-ink"
+              : "border-line bg-surface text-ink-2 hover:border-line-strong"
+          )}
+        >
+          <Cloud className="h-4 w-4" />
+          <span>Outbound VPN (WARP)</span>
+        </button>
+      </div>
+
+      {pane === "tunnel" ? <CloudflaredView /> : <WarpOutboundView />}
+    </div>
+  );
+}
+
+function WarpOutboundView() {
+  const toast = useToastStore((s) => s.push);
   const qc = useQueryClient();
   const guard = useGuarded();
   const q = useQuery({ queryKey: KEY, queryFn: () => apiFetch<WarpStatus>(`${VPN}/warp`), refetchInterval: 10000 });
@@ -182,67 +241,9 @@ export function WarpView() {
       i.installed ? "Tunnel settings applied" : "WARP tunnel installed"
     );
 
-  const cfPresent = Boolean(internals?.cloudflaredPresent || internals?.cloudflaredRunning);
-  const cfRunning = Boolean(internals?.cloudflaredRunning);
-  const cfUp = Boolean(internals?.cloudflaredUp);
-  const cfHa = internals?.cloudflaredHaConnections ?? 0;
-
   return (
     <div className="grid gap-5 lg:grid-cols-12">
       <div className="lg:col-span-7 min-w-0 space-y-5">
-        {cfPresent && (
-          <Card className="space-y-4">
-            <CardHeader
-              title="Cloudflare Tunnel (cloudflared)"
-              subtitle="Out-of-band Zero Trust remote access for UI & SSH (separate from outbound WARP)"
-              icon={<ShieldCheck className="h-4 w-4" />}
-              action={
-                <Badge variant={cfUp ? "success" : cfRunning ? "warning" : "neutral"}>
-                  {cfUp ? `${cfHa} HA edges` : cfRunning ? "Connecting" : "Stopped"}
-                </Badge>
-              }
-            />
-            <div className="qm-subcard p-5 space-y-2">
-              <div className="flex items-center gap-2.5">
-                <LiveDot tone={cfUp ? "jade" : cfRunning ? "saffron" : "crimson"} />
-                <span className="qm-display text-[1.9rem] font-semibold leading-none text-ink">
-                  {cfUp ? "Connected" : cfRunning ? "Connecting" : "Stopped"}
-                </span>
-              </div>
-              <p className="text-[13px] text-ink-2 max-w-prose">
-                {cfUp
-                  ? `Active Zero Trust tunnel with ${cfHa} HA edge connections proxying loopback UI (:443), SSH (:22), and WARP private routing over IPv6/IPv4.`
-                  : cfRunning
-                    ? "cloudflared is running and establishing edge connections."
-                    : "cloudflared is installed but not currently running."}
-              </p>
-            </div>
-            <dl className="grid gap-3 grid-cols-2 sm:grid-cols-3">
-              <Fact label="HA Connections">{cfHa}</Fact>
-              <Fact label="Daemon">{cfRunning ? "Running" : "Stopped"}</Fact>
-              <Fact label="Metrics">
-                <span className="font-mono text-[12px]">127.0.0.1:20241</span>
-              </Fact>
-            </dl>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="secondary"
-                disabled={busy !== null}
-                onClick={() =>
-                  act(
-                    "cf-restart",
-                    () => adminSend("POST", "/services/action", { name: "cloudflared", action: "restart" }),
-                    "Cloudflare Tunnel restarted"
-                  )
-                }
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                Restart tunnel
-              </Button>
-            </div>
-          </Card>
-        )}
-
         <Card className="space-y-5">
           <CardHeader
             title="Cloudflare WARP (Outbound Egress)"
