@@ -55,7 +55,7 @@ Description: wgcf is an unofficial, cross-platform CLI for Cloudflare Warp
 
 
 Package: sdxpinn-cellcore
-Version: 1.6.0-2
+Version: 1.6.0-3
 Architecture: sdxpinn
 Maintainer: GizmoTickler <gizmotickler@users.noreply.github.com>
 Source: github.com/GizmoTickler/CellCore
@@ -63,10 +63,10 @@ Depends: libc, uci, ubus, uhttpd, ookla-speedtest, msmtp, ca-bundle, ca-certific
 Conflicts: sdxpinn-quecmanager, sdxpinn-quecmanager-beta, sdxpinn-console-menu
 Replaces: sdxpinn-quecmanager-beta, sdxpinn-quecmanager, sdxpinn-patch, socat-at-bridge, sdxpinn-console-menu
 Provides: sdxpinn-quecmanager-beta
-MD5Sum: a137e06daf1a651d94463514fd1ab072
-SHA256sum: ecf8dd1369335575d67361119e3fc468024a8fbfc73334ee4eaa654298776874
-Size: 4839364
-Filename: sdxpinn-cellcore_1.6.0-2_sdxpinn.ipk
+MD5Sum: 87505575b7e4adeb495bf9a49c42a625
+SHA256sum: b83287d697de02e6fadd37af77944e16e5589a00131af7d90e71e717f33c948e
+Size: 4840655
+Filename: sdxpinn-cellcore_1.6.0-3_sdxpinn.ipk
 Description: CellCore — static Rust cellular gateway daemon (cellcored) and React 19 UI with native QRTR/QMI data plane for Quectel RM55x SDX75 modems
 
 

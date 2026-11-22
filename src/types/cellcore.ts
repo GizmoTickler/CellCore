@@ -408,6 +408,8 @@ export interface SystemInternals {
   mwan3Running: boolean;
   keepAliveEnabled: boolean;
   ethSpeed: string;
+  cloudflaredPresent?: boolean;
+  cloudflaredUp?: boolean;
   cloudflaredHaConnections?: number | null;
   cloudflaredRunning?: boolean;
   lastReconcile?: ReconcileReport | null;
