@@ -1129,28 +1129,41 @@ pub fn del_passthrough_host_route_v4(
     Ok(())
 }
 
+pub(crate) fn build_del_default_route_msg(family: u8, ifindex: i32, table: u32) -> Vec<u8> {
+    let msg = RtMsg {
+        rtm_family: family,
+        rtm_dst_len: 0,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: if table <= 255 { table as u8 } else { RT_TABLE_COMPAT_VAL },
+        rtm_protocol: 0,
+        rtm_scope: 0,
+        rtm_type: RTN_UNICAST_VAL,
+        rtm_flags: 0,
+    };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(&msg as *const RtMsg as *const u8, mem::size_of::<RtMsg>())
+    };
+    let mut b = NlBuilder::new(RTM_DELROUTE_OP, NLM_F_REQUEST_BIT | NLM_F_ACK_BIT, 16, bytes);
+    b.push_u32(RTA_TABLE_ATTR, table);
+    b.push_i32(RTA_OIF_ATTR, ifindex);
+    b.finish()
+}
+
 pub fn del_default_routes(iface: &str, ifindex: i32, table: u32) -> Result<(), String> {
     validate_managed_iface(iface)?;
     validate_managed_table(table)?;
     for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
-        let msg = RtMsg {
-            rtm_family: family,
-            rtm_dst_len: 0,
-            rtm_src_len: 0,
-            rtm_tos: 0,
-            rtm_table: if table <= 255 { table as u8 } else { RT_TABLE_COMPAT_VAL },
-            rtm_protocol: 0,
-            rtm_scope: 0,
-            rtm_type: RTN_UNICAST_VAL,
-            rtm_flags: 0,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(&msg as *const RtMsg as *const u8, mem::size_of::<RtMsg>())
-        };
-        let mut b = NlBuilder::new(RTM_DELROUTE_OP, NLM_F_REQUEST_BIT | NLM_F_ACK_BIT, 16, bytes);
-        b.push_u32(RTA_TABLE_ATTR, table);
-        b.push_i32(RTA_OIF_ATTR, ifindex);
-        let _ = send_recv_netlink(&b.finish());
+        let req = build_del_default_route_msg(family, ifindex, table);
+        // Loop so multiple residual default routes (e.g. differing metrics/protocols)
+        // on the same interface/table are all evicted until kernel reports ESRCH/ENOENT.
+        for _ in 0..16 {
+            match send_recv_netlink_errno(&req) {
+                Ok(_) => continue,
+                Err((Some(libc::ESRCH | libc::ENOENT | libc::ENODEV), _)) => break,
+                Err(_) => break,
+            }
+        }
     }
     Ok(())
 }
@@ -1388,5 +1401,17 @@ mod tests {
         // UP + LOWER_UP rmnet_data0 with global IPv6 -> Some("rmnet_data0")
         let addrs4 = vec![mk_addr(17, libc::AF_INET6, "2607:fb90::1", 64, 0)];
         assert_eq!(detect_active_rmnet_wan(&links, &addrs4).as_deref(), Some("rmnet_data0"));
+    }
+
+    #[test]
+    fn del_default_route_msg_and_guards() {
+        let m4 = build_del_default_route_msg(libc::AF_INET as u8, 17, TABLE_MAIN);
+        assert_eq!(m4.len() % 4, 0);
+        assert_eq!(u16::from_ne_bytes([m4[4], m4[5]]), RTM_DELROUTE_OP);
+        let m6 = build_del_default_route_msg(libc::AF_INET6 as u8, 17, TABLE_MAIN);
+        assert_eq!(m6.len() % 4, 0);
+        assert_eq!(u16::from_ne_bytes([m6[4], m6[5]]), RTM_DELROUTE_OP);
+        assert!(del_default_routes("br-lan", 5, TABLE_MAIN).is_err());
+        assert!(del_default_routes("rmnet_data0", 17, TABLE_WARP).is_err());
     }
 }

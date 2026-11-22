@@ -14,7 +14,7 @@ use std::{
 
 use tokio::{
     io::unix::AsyncFd,
-    sync::{broadcast, mpsc, oneshot},
+    sync::{Notify, broadcast, mpsc, oneshot},
 };
 
 use super::{
@@ -429,10 +429,72 @@ pub fn configured_modem_node() -> u32 {
     configured_modem_node_override().unwrap_or(0)
 }
 
+async fn send_lookup_on(
+    ctrl_fd: &AsyncFd<OwnedFd>,
+    state: &Mutex<BusState>,
+) -> Result<(), QmiError> {
+    let local_node = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .local_node;
+    let dst = SockAddrQrtr {
+        sq_family: AF_QIPCRTR as u16,
+        _pad: 0,
+        sq_node: local_node,
+        sq_port: QRTR_PORT_CTRL,
+    };
+    let pkt = QrtrCtrlPkt::new_lookup(0).encode();
+    qrtr_send_to(ctrl_fd, dst, &pkt).await.map(|_| ())
+}
+
+static SHARED_BUS: Mutex<Option<Arc<QrtrBus>>> = Mutex::new(None);
+
+/// Return a process-wide shared `QrtrBus` handle so `dataplane`, `qmi::dsp`,
+/// and `telemetry` reuse a single `AF_QIPCRTR` control socket without leaking FDs.
+pub fn shared_bus() -> Result<Arc<QrtrBus>, QmiError> {
+    let mut g = SHARED_BUS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(bus) = g.as_ref() {
+        if !bus.is_shutdown() {
+            return Ok(Arc::clone(bus));
+        }
+        *g = None;
+    }
+    let bus = QrtrBus::connect()?;
+    *g = Some(Arc::clone(&bus));
+    Ok(bus)
+}
+
+/// Explicitly shut down and clear the shared `QrtrBus` instance (next caller reconnects).
+#[allow(dead_code)]
+pub fn reset_shared_bus() {
+    let prev = SHARED_BUS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(bus) = prev {
+        bus.shutdown();
+    }
+}
+
+/// Convenience helper over [`shared_bus`] to wait until `service_id` is registered on QRTR.
+#[allow(dead_code)]
+pub async fn wait_for_service(
+    service_id: u32,
+    timeout: Duration,
+) -> Result<ServiceEndpoint, QmiError> {
+    let bus = shared_bus()?;
+    bus.wait_for_service(service_id, timeout).await
+}
+
 pub struct QrtrBus {
     ctrl_fd: Arc<AsyncFd<OwnedFd>>,
     state: Arc<Mutex<BusState>>,
     events_tx: broadcast::Sender<QrtrBusEvent>,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+}
+
+impl Drop for QrtrBus {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl QrtrBus {
@@ -452,9 +514,22 @@ impl QrtrBus {
             ctrl_fd,
             state,
             events_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
         });
-        bus.spawn_ctrl_loop();
+        drop(bus.spawn_ctrl_loop());
         Ok(bus)
+    }
+
+    /// Signal the background control loop to exit immediately and release the control socket FD.
+    pub fn shutdown(&self) {
+        if !self.shutdown.swap(true, Ordering::AcqRel) {
+            self.shutdown_notify.notify_waiters();
+        }
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<QrtrBusEvent> {
@@ -464,7 +539,7 @@ impl QrtrBus {
     pub fn snapshot(&self) -> BusSnapshot {
         let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         BusSnapshot {
-            available: true,
+            available: !self.is_shutdown(),
             local_node: Some(g.local_node),
             modem_node: g.modem_node,
             ssr_count: g.ssr_count,
@@ -484,19 +559,15 @@ impl QrtrBus {
     }
 
     pub async fn send_lookup(&self) -> Result<(), QmiError> {
-        let local_node = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .local_node;
-        let dst = SockAddrQrtr {
-            sq_family: AF_QIPCRTR as u16,
-            _pad: 0,
-            sq_node: local_node,
-            sq_port: QRTR_PORT_CTRL,
-        };
-        let pkt = QrtrCtrlPkt::new_lookup(0).encode();
-        qrtr_send_to(&self.ctrl_fd, dst, &pkt).await.map(|_| ())
+        send_lookup_on(&self.ctrl_fd, &self.state).await
+    }
+
+    pub async fn wait_for_service(
+        &self,
+        service: u32,
+        timeout: Duration,
+    ) -> Result<ServiceEndpoint, QmiError> {
+        self.wait_service(service, timeout).await
     }
 
     pub async fn wait_service(
@@ -566,39 +637,68 @@ impl QrtrBus {
         }))
     }
 
-    fn spawn_ctrl_loop(self: &Arc<Self>) {
-        let bus = Arc::downgrade(self);
+    /// Spawn the QRTR control-packet reader without retaining a strong `Arc<QrtrBus>`.
+    /// Dropping the last external `Arc<QrtrBus>` (or calling [`QrtrBus::shutdown`])
+    /// triggers `shutdown_notify` so the task exits immediately and closes `ctrl_fd`.
+    fn spawn_ctrl_loop(&self) -> tokio::task::JoinHandle<()> {
+        let ctrl_fd = Arc::clone(&self.ctrl_fd);
+        let state = Arc::clone(&self.state);
+        let events_tx = self.events_tx.clone();
+        let shutdown = Arc::clone(&self.shutdown);
+        let shutdown_notify = Arc::clone(&self.shutdown_notify);
         tokio::spawn(async move {
-            let Some(b0) = bus.upgrade() else { return };
-            let _ = b0.send_lookup().await;
-            drop(b0);
+            if !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_notify.notified() => return,
+                    _ = send_lookup_on(&ctrl_fd, &state) => {}
+                }
+            }
 
             let mut buf = [0u8; 512];
             loop {
-                let Some(b) = bus.upgrade() else { break };
-                let res = qrtr_recv_from(&b.ctrl_fd, &mut buf).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let notified = shutdown_notify.notified();
+                tokio::pin!(notified);
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let res = tokio::select! {
+                    biased;
+                    _ = &mut notified => break,
+                    r = qrtr_recv_from(&ctrl_fd, &mut buf) => r,
+                };
                 match res {
                     Ok((n, _src)) => {
                         if let Ok(pkt) = QrtrCtrlPkt::decode(&buf[..n]) {
                             let evt = {
-                                let mut g = b.state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                                 apply_ctrl_pkt(&mut g, &pkt, crate::auth::now_secs())
                             };
                             if let Some(ev) = evt {
                                 let is_ssr = matches!(ev, QrtrBusEvent::Ssr { .. });
-                                let _ = b.events_tx.send(ev);
-                                if is_ssr {
-                                    let _ = b.send_lookup().await;
+                                let _ = events_tx.send(ev);
+                                if is_ssr && !shutdown.load(Ordering::Acquire) {
+                                    let _ = send_lookup_on(&ctrl_fd, &state).await;
                                 }
                             }
                         }
                     }
                     Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_notify.notified() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        }
                     }
                 }
             }
-        });
+        })
     }
 }
 
@@ -999,5 +1099,89 @@ mod tests {
         assert_eq!(apply_ctrl_pkt(&mut pinned, &wds_node3, 100), None);
         assert_eq!(pinned.modem_node, 0);
         assert!(pinned.modem_services.is_empty());
+    }
+
+    fn make_test_bus() -> (Arc<QrtrBus>, OwnedFd, tokio::task::JoinHandle<()>) {
+        let mut fds = [0 as libc::c_int; 2];
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let local_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let peer_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let ctrl_fd = Arc::new(unsafe { AsyncFd::register(local_fd) }.unwrap());
+        let state = Arc::new(Mutex::new(BusState::new(2, 0)));
+        let (events_tx, _) = broadcast::channel(16);
+        let bus = Arc::new(QrtrBus {
+            ctrl_fd,
+            state,
+            events_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+        });
+        let handle = bus.spawn_ctrl_loop();
+        (bus, peer_fd, handle)
+    }
+
+    #[tokio::test]
+    async fn qrtr_bus_drop_exits_ctrl_loop_and_releases_fd() {
+        let (bus, _peer, handle) = make_test_bus();
+        let ctrl_weak = Arc::downgrade(&bus.ctrl_fd);
+        let bus_weak = Arc::downgrade(&bus);
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished());
+
+        // Dropping the only external Arc<QrtrBus> must trigger Drop::shutdown(),
+        // wake ctrl_loop out of qrtr_recv_from, finish the task, and release ctrl_fd.
+        drop(bus);
+        assert!(bus_weak.upgrade().is_none(), "ctrl_loop must not hold strong Arc<QrtrBus>");
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("ctrl_loop must exit promptly on QrtrBus drop")
+            .unwrap();
+        assert!(ctrl_weak.upgrade().is_none(), "ctrl_fd must be released when ctrl_loop exits");
+    }
+
+    #[tokio::test]
+    async fn qrtr_bus_wait_for_service_wakes_on_service_added() {
+        let (bus, _peer, handle) = make_test_bus();
+        let bus2 = Arc::clone(&bus);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let pkt = QrtrCtrlPkt {
+                cmd: CMD_NEW_SERVER,
+                service: SVC_WDS,
+                version: 1,
+                instance: 0,
+                node: 0,
+                port: 79,
+            };
+            let ev = {
+                let mut g = bus2.state.lock().unwrap();
+                apply_ctrl_pkt(&mut g, &pkt, 100)
+            };
+            if let Some(ev) = ev {
+                let _ = bus2.events_tx.send(ev);
+            }
+        });
+        let ep = bus
+            .wait_for_service(SVC_WDS, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(ep.service, SVC_WDS);
+        assert_eq!(ep.port, 79);
+
+        bus.shutdown();
+        assert!(bus.is_shutdown());
+        assert!(!bus.snapshot().available);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("ctrl_loop must exit on explicit shutdown()")
+            .unwrap();
     }
 }

@@ -83,6 +83,8 @@ pub struct Preferences {
     pub temperature_unit: String,
     pub measurement_unit: String,
     pub https_redirect: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_labels: Option<[String; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +108,10 @@ pub struct Quecwatch {
     pub auto_sim_failover: bool,
     pub high_latency: bool,
     pub latency_ceiling: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_sim_slot: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_failback_mins: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,6 +144,8 @@ pub struct Policy {
     pub mtu: Option<u16>,
     #[serde(default)]
     pub dns_servers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eth_link_speed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +178,10 @@ pub struct CellLockSchedule {
     pub nr5g: String,
     pub lte_persist: bool,
     pub nr5g_persist: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_lock_deadman_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_lock_deadman_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -384,6 +396,13 @@ pub fn validate(b: &Bundle) -> Result<(), Vec<String>> {
     let p = &b.preferences;
     need(&mut e, matches!(p.temperature_unit.as_str(), "celsius" | "fahrenheit"), "preferences.temperatureUnit must be celsius or fahrenheit");
     need(&mut e, matches!(p.measurement_unit.as_str(), "mi" | "km"), "preferences.measurementUnit must be mi or km");
+    need(
+        &mut e,
+        p.antenna_labels
+            .as_ref()
+            .is_none_or(|labels| labels.iter().all(|s| s.chars().count() <= 32 && !s.chars().any(|c| c.is_control()))),
+        "preferences.antennaLabels entries must be <= 32 printable chars",
+    );
     let l = &b.latency;
     need(&mut e, host_ok(&l.host), "latency.host invalid");
     need(&mut e, (2..=60).contains(&l.interval_sec), "latency.intervalSec must be 2..60");
@@ -393,6 +412,8 @@ pub fn validate(b: &Bundle) -> Result<(), Vec<String>> {
     need(&mut e, (1..=20).contains(&q.failures), "quecwatch.failures must be 1..20");
     need(&mut e, (1..=20).contains(&q.max_retries), "quecwatch.maxRetries must be 1..20");
     need(&mut e, (20..=2000).contains(&q.latency_ceiling), "quecwatch.latencyCeiling must be 20..2000");
+    need(&mut e, q.preferred_sim_slot.is_none_or(|s| s <= 2), "quecwatch.preferredSimSlot must be 0, 1, or 2");
+    need(&mut e, q.sim_failback_mins.is_none_or(|m| (1..=1440).contains(&m)), "quecwatch.simFailbackMins must be 1..1440");
     let m = &b.maintenance;
     need(&mut e, parse_hhmm(&m.scheduled_reboot_time).is_some(), "maintenance.scheduledRebootTime must be HH:MM");
     const DAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
@@ -408,11 +429,19 @@ pub fn validate(b: &Bundle) -> Result<(), Vec<String>> {
     need(&mut e, po.ttl.is_none_or(|t| t >= 1) && po.hl.is_none_or(|t| t >= 1), "policy.ttl/hl must be 1..255");
     need(&mut e, po.ttl.is_some() == po.hl.is_some(), "policy.ttl and policy.hl go together");
     need(&mut e, po.mtu.is_none_or(|m| (1280..=1500).contains(&m)), "policy.mtu must be 1280..1500");
-    need(&mut e, 
+    need(
+        &mut e,
         po.dns_servers
             .as_ref()
-            .is_none_or(|s| !s.is_empty() && s.len() <= 4 && s.iter().all(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())),
-        "policy.dnsServers must be 1-4 IPv4 addresses",
+            .is_none_or(|s| !s.is_empty() && s.len() <= 4 && s.iter().all(|ip| ip.parse::<std::net::IpAddr>().is_ok())),
+        "policy.dnsServers must be 1-4 IPv4/IPv6 addresses",
+    );
+    need(
+        &mut e,
+        po.eth_link_speed
+            .as_deref()
+            .is_none_or(|s| matches!(s, "auto" | "10" | "100" | "1000")),
+        "policy.ethLinkSpeed must be auto, 10, 100, or 1000",
     );
     need(&mut e, b.profiles.len() <= MAX_PROFILES, "too many profiles");
     let mut names = std::collections::HashSet::new();
@@ -459,6 +488,11 @@ pub fn validate(b: &Bundle) -> Result<(), Vec<String>> {
     let c = &b.cell_lock_schedule;
     need(&mut e, parse_hhmm(&c.start_time).is_some() && parse_hhmm(&c.end_time).is_some(), "cellLockSchedule times must be HH:MM");
     need(&mut e, lock_params_ok(&c.lte) && lock_params_ok(&c.nr5g), "cellLockSchedule lock parameters invalid");
+    need(
+        &mut e,
+        c.cell_lock_deadman_secs.is_none_or(|s| (1..=86_400).contains(&s)),
+        "cellLockSchedule.cellLockDeadmanSecs must be 1..86400",
+    );
     if let Some(r) = &b.radio {
         need(&mut e, band_list_ok(&r.lte_bands) && band_list_ok(&r.nsa_nr5g_bands) && band_list_ok(&r.nr5g_bands), "radio band lists invalid");
         if let Err(msg) = handlers::check_bands_cover_mode(&r.lte_bands, &r.nsa_nr5g_bands, &r.nr5g_bands, &r.mode_pref, r.nr5g_disable_mode) {
@@ -627,6 +661,7 @@ pub async fn collect(app: &AppState, include_identifiers: bool, with_radio: bool
             temperature_unit: s.temperature_unit.clone(),
             measurement_unit: s.measurement_unit.clone(),
             https_redirect: s.https_redirect,
+            antenna_labels: Some(s.antenna_labels.clone()),
         },
         latency: Latency {
             enabled: s.ping_enabled,
@@ -644,6 +679,8 @@ pub async fn collect(app: &AppState, include_identifiers: bool, with_radio: bool
             auto_sim_failover: s.quecwatch_auto_sim_failover,
             high_latency: s.quecwatch_high_latency,
             latency_ceiling: s.quecwatch_latency_ceiling,
+            preferred_sim_slot: Some(s.preferred_sim_slot),
+            sim_failback_mins: Some(s.sim_failback_mins),
         },
         maintenance: Maintenance {
             scheduled_reboot_enabled: s.scheduled_reboot_enabled,
@@ -661,6 +698,7 @@ pub async fn collect(app: &AppState, include_identifiers: bool, with_radio: bool
             hl: s.hl_value,
             mtu: s.mtu_value,
             dns_servers: s.custom_dns.clone(),
+            eth_link_speed: Some(s.eth_link_speed.clone()),
         },
         profiles,
         cell_lock_schedule: CellLockSchedule {
@@ -671,6 +709,8 @@ pub async fn collect(app: &AppState, include_identifiers: bool, with_radio: bool
             nr5g: s.cell_lock_nr5g.clone(),
             lte_persist: s.cell_lock_lte_persist,
             nr5g_persist: s.cell_lock_nr5g_persist,
+            cell_lock_deadman_enabled: Some(s.cell_lock_deadman_enabled),
+            cell_lock_deadman_secs: Some(s.cell_lock_deadman_secs),
         },
         radio,
         dataplane,
@@ -913,14 +953,15 @@ impl Applier for HandlerApplier {
         match item {
             Item::Preferences => {
                 let p = &b.preferences;
-                outcome(
-                    handlers::post_settings(
-                        st(),
-                        req(json!({ "temperatureUnit": p.temperature_unit, "measurementUnit": p.measurement_unit, "httpsRedirect": p.https_redirect }))?,
-                    )
-                    .await,
-                )
-                .await?;
+                let mut payload = json!({
+                    "temperatureUnit": p.temperature_unit,
+                    "measurementUnit": p.measurement_unit,
+                    "httpsRedirect": p.https_redirect,
+                });
+                if let Some(ref labels) = p.antenna_labels {
+                    payload["antennaLabels"] = json!(labels);
+                }
+                outcome(handlers::post_settings(st(), req(payload)?).await).await?;
             }
             Item::Latency => {
                 let l = &b.latency;
@@ -935,19 +976,19 @@ impl Applier for HandlerApplier {
             }
             Item::Quecwatch => {
                 let q = &b.quecwatch;
-                outcome(
-                    handlers::post_quecwatch(
-                        st(),
-                        req(json!({
-                            "enabled": q.enabled, "pingTarget": q.target, "pingInterval": q.interval_sec,
-                            "pingFailures": q.failures, "maxRetries": q.max_retries, "connectionRefresh": q.connection_refresh,
-                            "autoSimFailover": q.auto_sim_failover, "highLatencyMonitoring": q.high_latency,
-                            "latencyCeiling": q.latency_ceiling,
-                        }))?,
-                    )
-                    .await,
-                )
-                .await?;
+                let mut payload = json!({
+                    "enabled": q.enabled, "pingTarget": q.target, "pingInterval": q.interval_sec,
+                    "pingFailures": q.failures, "maxRetries": q.max_retries, "connectionRefresh": q.connection_refresh,
+                    "autoSimFailover": q.auto_sim_failover, "highLatencyMonitoring": q.high_latency,
+                    "latencyCeiling": q.latency_ceiling,
+                });
+                if let Some(slot) = q.preferred_sim_slot {
+                    payload["preferredSimSlot"] = json!(slot);
+                }
+                if let Some(mins) = q.sim_failback_mins {
+                    payload["simFailbackMins"] = json!(mins);
+                }
+                outcome(handlers::post_quecwatch(st(), req(payload)?).await).await?;
             }
             Item::Maintenance => {
                 let m = &b.maintenance;
@@ -979,9 +1020,45 @@ impl Applier for HandlerApplier {
                 let p = &b.policy;
                 let ttl = json!({ "action": "ttl", "enabled": p.ttl.is_some(), "ttl": p.ttl.unwrap_or(65), "hl": p.hl.unwrap_or(65) });
                 let mtu = json!({ "action": "mtu", "enabled": p.mtu.is_some(), "mtu": p.mtu.unwrap_or(1500) });
-                let dns = json!({ "action": "dns", "enabled": p.dns_servers.is_some(), "servers": p.dns_servers });
-                for body in [ttl, mtu, dns] {
-                    outcome(handlers::post_network_lan(st(), req(body)?).await).await?;
+                outcome(handlers::post_network_lan(st(), req(ttl)?).await).await?;
+                outcome(handlers::post_network_lan(st(), req(mtu)?).await).await?;
+                match &p.dns_servers {
+                    Some(servers) => {
+                        let v4_only: Vec<String> = servers
+                            .iter()
+                            .filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
+                            .cloned()
+                            .collect();
+                        let v6_only: Vec<String> = servers
+                            .iter()
+                            .filter(|s| s.parse::<std::net::Ipv6Addr>().is_ok())
+                            .cloned()
+                            .collect();
+                        if !v4_only.is_empty() {
+                            let dns = json!({ "action": "dns", "enabled": true, "servers": v4_only });
+                            outcome(handlers::post_network_lan(st(), req(dns)?).await).await?;
+                        }
+                        if !v6_only.is_empty() {
+                            let _ = crate::uci::run_cmd("uci", &["-q", "delete", "dhcp.lan.dns"], Duration::from_secs(3)).await;
+                            for ip6 in &v6_only {
+                                let _ = crate::uci::run_cmd("uci", &["add_list", &format!("dhcp.lan.dns={ip6}")], Duration::from_secs(3)).await;
+                            }
+                            let _ = crate::uci::uci_commit("dhcp").await;
+                        }
+                        let mut s = self.ctx.app.settings.write().await;
+                        s.custom_dns = Some(servers.clone());
+                        let _ = save_json_atomic(&format!("{ETC_QM_DIR}/settings.json"), &*s, 0o600);
+                    }
+                    None => {
+                        let dns = json!({ "action": "dns", "enabled": false, "servers": Value::Null });
+                        outcome(handlers::post_network_lan(st(), req(dns)?).await).await?;
+                        let _ = crate::uci::run_cmd("uci", &["-q", "delete", "dhcp.lan.dns"], Duration::from_secs(3)).await;
+                        let _ = crate::uci::uci_commit("dhcp").await;
+                    }
+                }
+                if let Some(ref limit) = p.eth_link_speed {
+                    let eth = json!({ "action": "eth_limit", "limit": limit });
+                    outcome(handlers::post_network_lan(st(), req(eth)?).await).await?;
                 }
             }
             Item::Profiles => {
@@ -1033,14 +1110,18 @@ impl Applier for HandlerApplier {
             }
             Item::CellLockSchedule => {
                 let c = &b.cell_lock_schedule;
-                outcome(
-                    handlers::post_cell_lock(
-                        st(),
-                        req(json!({ "scheduleEnabled": c.enabled, "startTime": c.start_time, "endTime": c.end_time }))?,
-                    )
-                    .await,
-                )
-                .await?;
+                let mut payload = json!({
+                    "scheduleEnabled": c.enabled,
+                    "startTime": c.start_time,
+                    "endTime": c.end_time,
+                });
+                if let Some(en) = c.cell_lock_deadman_enabled {
+                    payload["cellLockDeadmanEnabled"] = json!(en);
+                }
+                if let Some(secs) = c.cell_lock_deadman_secs {
+                    payload["cellLockDeadmanSecs"] = json!(secs);
+                }
+                outcome(handlers::post_cell_lock(st(), req(payload)?).await).await?;
                 let mut s = self.ctx.app.settings.write().await;
                 s.cell_lock_lte = c.lte.clone();
                 s.cell_lock_nr5g = c.nr5g.clone();
@@ -1343,7 +1424,12 @@ pub mod tests {
             created_at: 1_790_000_000,
             app_version: "4.1.1".into(),
             includes_identifiers: false,
-            preferences: Preferences { temperature_unit: "celsius".into(), measurement_unit: "km".into(), https_redirect: true },
+            preferences: Preferences {
+                temperature_unit: "celsius".into(),
+                measurement_unit: "km".into(),
+                https_redirect: true,
+                antenna_labels: None,
+            },
             latency: Latency { enabled: true, host: "1.1.1.1".into(), interval_sec: 5, keep_alive: false },
             quecwatch: Quecwatch {
                 enabled: true,
@@ -1355,6 +1441,8 @@ pub mod tests {
                 auto_sim_failover: false,
                 high_latency: false,
                 latency_ceiling: 150,
+                preferred_sim_slot: None,
+                sim_failback_mins: None,
             },
             maintenance: Maintenance {
                 scheduled_reboot_enabled: false,
@@ -1364,7 +1452,13 @@ pub mod tests {
                 smtp_configured: true,
             },
             data_usage: DataUsagePlan { billing_cycle_day: 5, quota_bytes: Some(100 << 30) },
-            policy: Policy { ttl: Some(65), hl: Some(65), mtu: None, dns_servers: Some(vec!["1.1.1.1".into()]) },
+            policy: Policy {
+                ttl: Some(65),
+                hl: Some(65),
+                mtu: None,
+                dns_servers: Some(vec!["1.1.1.1".into()]),
+                eth_link_speed: None,
+            },
             profiles: vec![Profile {
                 name: "T-Mobile".into(),
                 iccid: String::new(),
@@ -1388,6 +1482,8 @@ pub mod tests {
                 nr5g: "123,520110,30,41".into(),
                 lte_persist: false,
                 nr5g_persist: true,
+                cell_lock_deadman_enabled: None,
+                cell_lock_deadman_secs: None,
             },
             radio: Some(Radio {
                 lte_bands: vec!["2".into(), "66".into()],
@@ -1697,5 +1793,61 @@ pub mod tests {
         let mut bad_rt = wanted.clone();
         bad_rt.radio_tuning.as_mut().unwrap().rat_acq_order = Some("GSM".into());
         assert!(validate(&bad_rt).is_err());
+    }
+
+    #[test]
+    fn v14_v15_fields_and_ipv6_dns_roundtrip_and_legacy_bundles_stay_valid() {
+        let mut b = sample();
+        b.preferences.antenna_labels = Some([
+            "Roof N".into(),
+            "Roof E".into(),
+            "Roof S".into(),
+            "Roof W".into(),
+        ]);
+        b.quecwatch.preferred_sim_slot = Some(2);
+        b.quecwatch.sim_failback_mins = Some(30);
+        b.policy.eth_link_speed = Some("1000".into());
+        b.policy.dns_servers = Some(vec![
+            "1.1.1.1".into(),
+            "2606:4700:4700::1111".into(),
+            "2001:4860:4860::8888".into(),
+        ]);
+        b.cell_lock_schedule.cell_lock_deadman_enabled = Some(true);
+        b.cell_lock_schedule.cell_lock_deadman_secs = Some(300);
+
+        assert!(validate(&b).is_ok(), "{:?}", validate(&b));
+        let raw = serde_json::to_value(&b).unwrap();
+        assert_eq!(reparse(raw).unwrap(), b);
+
+        // Legacy bundle omitting all new optional fields must remain valid.
+        let mut legacy_val = serde_json::to_value(&b).unwrap();
+        legacy_val["preferences"].as_object_mut().unwrap().remove("antennaLabels");
+        legacy_val["quecwatch"].as_object_mut().unwrap().remove("preferredSimSlot");
+        legacy_val["quecwatch"].as_object_mut().unwrap().remove("simFailbackMins");
+        legacy_val["policy"].as_object_mut().unwrap().remove("ethLinkSpeed");
+        legacy_val["cellLockSchedule"].as_object_mut().unwrap().remove("cellLockDeadmanEnabled");
+        legacy_val["cellLockSchedule"].as_object_mut().unwrap().remove("cellLockDeadmanSecs");
+        let parsed_legacy = reparse(legacy_val).unwrap();
+        assert_eq!(parsed_legacy.preferences.antenna_labels, None);
+        assert_eq!(parsed_legacy.quecwatch.preferred_sim_slot, None);
+        assert_eq!(parsed_legacy.quecwatch.sim_failback_mins, None);
+        assert_eq!(parsed_legacy.policy.eth_link_speed, None);
+        assert_eq!(parsed_legacy.cell_lock_schedule.cell_lock_deadman_enabled, None);
+        assert_eq!(parsed_legacy.cell_lock_schedule.cell_lock_deadman_secs, None);
+
+        // Invalid values for the new fields must be rejected.
+        type Mutation = Box<dyn Fn(&mut Bundle)>;
+        let bad_cases: Vec<Mutation> = vec![
+            Box::new(|x| x.quecwatch.preferred_sim_slot = Some(3)),
+            Box::new(|x| x.quecwatch.sim_failback_mins = Some(0)),
+            Box::new(|x| x.policy.eth_link_speed = Some("10000".into())),
+            Box::new(|x| x.cell_lock_schedule.cell_lock_deadman_secs = Some(0)),
+            Box::new(|x| x.preferences.antenna_labels = Some(["bad\nlabel".into(), "A".into(), "B".into(), "C".into()])),
+        ];
+        for (idx, mutate) in bad_cases.iter().enumerate() {
+            let mut bad = b.clone();
+            mutate(&mut bad);
+            assert!(validate(&bad).is_err(), "v1.4/v1.5 bad case {idx} accepted");
+        }
     }
 }

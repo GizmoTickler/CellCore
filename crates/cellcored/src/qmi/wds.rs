@@ -18,6 +18,10 @@ pub const WDS_START_NETWORK_INTERFACE: u16 = 0x0020;
 pub const WDS_STOP_NETWORK_INTERFACE: u16 = 0x0021;
 pub const WDS_GET_PKT_SRVC_STATUS: u16 = 0x0022;
 pub const WDS_PKT_SRVC_STATUS_IND: u16 = 0x0022;
+#[allow(dead_code)]
+pub const WDS_GET_CURRENT_CHANNEL_RATE: u16 = 0x0023;
+#[allow(dead_code)]
+pub const WDS_GET_PKT_STATISTICS: u16 = 0x0024;
 pub const WDS_GET_PROFILE_LIST: u16 = 0x002A;
 pub const WDS_GET_PROFILE_SETTINGS: u16 = 0x002B;
 pub const WDS_GET_RUNTIME_SETTINGS: u16 = 0x002D;
@@ -26,6 +30,8 @@ pub const WDS_SET_AUTO_CONNECT: u16 = 0x0051;
 pub const WDS_BIND_MUX_DATA_PORT: u16 = 0x00A2;
 
 pub const RUNTIME_SETTINGS_MASK: u32 = 0x0000_6B10;
+#[allow(dead_code)]
+pub const PKT_STATS_MASK_ALL: u32 = 0x0000_03FF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -248,6 +254,93 @@ pub async fn get_pkt_srvc_status(client: &dyn QmiClient) -> Result<PktSrvcStatus
     parse_pkt_srvc_status_tlvs(&tlvs)
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WdsChannelRate {
+    pub tx_bps: u32,
+    pub rx_bps: u32,
+    pub max_tx_bps: u32,
+    pub max_rx_bps: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WdsPktStatistics {
+    pub tx_packets_ok: Option<u32>,
+    pub rx_packets_ok: Option<u32>,
+    pub tx_errors: Option<u32>,
+    pub rx_errors: Option<u32>,
+    pub tx_overflows: Option<u32>,
+    pub rx_overflows: Option<u32>,
+    pub tx_bytes_ok: Option<u64>,
+    pub rx_bytes_ok: Option<u64>,
+    pub tx_dropped: Option<u32>,
+    pub rx_dropped: Option<u32>,
+}
+
+fn read_u64_le(tlvs: &[(u8, Vec<u8>)], tag: u8) -> Option<u64> {
+    find_tlv(tlvs, tag).and_then(|v| {
+        (v.len() >= 8)
+            .then(|| u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+    })
+}
+
+#[allow(dead_code)]
+pub fn parse_channel_rate_tlvs(tlvs: &[(u8, Vec<u8>)]) -> Result<WdsChannelRate, QmiError> {
+    let raw = find_tlv(tlvs, 0x01)
+        .ok_or_else(|| QmiError::Malformed("WDS current_channel_rate missing TLV 0x01".into()))?;
+    if raw.len() < 16 {
+        return Err(QmiError::Malformed(format!(
+            "WDS current_channel_rate TLV 0x01 too short ({} bytes)",
+            raw.len()
+        )));
+    }
+    Ok(WdsChannelRate {
+        tx_bps: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        rx_bps: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        max_tx_bps: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        max_rx_bps: u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]),
+    })
+}
+
+#[allow(dead_code)]
+pub fn parse_pkt_statistics_tlvs(tlvs: &[(u8, Vec<u8>)]) -> WdsPktStatistics {
+    WdsPktStatistics {
+        tx_packets_ok: read_u32_le(tlvs, 0x10),
+        rx_packets_ok: read_u32_le(tlvs, 0x11),
+        tx_errors: read_u32_le(tlvs, 0x12),
+        rx_errors: read_u32_le(tlvs, 0x13),
+        tx_overflows: read_u32_le(tlvs, 0x14),
+        rx_overflows: read_u32_le(tlvs, 0x15),
+        tx_bytes_ok: read_u64_le(tlvs, 0x19),
+        rx_bytes_ok: read_u64_le(tlvs, 0x1A),
+        tx_dropped: read_u32_le(tlvs, 0x1B),
+        rx_dropped: read_u32_le(tlvs, 0x1C),
+    }
+}
+
+#[allow(dead_code)]
+pub async fn get_current_channel_rate(client: &dyn QmiClient) -> Result<WdsChannelRate, QmiError> {
+    let tlvs = client
+        .rpc(WDS_GET_CURRENT_CHANNEL_RATE, Vec::new(), Duration::from_secs(3))
+        .await?;
+    check_result_tlv(&tlvs)?;
+    parse_channel_rate_tlvs(&tlvs)
+}
+
+#[allow(dead_code)]
+pub async fn get_pkt_statistics(client: &dyn QmiClient) -> Result<WdsPktStatistics, QmiError> {
+    let mut w = TlvWriter::new();
+    w.push_u32(0x01, PKT_STATS_MASK_ALL);
+    let tlvs = client
+        .rpc(WDS_GET_PKT_STATISTICS, w.finish(), Duration::from_secs(3))
+        .await?;
+    check_result_tlv(&tlvs)?;
+    Ok(parse_pkt_statistics_tlvs(&tlvs))
+}
+
 pub async fn get_runtime_settings(client: &dyn QmiClient) -> Result<WdsRuntimeSettings, QmiError> {
     let mut w = TlvWriter::new();
     w.push_u32(0x10, RUNTIME_SETTINGS_MASK);
@@ -459,5 +552,58 @@ mod tests {
         let ind = parse_pkt_srvc_status_tlvs(&[(0x01, vec![2, 1])]).unwrap();
         assert_eq!(ind.status, PktConnStatus::Connected);
         assert!(ind.reconfig_required);
+    }
+
+    #[tokio::test]
+    async fn decodes_current_channel_rate_and_pkt_statistics() {
+        let mock = MockQmiClient::new(|msg_id, req| {
+            let mut w = TlvWriter::new();
+            match msg_id {
+                WDS_GET_CURRENT_CHANNEL_RATE => {
+                    let mut raw = Vec::with_capacity(16);
+                    raw.extend_from_slice(&150_000_000u32.to_le_bytes());
+                    raw.extend_from_slice(&1_200_000_000u32.to_le_bytes());
+                    raw.extend_from_slice(&300_000_000u32.to_le_bytes());
+                    raw.extend_from_slice(&2_500_000_000u32.to_le_bytes());
+                    w.push_bytes(0x01, &raw).unwrap();
+                }
+                WDS_GET_PKT_STATISTICS => {
+                    let rtlvs = parse_tlvs(req)?;
+                    assert_eq!(read_u32_le(&rtlvs, 0x01), Some(PKT_STATS_MASK_ALL));
+                    w.push_u32(0x10, 1000)
+                        .push_u32(0x11, 2000)
+                        .push_u32(0x12, 1)
+                        .push_u32(0x13, 2)
+                        .push_u32(0x14, 0)
+                        .push_u32(0x15, 3)
+                        .push_u32(0x1B, 4)
+                        .push_u32(0x1C, 5);
+                    w.push_bytes(0x19, &1_500_000u64.to_le_bytes()).unwrap();
+                    w.push_bytes(0x1A, &9_876_543_210u64.to_le_bytes()).unwrap();
+                }
+                other => return Err(QmiError::Malformed(format!("unexpected {other:#x}"))),
+            }
+            let mut out = parse_tlvs(&make_result_ok_tlv())?;
+            out.extend(parse_tlvs(&w.finish())?);
+            Ok(out)
+        });
+
+        let rate = get_current_channel_rate(&mock).await.unwrap();
+        assert_eq!(rate.tx_bps, 150_000_000);
+        assert_eq!(rate.rx_bps, 1_200_000_000);
+        assert_eq!(rate.max_tx_bps, 300_000_000);
+        assert_eq!(rate.max_rx_bps, 2_500_000_000);
+
+        let stats = get_pkt_statistics(&mock).await.unwrap();
+        assert_eq!(stats.tx_packets_ok, Some(1000));
+        assert_eq!(stats.rx_packets_ok, Some(2000));
+        assert_eq!(stats.tx_errors, Some(1));
+        assert_eq!(stats.rx_errors, Some(2));
+        assert_eq!(stats.tx_overflows, Some(0));
+        assert_eq!(stats.rx_overflows, Some(3));
+        assert_eq!(stats.tx_bytes_ok, Some(1_500_000));
+        assert_eq!(stats.rx_bytes_ok, Some(9_876_543_210));
+        assert_eq!(stats.tx_dropped, Some(4));
+        assert_eq!(stats.rx_dropped, Some(5));
     }
 }

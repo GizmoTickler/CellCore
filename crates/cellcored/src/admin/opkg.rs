@@ -322,11 +322,14 @@ write_state() {{
 echo "=== CellCore self-upgrade started ($PKG $FROM_VER -> $TARGET_VER) ==="
 write_state true "snapshotting" false ""
 rm -rf "$RB"
-mkdir -p "$RB/etc"
+mkdir -p "$RB/etc" "$RB/opkg-info"
 [ -x /usr/sbin/cellcored ] && cp -a /usr/sbin/cellcored "$RB/cellcored"
 [ -d /www ] && cp -a /www "$RB/www"
 [ -f /etc/init.d/cellcored ] && cp -a /etc/init.d/cellcored "$RB/init.d-cellcored"
+[ -f /etc/init.d/dropbear-lan-watchdog ] && cp -a /etc/init.d/dropbear-lan-watchdog "$RB/init.d-dropbear-lan-watchdog"
 [ -d /etc/cellcore ] && cp -a /etc/cellcore "$RB/etc/cellcore"
+[ -f /usr/lib/opkg/status ] && cp -a /usr/lib/opkg/status "$RB/opkg-status"
+cp -a /usr/lib/opkg/info/sdxpinn-cellcore.* "$RB/opkg-info/" 2>/dev/null || true
 rollback() {{
   reason="$1"
   echo "ERROR: $reason -- rolling back"
@@ -337,9 +340,15 @@ rollback() {{
     cp -a "$RB/www" /www
   fi
   [ -f "$RB/init.d-cellcored" ] && cp -af "$RB/init.d-cellcored" /etc/init.d/cellcored
+  [ -f "$RB/init.d-dropbear-lan-watchdog" ] && cp -af "$RB/init.d-dropbear-lan-watchdog" /etc/init.d/dropbear-lan-watchdog
   if [ -d "$RB/etc/cellcore" ]; then
     mkdir -p /etc/cellcore
     cp -af "$RB/etc/cellcore/." /etc/cellcore/
+  fi
+  [ -f "$RB/opkg-status" ] && cp -af "$RB/opkg-status" /usr/lib/opkg/status
+  if [ -d "$RB/opkg-info" ]; then
+    rm -f /usr/lib/opkg/info/sdxpinn-cellcore.* 2>/dev/null || true
+    cp -af "$RB/opkg-info/." /usr/lib/opkg/info/ 2>/dev/null || true
   fi
   /etc/init.d/cellcored restart >/dev/null 2>&1 || /etc/init.d/cellcored start >/dev/null 2>&1 || true
   sleep 2
@@ -368,6 +377,16 @@ done
 if [ "$verified" -ne 1 ]; then
   rollback "cellcored verify timed out after 45s"
 fi
+RESCUE_DL="/tmp/qm-rescue-dl.$$"
+mkdir -p "$RESCUE_DL" /etc/cellcore-rescue
+if (cd "$RESCUE_DL" && opkg download "$PKG" >/dev/null 2>&1); then
+  ipk_f=$(ls -1 "$RESCUE_DL"/"${{PKG}}"_*.ipk "$RESCUE_DL"/*.ipk 2>/dev/null | head -n 1)
+  if [ -n "$ipk_f" ] && [ -f "$ipk_f" ]; then
+    cp -f "$ipk_f" /etc/cellcore-rescue/cellcore.ipk.tmp && mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
+    echo "Staged verified rescue package -> /etc/cellcore-rescue/cellcore.ipk"
+  fi
+fi
+rm -rf "$RESCUE_DL"
 rm -rf "$RB"
 echo "=== CellCore self-upgrade succeeded ($PKG -> $TARGET_VER) ==="
 write_state false "succeeded" false ""
@@ -1052,5 +1071,21 @@ Status: install user installed
         assert_eq!(compare_opkg_versions("4.2.1-2", "4.2.1-10"), Ordering::Less);
         assert_eq!(compare_opkg_versions("1:4.2.0-1", "4.2.9-1"), Ordering::Greater);
         assert_eq!(compare_opkg_versions("4.2.1~rc1-1", "4.2.1-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn self_upgrade_script_snapshots_opkg_metadata_watchdog_and_stages_rescue_ipk() {
+        let s = build_self_upgrade_script(
+            "sdxpinn-cellcore",
+            "1.5.0-1",
+            "1.6.0-1",
+            "/tmp/cellcore/self-upgrade.json",
+            "/tmp/cellcore/self-upgrade.log",
+        );
+        assert!(s.contains("/usr/lib/opkg/status"));
+        assert!(s.contains("/usr/lib/opkg/info/sdxpinn-cellcore.*"));
+        assert!(s.contains("/etc/init.d/dropbear-lan-watchdog"));
+        assert!(s.contains("/etc/cellcore-rescue/cellcore.ipk"));
+        assert!(s.contains("cellcored verify --expect-wan 0"));
     }
 }

@@ -589,6 +589,53 @@ pub fn cell_lock_sched_action(now_min: u16, start: &str, end: &str, engaged: boo
 }
 
 const SCHED_ENGAGED_MARKER: &str = "/tmp/cellcore/cell_lock_sched_engaged";
+pub const MIN_SCHEDULED_REBOOT_UPTIME_SECS: u64 = 180;
+pub const LAST_SCHEDULED_REBOOT_MIN_PATH: &str = "/etc/cellcore/last_scheduled_reboot_min";
+
+/// Read kernel uptime in whole seconds from `/proc/uptime`.
+pub fn read_proc_uptime_secs() -> Option<u64> {
+    let raw = fs::read_to_string(crate::paths::p("/proc/uptime")).ok()?;
+    let secs_f = raw.split_whitespace().next()?.parse::<f64>().ok()?;
+    (secs_f.is_finite() && secs_f >= 0.0).then_some(secs_f as u64)
+}
+
+pub fn read_last_scheduled_reboot_min() -> Option<u64> {
+    fs::read_to_string(crate::paths::p(LAST_SCHEDULED_REBOOT_MIN_PATH))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+pub fn persist_last_scheduled_reboot_min(min: u64) -> Result<(), String> {
+    crate::state::atomic_write(
+        std::path::Path::new(LAST_SCHEDULED_REBOOT_MIN_PATH),
+        format!("{min}\n").as_bytes(),
+        0o600,
+    )
+}
+
+/// Boot-loop guard for scheduled reboots:
+/// 1. System uptime must be at least `MIN_SCHEDULED_REBOOT_UPTIME_SECS` (180s).
+/// 2. Wall clock must be NTP-synced (`>= MIN_VALID_WALL_CLOCK_SECS`).
+/// 3. Current wall-clock minute (`now_secs / 60`) must strictly exceed any
+///    persisted `/etc/cellcore/last_scheduled_reboot_min`.
+pub fn should_allow_scheduled_reboot(
+    now_secs: u64,
+    uptime_secs: Option<u64>,
+    last_persisted_min: Option<u64>,
+) -> Result<(), &'static str> {
+    if now_secs < crate::state::MIN_VALID_WALL_CLOCK_SECS {
+        return Err("wall clock not NTP-synced yet");
+    }
+    match uptime_secs {
+        Some(u) if u >= MIN_SCHEDULED_REBOOT_UPTIME_SECS => {}
+        _ => return Err("system uptime below 180s boot-loop guard"),
+    }
+    let this_min = now_secs / 60;
+    if last_persisted_min.is_some_and(|prev| this_min <= prev) {
+        return Err("wall clock has not advanced past last scheduled reboot minute");
+    }
+    Ok(())
+}
 
 fn mono_secs() -> u64 {
     crate::state::mono_ms() / 1000
@@ -749,38 +796,60 @@ pub async fn tick_cell_lock_scheduler(
         let status_path = crate::paths::p("/tmp/cell_lock_status.json");
         match action {
             SchedAction::Engage => {
+                let mut any_sent = false;
+                let mut all_ok = true;
                 if !cfg.cell_lock_nr5g.is_empty() {
+                    any_sent = true;
                     let cmd = format!("AT+QNWLOCK=\"common/5g\",{}", cfg.cell_lock_nr5g);
-                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
+                    if !matches!(state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await, Ok(r) if r.ok) {
+                        all_ok = false;
+                    }
                 }
                 if !cfg.cell_lock_lte.is_empty() {
+                    any_sent = true;
                     let cmd = format!("AT+QNWLOCK=\"common/4g\",{}", cfg.cell_lock_lte);
-                    let _ = state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await;
+                    if !matches!(state.smd.exec(cmd, Priority::Background, Duration::from_secs(5)).await, Ok(r) if r.ok) {
+                        all_ok = false;
+                    }
                 }
-                let _ = crate::state::atomic_write(std::path::Path::new(&marker_path), b"1\n", 0o600);
-                let _ = crate::state::atomic_write(
-                    std::path::Path::new(&status_path),
-                    b"{\"status\":\"active\",\"locked\":1}",
-                    0o600,
-                );
-                state.push_daemon_log("Scheduled Cell Lock engaged");
+                if any_sent && all_ok {
+                    let _ = crate::state::atomic_write(std::path::Path::new(&marker_path), b"1\n", 0o600);
+                    let _ = crate::state::atomic_write(
+                        std::path::Path::new(&status_path),
+                        b"{\"status\":\"active\",\"locked\":1}",
+                        0o600,
+                    );
+                    state.push_daemon_log("Scheduled Cell Lock engaged");
+                } else {
+                    state.push_daemon_log("Scheduled Cell Lock engage failed (AT did not return OK); will retry");
+                }
             }
             SchedAction::Release => {
-                let _ = state
-                    .smd
-                    .exec("AT+QNWLOCK=\"common/5g\",0", Priority::Background, Duration::from_secs(5))
-                    .await;
-                let _ = state
-                    .smd
-                    .exec("AT+QNWLOCK=\"common/4g\",0", Priority::Background, Duration::from_secs(5))
-                    .await;
-                let _ = fs::remove_file(&marker_path);
-                let _ = crate::state::atomic_write(
-                    std::path::Path::new(&status_path),
-                    b"{\"status\":\"inactive\",\"locked\":0}",
-                    0o600,
+                let ok5 = matches!(
+                    state
+                        .smd
+                        .exec("AT+QNWLOCK=\"common/5g\",0", Priority::Background, Duration::from_secs(5))
+                        .await,
+                    Ok(r) if r.ok
                 );
-                state.push_daemon_log("Scheduled Cell Lock cleared");
+                let ok4 = matches!(
+                    state
+                        .smd
+                        .exec("AT+QNWLOCK=\"common/4g\",0", Priority::Background, Duration::from_secs(5))
+                        .await,
+                    Ok(r) if r.ok
+                );
+                if ok5 && ok4 {
+                    let _ = fs::remove_file(&marker_path);
+                    let _ = crate::state::atomic_write(
+                        std::path::Path::new(&status_path),
+                        b"{\"status\":\"inactive\",\"locked\":0}",
+                        0o600,
+                    );
+                    state.push_daemon_log("Scheduled Cell Lock cleared");
+                } else {
+                    state.push_daemon_log("Scheduled Cell Lock release failed (AT did not return OK); will retry");
+                }
             }
             SchedAction::Nothing => {}
         }
@@ -817,22 +886,35 @@ pub async fn tick_profiles_and_schedules(state: &AppState) {
         && cfg.scheduled_reboot_days.iter().any(|d| d.eq_ignore_ascii_case(weekday))
     {
         let this_min = now / 60;
-        if LAST_REBOOT_MIN.swap(this_min, std::sync::atomic::Ordering::Relaxed) != this_min {
-            if crate::obs::failover::is_active() {
+        if LAST_REBOOT_MIN.load(std::sync::atomic::Ordering::Relaxed) != this_min {
+            let uptime = read_proc_uptime_secs();
+            let last_persisted = read_last_scheduled_reboot_min();
+            if let Err(reason) = should_allow_scheduled_reboot(now, uptime, last_persisted) {
+                LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
+                state.push_daemon_log(format!("Scheduled reboot skipped: {reason}"));
+            } else if crate::obs::failover::is_active() {
+                LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
                 state.push_daemon_log("Scheduled reboot deferred: modem is carrying failover traffic");
                 crate::obs::failover::defer_scheduled_reboot(now);
             } else {
-                state.push_daemon_log("Scheduled reboot triggered");
-                crate::obs::emit(
-                    crate::obs::EventKind::ScheduledReboot,
-                    crate::obs::Severity::Info,
-                    "Scheduled reboot",
-                    serde_json::json!({ "time": hhmm, "day": weekday, "ran": true }),
-                );
-                crate::obs::set_boot_reason("scheduled reboot");
-                crate::telemetry::flush_persistent_state(state).await;
-                let _ = run_cmd("sync", &[], Duration::from_secs(3)).await;
-                let _ = run_cmd("/sbin/reboot", &[], Duration::from_secs(3)).await;
+                LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = persist_last_scheduled_reboot_min(this_min) {
+                    state.push_daemon_log(format!(
+                        "Scheduled reboot aborted: failed to persist last_scheduled_reboot_min: {e}"
+                    ));
+                } else {
+                    state.push_daemon_log("Scheduled reboot triggered");
+                    crate::obs::emit(
+                        crate::obs::EventKind::ScheduledReboot,
+                        crate::obs::Severity::Info,
+                        "Scheduled reboot",
+                        serde_json::json!({ "time": hhmm, "day": weekday, "ran": true }),
+                    );
+                    crate::obs::set_boot_reason("scheduled reboot");
+                    crate::telemetry::flush_persistent_state(state).await;
+                    let _ = run_cmd("sync", &[], Duration::from_secs(3)).await;
+                    let _ = run_cmd("/sbin/reboot", &[], Duration::from_secs(3)).await;
+                }
             }
         }
     }
@@ -1071,6 +1153,129 @@ mod tests {
                 assert!(app.sched_boot_checked.load(std::sync::atomic::Ordering::Acquire));
                 assert_eq!(*lock_5g.lock().unwrap(), "0");
                 assert!(!sbx.root.join("tmp/cellcore/cell_lock_sched_engaged").exists());
+            })
+            .await;
+    }
+
+    #[test]
+    fn scheduled_reboot_boot_loop_guard_checks_uptime_ntp_and_persisted_min() {
+        let valid_ts = crate::state::MIN_VALID_WALL_CLOCK_SECS + 3600;
+        let this_min = valid_ts / 60;
+
+        // Pre-NTP wall clock -> rejected
+        assert!(should_allow_scheduled_reboot(1_000_000, Some(600), None).is_err());
+        // Missing or low uptime (< 180s) -> rejected
+        assert!(should_allow_scheduled_reboot(valid_ts, None, None).is_err());
+        assert!(should_allow_scheduled_reboot(valid_ts, Some(179), None).is_err());
+        // Wall clock not strictly past persisted last_scheduled_reboot_min -> rejected
+        assert!(should_allow_scheduled_reboot(valid_ts, Some(300), Some(this_min)).is_err());
+        assert!(should_allow_scheduled_reboot(valid_ts, Some(300), Some(this_min + 5)).is_err());
+        // Valid NTP + uptime >= 180s + strictly advanced past persisted minute -> allowed
+        assert!(should_allow_scheduled_reboot(valid_ts, Some(180), None).is_ok());
+        assert!(should_allow_scheduled_reboot(valid_ts, Some(300), Some(this_min - 1)).is_ok());
+
+        let sbx = crate::paths::TestSandbox::new("sched-reboot-guard");
+        sbx.write("/proc/uptime", "245.78 120.00\n");
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            assert_eq!(read_proc_uptime_secs(), Some(245));
+            assert_eq!(read_last_scheduled_reboot_min(), None);
+            persist_last_scheduled_reboot_min(this_min).unwrap();
+            assert_eq!(read_last_scheduled_reboot_min(), Some(this_min));
+            assert!(
+                should_allow_scheduled_reboot(
+                    valid_ts,
+                    read_proc_uptime_secs(),
+                    read_last_scheduled_reboot_min()
+                )
+                .is_err()
+            );
+            assert!(
+                should_allow_scheduled_reboot(
+                    valid_ts + 60,
+                    read_proc_uptime_secs(),
+                    read_last_scheduled_reboot_min()
+                )
+                .is_ok()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn scheduler_only_writes_or_removes_engaged_marker_after_at_ok() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sbx = crate::paths::TestSandbox::new("sched-marker-ok");
+        std::fs::create_dir_all(sbx.root.join("tmp/cellcore")).unwrap();
+        let allow_ok = std::sync::Arc::new(AtomicBool::new(false));
+        let allow_ok_srv = allow_ok.clone();
+
+        let (a, mut b) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = b.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let reply = if allow_ok_srv.load(Ordering::Relaxed) {
+                        format!("{cmd}\r\r\nOK\r\n")
+                    } else {
+                        format!("{cmd}\r\r\nERROR\r\n")
+                    };
+                    let _ = b.write_all(reply.as_bytes());
+                }
+            }
+        });
+        let fd_opt = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_opt.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, smd);
+                app.sched_boot_checked.store(true, Ordering::Release);
+                let cfg = crate::state::DaemonSettings {
+                    cell_lock_sched_enabled: true,
+                    cell_lock_start_time: "08:00".into(),
+                    cell_lock_end_time: "18:00".into(),
+                    cell_lock_nr5g: "589,521310,30,41".into(),
+                    ..Default::default()
+                };
+                let marker = sbx.root.join("tmp/cellcore/cell_lock_sched_engaged");
+
+                // AT returns ERROR -> Engage must NOT write marker
+                tick_cell_lock_scheduler(&app, &cfg, 10 * 60).await;
+                assert!(!marker.exists(), "marker must not be written when AT fails");
+
+                // AT returns OK -> Engage writes marker
+                allow_ok.store(true, Ordering::Relaxed);
+                tick_cell_lock_scheduler(&app, &cfg, 10 * 60).await;
+                assert!(marker.exists(), "marker must be written when AT succeeds");
+
+                // AT returns ERROR -> Release must NOT remove marker
+                allow_ok.store(false, Ordering::Relaxed);
+                tick_cell_lock_scheduler(&app, &cfg, 20 * 60).await;
+                assert!(marker.exists(), "marker must not be removed when Release AT fails");
+
+                // AT returns OK -> Release removes marker
+                allow_ok.store(true, Ordering::Relaxed);
+                tick_cell_lock_scheduler(&app, &cfg, 20 * 60).await;
+                assert!(!marker.exists(), "marker must be removed when Release AT succeeds");
             })
             .await;
     }

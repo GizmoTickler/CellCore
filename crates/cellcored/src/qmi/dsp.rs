@@ -18,10 +18,10 @@ use serde::Serialize;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
-    QmiClient, QmiError, SVC_NAS, SVC_SAR, SVC_TMD,
+    QmiClient, QmiError, SVC_SAR, SVC_TMD,
     codec::{TlvWriter, check_result_tlv, find_tlv},
-    nas::{self, SignalInfoSnapshot},
-    qrtr::QrtrBus,
+    nas::SignalInfoSnapshot,
+    qrtr::{QrtrBus, QrtrServiceClient, shared_bus},
 };
 use crate::http::HttpCtx;
 
@@ -32,23 +32,90 @@ pub const TMD_GET_MITIGATION_LEVEL: u16 = 0x0022;
 pub const SAR_RF_SET_STATE: u16 = 0x0001;
 pub const SAR_RF_GET_STATE: u16 = 0x0002;
 
-static DSP_QRTR_BUS: Mutex<Option<Arc<QrtrBus>>> = Mutex::const_new(None);
-
-async fn shared_dsp_bus() -> Option<Arc<QrtrBus>> {
-    let mut guard = DSP_QRTR_BUS.lock().await;
-    if let Some(bus) = guard.as_ref() {
-        if bus.snapshot().available {
-            return Some(Arc::clone(bus));
-        }
-        *guard = None;
-    }
-    let bus = QrtrBus::connect().ok()?;
-    *guard = Some(Arc::clone(&bus));
-    Some(bus)
+#[derive(Default)]
+struct DspClientCache {
+    ssr_epoch: u64,
+    tmd_client: Option<Arc<QrtrServiceClient>>,
+    sar_client: Option<Arc<QrtrServiceClient>>,
+    tmd_device_list: Option<Vec<(String, u8)>>,
 }
 
-async fn invalidate_dsp_bus() {
-    *DSP_QRTR_BUS.lock().await = None;
+impl DspClientCache {
+    fn reset_if_ssr(&mut self, ssr_count: u64) {
+        if self.ssr_epoch != ssr_count {
+            self.ssr_epoch = ssr_count;
+            self.tmd_client = None;
+            self.sar_client = None;
+            self.tmd_device_list = None;
+        }
+    }
+}
+
+static DSP_CACHE: Mutex<DspClientCache> = Mutex::const_new(DspClientCache {
+    ssr_epoch: 0,
+    tmd_client: None,
+    sar_client: None,
+    tmd_device_list: None,
+});
+
+/// Filter out irrelevant non-cellular TMD mitigation devices from 30s polling
+/// (`wlan*`, `mmw*`, `cpuv_restriction_cold`).
+pub fn is_relevant_tmd_device(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    !n.is_empty()
+        && !n.starts_with("wlan")
+        && !n.starts_with("mmw")
+        && n != "cpuv_restriction_cold"
+}
+
+fn is_transport_err(e: &QmiError) -> bool {
+    matches!(e, QmiError::Io(_) | QmiError::Timeout | QmiError::Ssr)
+}
+
+async fn ensure_cached_client(
+    bus: &Arc<QrtrBus>,
+    service: u32,
+    tag: &'static str,
+    ssr_count: u64,
+) -> Result<Arc<QrtrServiceClient>, QmiError> {
+    {
+        let mut cache = DSP_CACHE.lock().await;
+        cache.reset_if_ssr(ssr_count);
+        let slot = match service {
+            SVC_TMD => &mut cache.tmd_client,
+            SVC_SAR => &mut cache.sar_client,
+            _ => &mut cache.tmd_client,
+        };
+        if let Some(c) = slot.as_ref().filter(|c| c.is_alive()) {
+            return Ok(Arc::clone(c));
+        }
+        *slot = None;
+    }
+    let (ind_tx, _ind_rx) = mpsc::channel(4);
+    let client = bus.open_service(service, tag, ind_tx, QMI_TIMEOUT).await?;
+    let mut cache = DSP_CACHE.lock().await;
+    cache.reset_if_ssr(ssr_count);
+    let slot = match service {
+        SVC_TMD => &mut cache.tmd_client,
+        SVC_SAR => &mut cache.sar_client,
+        _ => &mut cache.tmd_client,
+    };
+    *slot = Some(Arc::clone(&client));
+    Ok(client)
+}
+
+async fn invalidate_cached_client(service: u32, clear_tmd_list: bool) {
+    let mut cache = DSP_CACHE.lock().await;
+    match service {
+        SVC_TMD => {
+            cache.tmd_client = None;
+            if clear_tmd_list {
+                cache.tmd_device_list = None;
+            }
+        }
+        SVC_SAR => cache.sar_client = None,
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -124,15 +191,25 @@ pub fn sar_state_label(state: Option<u32>) -> String {
     }
 }
 
-pub async fn query_tmd_devices(client: &dyn QmiClient) -> Result<Vec<TmdDeviceInfo>, QmiError> {
+pub async fn query_tmd_device_list(client: &dyn QmiClient) -> Result<Vec<(String, u8)>, QmiError> {
     let tlvs = client.rpc(TMD_GET_MITIGATION_DEVICE_LIST, Vec::new(), QMI_TIMEOUT).await?;
     check_result_tlv(&tlvs)?;
     let list = find_tlv(&tlvs, 0x10)
         .map(parse_tmd_device_list)
         .unwrap_or_default();
+    Ok(list
+        .into_iter()
+        .filter(|(name, _)| is_relevant_tmd_device(name))
+        .take(24)
+        .collect())
+}
 
-    let mut out = Vec::with_capacity(list.len());
-    for (name, max_level) in list.into_iter().take(24) {
+pub async fn query_tmd_levels(
+    client: &dyn QmiClient,
+    devices: &[(String, u8)],
+) -> Result<Vec<TmdDeviceInfo>, QmiError> {
+    let mut out = Vec::with_capacity(devices.len());
+    for (name, max_level) in devices.iter().take(24) {
         let mut w = TlvWriter::new();
         let mut dev_tlv = Vec::with_capacity(1 + name.len());
         dev_tlv.push(name.len().min(255) as u8);
@@ -145,17 +222,24 @@ pub async fn query_tmd_devices(client: &dyn QmiClient) -> Result<Vec<TmdDeviceIn
                 let r = find_tlv(&rt, 0x11).and_then(|b| b.first().copied()).unwrap_or(0);
                 (c, r)
             }
+            Err(e) if is_transport_err(&e) => return Err(e),
             _ => (0, 0),
         };
         out.push(TmdDeviceInfo {
-            name,
-            max_level,
+            name: name.clone(),
+            max_level: *max_level,
             current_level: cur,
             requested_level: req,
             throttling: cur > 0,
         });
     }
     Ok(out)
+}
+
+#[allow(dead_code)]
+pub async fn query_tmd_devices(client: &dyn QmiClient) -> Result<Vec<TmdDeviceInfo>, QmiError> {
+    let list = query_tmd_device_list(client).await?;
+    query_tmd_levels(client, &list).await
 }
 
 pub async fn query_sar_state(client: &dyn QmiClient) -> Result<u32, QmiError> {
@@ -178,33 +262,26 @@ pub async fn set_sar_state_rpc(client: &dyn QmiClient, state: u32) -> Result<(),
 
 /// Set QMI SAR RF state (`SAR_RF_SET_STATE = 0x0001`, e.g. `0` = Default / No Backoff).
 pub async fn set_sar_rf_state(state: u32) -> Result<(), QmiError> {
-    let bus = shared_dsp_bus()
-        .await
-        .ok_or_else(|| QmiError::Unsupported("QRTR bus unavailable".into()))?;
-    if bus.snapshot().services.is_empty() {
-        if bus.send_lookup().await.is_err() {
-            invalidate_dsp_bus().await;
-            return Err(QmiError::Io("QRTR lookup failed".into()));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let (ind_tx, _ind_rx) = mpsc::channel(4);
-    let ep = match bus.open_service(SVC_SAR, "SAR_SET", ind_tx, QMI_TIMEOUT).await {
-        Ok(ep) => ep,
+    let bus = shared_bus()?;
+    let ssr_count = bus.snapshot().ssr_count;
+    let ep = ensure_cached_client(&bus, SVC_SAR, "SAR", ssr_count).await?;
+    match set_sar_state_rpc(ep.as_ref(), state).await {
+        Ok(()) => Ok(()),
         Err(e) => {
-            if matches!(e, QmiError::Io(_) | QmiError::Ssr) {
-                invalidate_dsp_bus().await;
+            if is_transport_err(&e) {
+                invalidate_cached_client(SVC_SAR, false).await;
             }
-            return Err(e);
+            Err(e)
         }
-    };
-    set_sar_state_rpc(ep.as_ref(), state).await
+    }
 }
 
-/// Probe live SDX75 DSP services directly over QRTR (`AF_QIPCRTR`).
+/// Probe live SDX75 DSP services directly over QRTR (`AF_QIPCRTR`), reusing
+/// persistent `SVC_TMD` and `SVC_SAR` client handles and caching the filtered
+/// TMD device list once per SSR epoch.
 pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     let now = crate::auth::now_secs();
-    let Some(bus) = shared_dsp_bus().await else {
+    let Ok(bus) = shared_bus() else {
         return DspTelemetrySnapshot {
             sar_label: sar_state_label(None),
             updated_at: now,
@@ -213,17 +290,11 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     };
 
     if bus.snapshot().services.is_empty() {
-        if bus.send_lookup().await.is_err() {
-            invalidate_dsp_bus().await;
-            return DspTelemetrySnapshot {
-                sar_label: sar_state_label(None),
-                updated_at: now,
-                ..Default::default()
-            };
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = bus.wait_for_service(SVC_TMD, Duration::from_millis(400)).await;
     }
-    let services = bus.snapshot().services;
+    let bsnap = bus.snapshot();
+    let ssr_count = bsnap.ssr_count;
+    let services = bsnap.services;
     let has_svc = |id: u32| services.iter().any(|s| s.service == id);
     let caps = DspCapabilities {
         tmd: has_svc(SVC_TMD),
@@ -235,11 +306,44 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
         time_svc: has_svc(0x16),
     };
 
-    let (ind_tx, _ind_rx) = mpsc::channel(8);
-
     let tmd_devices = if caps.tmd {
-        match bus.open_service(SVC_TMD, "TMD", ind_tx.clone(), QMI_TIMEOUT).await {
-            Ok(ep) => query_tmd_devices(ep.as_ref()).await.unwrap_or_default(),
+        match ensure_cached_client(&bus, SVC_TMD, "TMD", ssr_count).await {
+            Ok(ep) => {
+                let cached_list = {
+                    let mut cache = DSP_CACHE.lock().await;
+                    cache.reset_if_ssr(ssr_count);
+                    cache.tmd_device_list.clone()
+                };
+                let dev_list = match cached_list {
+                    Some(list) => Ok(list),
+                    None => match query_tmd_device_list(ep.as_ref()).await {
+                        Ok(list) => {
+                            let mut cache = DSP_CACHE.lock().await;
+                            cache.reset_if_ssr(ssr_count);
+                            cache.tmd_device_list = Some(list.clone());
+                            Ok(list)
+                        }
+                        Err(e) => {
+                            if is_transport_err(&e) {
+                                invalidate_cached_client(SVC_TMD, matches!(e, QmiError::Ssr)).await;
+                            }
+                            Err(e)
+                        }
+                    },
+                };
+                match dev_list {
+                    Ok(list) => match query_tmd_levels(ep.as_ref(), &list).await {
+                        Ok(devs) => devs,
+                        Err(e) => {
+                            if is_transport_err(&e) {
+                                invalidate_cached_client(SVC_TMD, matches!(e, QmiError::Ssr)).await;
+                            }
+                            Vec::new()
+                        }
+                    },
+                    Err(_) => Vec::new(),
+                }
+            }
             Err(_) => Vec::new(),
         }
     } else {
@@ -247,17 +351,16 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     };
 
     let sar_rf_state = if caps.sar {
-        match bus.open_service(SVC_SAR, "SAR", ind_tx.clone(), QMI_TIMEOUT).await {
-            Ok(ep) => query_sar_state(ep.as_ref()).await.ok(),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    let qmi_signal = if has_svc(SVC_NAS) {
-        match bus.open_service(SVC_NAS, "NAS_DSP", ind_tx, QMI_TIMEOUT).await {
-            Ok(ep) => nas::get_signal_info(ep.as_ref()).await.ok(),
+        match ensure_cached_client(&bus, SVC_SAR, "SAR", ssr_count).await {
+            Ok(ep) => match query_sar_state(ep.as_ref()).await {
+                Ok(st) => Some(st),
+                Err(e) => {
+                    if is_transport_err(&e) {
+                        invalidate_cached_client(SVC_SAR, false).await;
+                    }
+                    None
+                }
+            },
             Err(_) => None,
         }
     } else {
@@ -273,7 +376,8 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
         sar_label: sar_state_label(sar_rf_state),
         tmd_devices,
         any_throttling,
-        qmi_signal,
+        // NAS_GET_SIGNAL_INFO is already polled by dataplane.rs; avoid duplicate QMI traffic.
+        qmi_signal: None,
         updated_at: now,
     };
     crate::obs::events::on_dsp_telemetry(&snap);
@@ -328,5 +432,63 @@ mod tests {
             parse_tlvs(&make_result_ok_tlv())
         });
         set_sar_state_rpc(&mock, 0).await.unwrap();
+    }
+
+    #[test]
+    fn filters_irrelevant_non_cellular_tmd_devices() {
+        assert!(is_relevant_tmd_device("pa"));
+        assert!(is_relevant_tmd_device("modem"));
+        assert!(is_relevant_tmd_device("modem_lte_dsc"));
+        assert!(!is_relevant_tmd_device("wlan"));
+        assert!(!is_relevant_tmd_device("wlan_tx"));
+        assert!(!is_relevant_tmd_device("mmw0"));
+        assert!(!is_relevant_tmd_device("mmw_pa1"));
+        assert!(!is_relevant_tmd_device("cpuv_restriction_cold"));
+        assert!(!is_relevant_tmd_device(""));
+    }
+
+    #[tokio::test]
+    async fn query_tmd_device_list_filters_and_caches_levels() {
+        use crate::qmi::{
+            codec::{make_result_ok_tlv, parse_tlvs},
+            test_support::MockQmiClient,
+        };
+        let mock = MockQmiClient::new(|msg_id, _| {
+            let mut w = TlvWriter::new();
+            match msg_id {
+                TMD_GET_MITIGATION_DEVICE_LIST => {
+                    let devs: &[(&str, u8)] = &[
+                        ("pa", 3),
+                        ("wlan", 2),
+                        ("mmw0", 4),
+                        ("cpuv_restriction_cold", 1),
+                        ("modem", 4),
+                    ];
+                    let mut raw = vec![devs.len() as u8];
+                    for (name, max) in devs {
+                        raw.push(name.len() as u8);
+                        raw.extend_from_slice(name.as_bytes());
+                        raw.push(*max);
+                    }
+                    w.push_bytes(0x10, &raw).unwrap();
+                }
+                TMD_GET_MITIGATION_LEVEL => {
+                    w.push_u8(0x10, 1).push_u8(0x11, 2);
+                }
+                other => return Err(QmiError::Malformed(format!("unexpected {other:#x}"))),
+            }
+            let mut out = parse_tlvs(&make_result_ok_tlv())?;
+            out.extend(parse_tlvs(&w.finish())?);
+            Ok(out)
+        });
+        let cached = query_tmd_device_list(&mock).await.unwrap();
+        assert_eq!(cached, vec![("pa".into(), 3), ("modem".into(), 4)]);
+        let levels = query_tmd_levels(&mock, &cached).await.unwrap();
+        assert_eq!(levels.len(), 2);
+        assert!(levels[0].throttling);
+        assert_eq!(levels[0].current_level, 1);
+        assert_eq!(levels[0].requested_level, 2);
+        // 1 list call + 2 level calls (irrelevant devices never polled!)
+        assert_eq!(mock.calls.lock().unwrap().len(), 3);
     }
 }

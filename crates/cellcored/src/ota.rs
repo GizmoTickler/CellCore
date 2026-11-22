@@ -29,6 +29,8 @@ pub const FEED_CONF_TMP: &str = "/tmp/cellcore/opkg-feed.conf";
 pub const CHECK_STATE_PATH: &str = "/tmp/cellcore/ota-check.json";
 pub const UPGRADE_STATUS_PATH: &str = "/tmp/cellcore/ota-upgrade.json";
 pub const UPGRADE_LOG_PATH: &str = "/tmp/cellcore/ota-upgrade.log";
+#[allow(dead_code)]
+pub const RESCUE_IPK_PATH: &str = "/etc/cellcore-rescue/cellcore.ipk";
 const DEFAULT_LISTS_DIR: &str = "/var/opkg-lists";
 const FEED_UPDATE_TIMEOUT: Duration = Duration::from_secs(90);
 const LOG_TAIL_LINES: usize = 40;
@@ -392,7 +394,33 @@ echo "[$(date)] opkg upgrade $pkg (target $target, installed $from)"
 opkg upgrade "$pkg"
 rc=$?
 inst=$(opkg list-installed "$pkg" | sed -n "s/^$pkg - \([^ ]*\).*/\1/p" | head -n 1)
-if [ "$rc" -eq 0 ] && [ "$inst" = "$target" ]; then st=succeeded; else st=failed; fi
+if [ "$rc" -eq 0 ] && [ "$inst" = "$target" ]; then
+  st=succeeded
+  vi=0
+  vok=0
+  while [ "$vi" -lt 30 ]; do
+    if /usr/sbin/cellcored verify --expect-wan 0 >/dev/null 2>&1; then
+      vok=1
+      break
+    fi
+    sleep 1
+    vi=$((vi + 1))
+  done
+  if [ "$vok" -eq 1 ]; then
+    rdl="/tmp/cellcore-rescue-dl.$$"
+    mkdir -p "$rdl" /etc/cellcore-rescue
+    if (cd "$rdl" && opkg download "$pkg" >/dev/null 2>&1); then
+      ipk_f=$(ls -1 "$rdl"/"${pkg}"_*.ipk "$rdl"/*.ipk 2>/dev/null | head -n 1)
+      if [ -n "$ipk_f" ] && [ -f "$ipk_f" ]; then
+        cp -f "$ipk_f" /etc/cellcore-rescue/cellcore.ipk.tmp && mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
+        echo "[$(date)] staged verified rescue package -> /etc/cellcore-rescue/cellcore.ipk"
+      fi
+    fi
+    rm -rf "$rdl"
+  fi
+else
+  st=failed
+fi
 echo "[$(date)] opkg exited $rc; installed now: ${inst:-unknown} -> $st"
 printf '{"state":"%s","target":"%s","from":"%s","startedAt":%s,"finishedAt":%s,"exitCode":%s,"installedAfter":"%s"}\n' \
   "$st" "$target" "$from" "$started" "$(date +%s)" "$rc" "$inst" > "$status.tmp" && mv "$status.tmp" "$status"
@@ -598,5 +626,12 @@ mod tests {
         assert_eq!(sid, pid.to_string(), "installer must lead its own session");
         assert!(fs::read_to_string(&log).unwrap().contains("hello"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_script_stages_rescue_ipk_after_verify() {
+        assert!(INSTALL_SCRIPT.contains("/usr/sbin/cellcored verify --expect-wan 0"));
+        assert!(INSTALL_SCRIPT.contains(RESCUE_IPK_PATH));
+        assert!(INSTALL_SCRIPT.contains("opkg download"));
     }
 }

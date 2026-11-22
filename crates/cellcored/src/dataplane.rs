@@ -307,11 +307,19 @@ struct DataplaneHub {
     reconnect_queue: Mutex<Option<String>>,
 }
 
+type EthtoolGroFeatures = (Option<bool>, Option<bool>);
+
 static HUB: OnceLock<Arc<DataplaneHub>> = OnceLock::new();
 static BASELINE_SYSCTLS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+static BASELINE_IRQ_AFFINITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static BASELINE_ETHTOOL_FEATURES: OnceLock<Mutex<HashMap<String, EthtoolGroFeatures>>> =
+    OnceLock::new();
+/// Monotonic milliseconds (`crate::state::mono_ms()`) when the native bearer connected (`0` = disconnected).
 static NATIVE_CONNECTED_SINCE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SFE_LOADED_BY_US: AtomicBool = AtomicBool::new(false);
+
+const IPPT_DNSMASQ_CONF_PATH: &str = "/tmp/dnsmasq.d/99-cellcore-ippt.conf";
 
 /// True when Qualcomm Shortcut Forwarding Engine (`shortcut_fe`) is currently loaded in the kernel.
 pub fn is_sfe_loaded() -> bool {
@@ -319,11 +327,53 @@ pub fn is_sfe_loaded() -> bool {
         || Path::new(&crate::paths::p("/sys/sfe_ipv4")).exists()
 }
 
-/// Reconcile opt-in Qualcomm SFE software fastpath kernel modules.
-pub async fn reconcile_sfe_fastpath(enable: bool, force_unload: bool) -> Vec<String> {
+pub(crate) fn sfe_mutual_exclusion_warning(
+    preserve_ipa_offload: bool,
+    ippt: bool,
+) -> Option<String> {
+    match (preserve_ipa_offload, ippt) {
+        (true, true) => Some(
+            "SFE fastpath refused: mutually exclusive with IPA hardware offload (preserveIpaOffload) and IP Passthrough (ippt)"
+                .into(),
+        ),
+        (true, false) => Some(
+            "SFE fastpath refused: mutually exclusive with IPA hardware offload (preserveIpaOffload)"
+                .into(),
+        ),
+        (false, true) => Some(
+            "SFE fastpath refused: mutually exclusive with IP Passthrough (ippt)".into(),
+        ),
+        (false, false) => None,
+    }
+}
+
+pub(crate) async fn reconcile_sfe_fastpath_with_guard(
+    enable: bool,
+    force_unload: bool,
+    preserve_ipa_offload: bool,
+    ippt: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let opt_bin = "/usr/sbin/data_path_opt";
     if enable {
+        if let Some(warn) = sfe_mutual_exclusion_warning(preserve_ipa_offload, ippt) {
+            warnings.push(warn);
+            if SFE_LOADED_BY_US.load(Ordering::Relaxed) && is_sfe_loaded() {
+                if Path::new(&crate::paths::p(opt_bin)).exists() {
+                    let _ = run(opt_bin, &["-u", "SFE"], ExecOpts::new(10, 16 * KIB)).await;
+                }
+                if is_sfe_loaded() {
+                    for kmod in ["shortcut_fe_cm", "shortcut_fe_ipv6", "shortcut_fe"] {
+                        let _ = run("rmmod", &[kmod], ExecOpts::new(5, 16 * KIB)).await;
+                    }
+                }
+                if !is_sfe_loaded() {
+                    SFE_LOADED_BY_US.store(false, Ordering::Relaxed);
+                }
+            }
+            crate::radio_tuning::set_cached_sfe_state(Some(is_sfe_loaded()));
+            return warnings;
+        }
         if !is_sfe_loaded() {
             if Path::new(&crate::paths::p(opt_bin)).exists() {
                 let _ = run(opt_bin, &["-l", "SFE"], ExecOpts::new(10, 16 * KIB)).await;
@@ -362,6 +412,13 @@ pub async fn reconcile_sfe_fastpath(enable: bool, force_unload: bool) -> Vec<Str
     warnings
 }
 
+/// Reconcile opt-in Qualcomm SFE software fastpath kernel modules.
+#[allow(dead_code)]
+pub async fn reconcile_sfe_fastpath(enable: bool, force_unload: bool) -> Vec<String> {
+    let cfg = hub().config.read().await.clone();
+    reconcile_sfe_fastpath_with_guard(enable, force_unload, cfg.preserve_ipa_offload, cfg.ippt).await
+}
+
 /// True while `DataplaneMode::Native` is active (or stopping QCMAP/netmgrd), so `at_fwd`
 /// commands backed by QCMAP (`AT+QMAP`, `+QMAPWAC`, `+QDMZ`, `+QIP6CFG`) are never written
 /// to `/dev/smd11` where `atfwd-daemon` would wedge waiting for the stopped daemon.
@@ -369,10 +426,10 @@ pub fn is_native_mode() -> bool {
     NATIVE_MODE_ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Seconds since the native cellular bearer became connected (`None` when not connected in native mode).
+/// Monotonic seconds since the native cellular bearer became connected (`None` when not connected in native mode).
 pub fn native_wan_uptime_secs() -> Option<u64> {
-    let since = NATIVE_CONNECTED_SINCE.load(Ordering::Relaxed);
-    (since > 0).then(|| now_secs().saturating_sub(since).max(1))
+    let since_ms = NATIVE_CONNECTED_SINCE.load(Ordering::Relaxed);
+    (since_ms > 0).then(|| (crate::state::mono_ms().saturating_sub(since_ms) / 1000).max(1))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -453,11 +510,7 @@ fn hub() -> Arc<DataplaneHub> {
 }
 
 pub fn load_config() -> DataplaneConfig {
-    let p = crate::paths::p(DATAPLANE_CONFIG_PATH);
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    crate::state::load_json_or_default(DATAPLANE_CONFIG_PATH)
 }
 
 pub fn save_config(cfg: &DataplaneConfig) -> Result<(), String> {
@@ -669,6 +722,53 @@ pub(crate) async fn restore_native_dns(
     Ok(())
 }
 
+pub(crate) fn build_ippt_dnsmasq_conf(
+    mac: &str,
+    ip: Ipv4Addr,
+    gw: Option<Ipv4Addr>,
+) -> Result<String, String> {
+    let norm_mac = validate_unicast_mac(mac)?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return Err(format!("invalid IPPT lease IPv4 address {ip}"));
+    }
+    let mut out = format!(
+        "# Managed by cellcored native dataplane IPPT\n\
+         dhcp-host={norm_mac},set:cellcore_ippt,{ip},120s\n"
+    );
+    if let Some(gw_ip) = gw
+        && !gw_ip.is_unspecified()
+        && !gw_ip.is_loopback()
+        && !gw_ip.is_multicast()
+        && gw_ip != ip
+    {
+        out.push_str(&format!(
+            "dhcp-option=tag:cellcore_ippt,option:router,{gw_ip}\n"
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) async fn write_ippt_dnsmasq_conf(
+    mac: &str,
+    ip: Ipv4Addr,
+    gw: Option<Ipv4Addr>,
+) -> Result<(), String> {
+    let body = build_ippt_dnsmasq_conf(mac, ip, gw)?;
+    atomic_write(Path::new(IPPT_DNSMASQ_CONF_PATH), body.as_bytes(), 0o644)?;
+    reload_dnsmasq_if_present().await;
+    Ok(())
+}
+
+pub(crate) async fn remove_ippt_dnsmasq_conf() -> Result<bool, String> {
+    let real = crate::paths::p(IPPT_DNSMASQ_CONF_PATH);
+    if !Path::new(&real).exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&real).map_err(|e| format!("remove {IPPT_DNSMASQ_CONF_PATH}: {e}"))?;
+    reload_dnsmasq_if_present().await;
+    Ok(true)
+}
+
 async fn run_ipa_cli(args: &[String]) -> Result<bool, String> {
     let bin = "/usr/bin/ipa";
     if !Path::new(&crate::paths::p(bin)).exists() {
@@ -772,6 +872,32 @@ const OPTIONAL_IPA_SYSCTLS: &[(&str, &str)] = &[
     ("/sys/kernel/debug/ipa/clock_scaling_bw_threshold_turbo_mbps", "300"),
 ];
 
+pub(crate) fn parse_memtotal_mib(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:")
+            && let Some(kb_str) = rest.split_whitespace().next()
+            && let Ok(kb) = kb_str.parse::<u64>()
+        {
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+fn total_ram_mib() -> Option<u64> {
+    fs::read_to_string(crate::paths::p("/proc/meminfo"))
+        .ok()
+        .and_then(|s| parse_memtotal_mib(&s))
+}
+
+/// Cap socket buffers to 8 MiB on <= 512 MiB RAM boards (16 MiB on > 512 MiB).
+pub(crate) fn socket_buf_max_bytes_for_ram(ram_mib: Option<u64>) -> u64 {
+    match ram_mib {
+        Some(mib) if mib <= 512 => 8_388_608,
+        _ => 16_777_216,
+    }
+}
+
 pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&str>) -> Vec<String> {
     let baseline_lock = BASELINE_SYSCTLS.get_or_init(|| {
         let mut captured = Vec::new();
@@ -782,6 +908,18 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
         }
         Mutex::new(captured)
     });
+
+    // Capture any baseline sysctls not yet present on earlier calls (e.g. sandboxes or newly created links).
+    {
+        let mut pairs = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
+        for (rel, _) in HIGH_THROUGHPUT_SYSCTLS.iter().chain(OPTIONAL_IPA_SYSCTLS.iter()) {
+            if !pairs.iter().any(|(k, _)| k == rel)
+                && let Some(orig) = read_trimmed(rel)
+            {
+                pairs.push(((*rel).to_string(), orig));
+            }
+        }
+    }
 
     let mut dyn_entries: Vec<(String, &'static str)> = Vec::new();
     if let Some(iface) = active_iface
@@ -815,7 +953,11 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
     let mut warnings = Vec::new();
     match profile {
         KernelTuningProfile::HighThroughput => {
-            for (rel, val) in HIGH_THROUGHPUT_SYSCTLS
+            let buf_max = socket_buf_max_bytes_for_ram(total_ram_mib());
+            let buf_max_s = buf_max.to_string();
+            let tcp_rmem_s = format!("4096 131072 {buf_max}");
+            let tcp_wmem_s = format!("4096 65536 {buf_max}");
+            for (rel, default_val) in HIGH_THROUGHPUT_SYSCTLS
                 .iter()
                 .map(|(r, v)| (*r, *v))
                 .chain(dyn_entries.iter().map(|(r, v)| (r.as_str(), *v)))
@@ -824,6 +966,12 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                 if !Path::new(&real).exists() {
                     continue;
                 }
+                let val: &str = match rel {
+                    "/proc/sys/net/core/rmem_max" | "/proc/sys/net/core/wmem_max" => &buf_max_s,
+                    "/proc/sys/net/ipv4/tcp_rmem" => &tcp_rmem_s,
+                    "/proc/sys/net/ipv4/tcp_wmem" => &tcp_wmem_s,
+                    _ => default_val,
+                };
                 if let Err(e) = fs::write(&real, format!("{val}\n")) {
                     warnings.push(format!("{rel}: {e}"));
                 }
@@ -849,37 +997,136 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                     warnings.push(format!("restore {rel}: {e}"));
                 }
             }
+            restore_nic_offloads_and_irqs(&mut warnings);
         }
     }
     warnings
 }
 
-/// Enable hardware/kernel GRO forwarding offloads (`rx-gro-list`, `rx-udp-gro-forwarding`)
-/// on `eth0` and the active `rmnet_data*` interface (software netdev flags that never reset
-/// Realtek `r8125` + Qualcomm `ioss` hardware DMA rings), and pin `eth0-*` PCIe MSI IRQs
-/// onto CPUs 2–3 via `smp_affinity_list` (isolated from `ipcc_0` on CPU 0 and `gsi/IPA` on CPU 1).
-pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
-    let mut assigned = Vec::new();
-    let irqs_path = crate::paths::p("/proc/interrupts");
-    let Ok(text) = fs::read_to_string(&irqs_path) else {
-        return assigned;
-    };
-    for line in text.lines() {
-        if !line.contains("eth0-") {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IrqPinTarget {
+    pub irq: String,
+    pub cpu_list: &'static str,
+    pub cpu_mask: &'static str,
+}
+
+/// Plan IRQ pinning from `/proc/interrupts`:
+/// - Active `eth0-*` PCIe MSI vectors split across CPU 2 (`4`) and CPU 3 (`8`) instead of both on `c`.
+/// - `gsi` (Qualcomm IPAv5 GSI) pinned to CPU 1 (`2`) so it does not collide with `ipcc_0` on CPU 0 (`1`).
+pub(crate) fn plan_irq_affinities(interrupts_text: &str) -> Vec<IrqPinTarget> {
+    let mut eth0_irqs: Vec<(u64, u64, String)> = Vec::new();
+    let mut gsi_irqs: Vec<(u64, String)> = Vec::new();
+    for line in interrupts_text.lines() {
+        let Some((num_raw, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let irq = num_raw.trim();
+        if irq.is_empty() || !irq.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if let Some((num_raw, _)) = line.split_once(':') {
-            let irq = num_raw.trim();
-            if !irq.is_empty() && irq.bytes().all(|b| b.is_ascii_digit()) {
-                let list_path = crate::paths::p(&format!("/proc/irq/{irq}/smp_affinity_list"));
-                if Path::new(&list_path).exists() {
-                    let _ = fs::write(&list_path, "2-3\n");
-                }
-                assigned.push((irq.to_string(), "2-3"));
-            }
+        let Ok(irq_num) = irq.parse::<u64>() else {
+            continue;
+        };
+        let total_hits: u64 = rest
+            .split_whitespace()
+            .take_while(|tok| tok.bytes().all(|b| b.is_ascii_digit()))
+            .filter_map(|tok| tok.parse::<u64>().ok())
+            .sum();
+        let last_tok = rest.split_whitespace().last().unwrap_or("");
+        if line.contains("eth0-") {
+            eth0_irqs.push((total_hits, irq_num, irq.to_string()));
+        } else if last_tok == "gsi" || last_tok.starts_with("gsi_") {
+            gsi_irqs.push((irq_num, irq.to_string()));
         }
     }
+
+    // Active eth0 vectors first (non-zero hits before idle), deterministic by IRQ number.
+    eth0_irqs.sort_by_key(|(hits, irq_num, _)| (*hits == 0, *irq_num));
+    gsi_irqs.sort_by_key(|(irq_num, _)| *irq_num);
+
+    let mut plan = Vec::with_capacity(eth0_irqs.len() + gsi_irqs.len());
+    for (_, irq) in gsi_irqs {
+        plan.push(IrqPinTarget {
+            irq,
+            cpu_list: "1",
+            cpu_mask: "2",
+        });
+    }
+    for (idx, (_, _, irq)) in eth0_irqs.into_iter().enumerate() {
+        let (cpu_list, cpu_mask) = if idx % 2 == 0 { ("2", "4") } else { ("3", "8") };
+        plan.push(IrqPinTarget {
+            irq,
+            cpu_list,
+            cpu_mask,
+        });
+    }
+    plan
+}
+
+fn irq_affinity_file_for(irq: &str) -> Option<(String, bool)> {
+    let list_rel = format!("/proc/irq/{irq}/smp_affinity_list");
+    if Path::new(&crate::paths::p(&list_rel)).exists() {
+        return Some((list_rel, true));
+    }
+    let mask_rel = format!("/proc/irq/{irq}/smp_affinity");
+    if Path::new(&crate::paths::p(&mask_rel)).exists() {
+        return Some((mask_rel, false));
+    }
+    None
+}
+
+/// Pin `eth0-*` PCIe MSI IRQs split across CPU 2 (`4`) and CPU 3 (`8`), and `gsi` to CPU 1 (`2`),
+/// saving original IRQ affinities so reverting to `KernelTuningProfile::Default` restores them.
+pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
+    let irqs_path = crate::paths::p("/proc/interrupts");
+    let Ok(text) = fs::read_to_string(&irqs_path) else {
+        return Vec::new();
+    };
+    let plan = plan_irq_affinities(&text);
+    let baseline = BASELINE_IRQ_AFFINITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut assigned = Vec::with_capacity(plan.len());
+    for target in plan {
+        if let Some((rel, is_list)) = irq_affinity_file_for(&target.irq) {
+            if let Some(orig) = read_trimmed(&rel) {
+                baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(rel.clone())
+                    .or_insert(orig);
+            }
+            let val = if is_list {
+                target.cpu_list
+            } else {
+                target.cpu_mask
+            };
+            let _ = fs::write(crate::paths::p(&rel), format!("{val}\n"));
+        }
+        assigned.push((target.irq, target.cpu_list));
+    }
     assigned
+}
+
+pub(crate) fn parse_ethtool_gro_features(stdout: &str) -> (Option<bool>, Option<bool>) {
+    let mut gro_list = None;
+    let mut udp_gro_fwd = None;
+    for line in stdout.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.split_whitespace().next().unwrap_or("");
+        let parsed = match val {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+        match key {
+            "rx-gro-list" => gro_list = parsed,
+            "rx-udp-gro-forwarding" => udp_gro_fwd = parsed,
+            _ => {}
+        }
+    }
+    (gro_list, udp_gro_fwd)
 }
 
 fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
@@ -890,19 +1137,88 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
     {
         ifaces.push(iface);
     }
+    let eth_baseline = BASELINE_ETHTOOL_FEATURES.get_or_init(|| Mutex::new(HashMap::new()));
     for iface in ifaces {
         let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
         if !Path::new(&sys_if).exists() {
             continue;
         }
+        let already_saved = eth_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(iface);
+        if !already_saved
+            && let Ok(stdout) = crate::uci::run_cmd_blocking_timeout(
+                "ethtool",
+                &["-k", iface],
+                Duration::from_secs(2),
+            )
+        {
+            let feats = parse_ethtool_gro_features(&stdout);
+            if feats.0.is_some() || feats.1.is_some() {
+                eth_baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(iface.to_string(), feats);
+            }
+        }
         let _ = crate::uci::run_cmd_blocking_timeout(
             "ethtool",
-            &["-K", iface, "rx-gro-list", "on", "rx-udp-gro-forwarding", "on"],
+            &["-K", iface, "rx-gro-list", "off", "rx-udp-gro-forwarding", "on"],
             Duration::from_secs(2),
         );
     }
 
     let _ = pin_eth0_irqs_to_cpu2_3();
+}
+
+fn restore_nic_offloads_and_irqs(warnings: &mut Vec<String>) {
+    if let Some(baseline) = BASELINE_IRQ_AFFINITIES.get() {
+        let entries: Vec<(String, String)> = baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (rel, orig) in entries {
+            let real = crate::paths::p(&rel);
+            if Path::new(&real).exists()
+                && let Err(e) = fs::write(&real, format!("{orig}\n"))
+            {
+                warnings.push(format!("restore {rel}: {e}"));
+            }
+        }
+    }
+    if let Some(eth_baseline) = BASELINE_ETHTOOL_FEATURES.get() {
+        let entries: Vec<(String, EthtoolGroFeatures)> = eth_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (iface, (gro_list, udp_gro_fwd)) in entries {
+            let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
+            if !Path::new(&sys_if).exists() {
+                continue;
+            }
+            let mut args: Vec<&str> = vec!["-K", &iface];
+            if let Some(v) = gro_list {
+                args.push("rx-gro-list");
+                args.push(if v { "on" } else { "off" });
+            }
+            if let Some(v) = udp_gro_fwd {
+                args.push("rx-udp-gro-forwarding");
+                args.push(if v { "on" } else { "off" });
+            }
+            if args.len() > 2 {
+                let _ = crate::uci::run_cmd_blocking_timeout(
+                    "ethtool",
+                    &args,
+                    Duration::from_secs(2),
+                );
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_ipa_eth_driver(status_text: &str) -> Option<String> {
@@ -1099,14 +1415,25 @@ pub fn start(state: &AppState) {
     let h = hub();
     let cfg = load_config();
     NATIVE_MODE_ACTIVE.store(cfg.mode == DataplaneMode::Native, Ordering::Relaxed);
-    if cfg.kernel_tuning == KernelTuningProfile::HighThroughput {
-        let warns = apply_kernel_tuning(KernelTuningProfile::HighThroughput, Some(&cfg.iface));
-        *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
-    }
     let st = state.clone();
     tokio::spawn(async move {
+        if cfg.kernel_tuning == KernelTuningProfile::HighThroughput {
+            let iface = cfg.iface.clone();
+            let warns = tokio::task::spawn_blocking(move || {
+                apply_kernel_tuning(KernelTuningProfile::HighThroughput, Some(&iface))
+            })
+            .await
+            .unwrap_or_default();
+            *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
+        }
         if cfg.sfe_fastpath {
-            let _ = reconcile_sfe_fastpath(true, false).await;
+            let _ = reconcile_sfe_fastpath_with_guard(
+                true,
+                false,
+                cfg.preserve_ipa_offload,
+                cfg.ippt,
+            )
+            .await;
         }
         supervisor_loop(st, h).await;
     });
@@ -1150,8 +1477,10 @@ struct NativeNatState {
     ipt_nat: bool,
     ipt_forward: bool,
     ip6t_forward: bool,
-    ipt_mss_arg: Option<String>,
-    ip6t_mss_arg: Option<String>,
+    ipt_mss_out_arg: Option<String>,
+    ipt_mss_in_arg: Option<String>,
+    ip6t_mss_out_arg: Option<String>,
+    ip6t_mss_in_arg: Option<String>,
 }
 
 struct NativeHandles {
@@ -1162,6 +1491,11 @@ struct NativeHandles {
     last_v4_ip: Option<String>,
     last_v6_ip: Option<String>,
     last_v6_key: Option<(String, u8)>,
+    /// Preserved across disconnect, reconnect, and SSR so stale WAN conntrack
+    /// entries and odhcpd prefixes are always evicted when the bearer returns.
+    last_applied_v4_ip: Option<String>,
+    last_applied_v6_ip: Option<String>,
+    last_applied_v6_key: Option<(String, u8)>,
     last_link_mtu: u32,
     last_applied_sig: Option<AppliedCfgSig>,
     last_resolved_iface: Option<String>,
@@ -1169,13 +1503,20 @@ struct NativeHandles {
     saved_resolv: Option<SavedResolvSnapshot>,
     v6_dns_routes: Vec<Ipv6Addr>,
     ippt_host_ip: Option<Ipv4Addr>,
+    ippt_dnsmasq_active: bool,
     ipa_ippt_active: bool,
     ipa_ippt_mac: Option<String>,
     ipa_v6_sharing_prefix: Option<String>,
     created_rmnet_iface: Option<String>,
     mwan3_stopped: bool,
     native_nat: Option<NativeNatState>,
-    backoff: ReconnectBackoff,
+    v4_backoff: ReconnectBackoff,
+    v6_backoff: ReconnectBackoff,
+    v4_next_retry_ms: u64,
+    v6_next_retry_ms: u64,
+    v4_last_error: Option<String>,
+    v6_last_error: Option<String>,
+    netlink_backoff: ReconnectBackoff,
     vendor_daemons_stopped: bool,
 }
 
@@ -1189,6 +1530,9 @@ impl NativeHandles {
             last_v4_ip: None,
             last_v6_ip: None,
             last_v6_key: None,
+            last_applied_v4_ip: None,
+            last_applied_v6_ip: None,
+            last_applied_v6_key: None,
             last_link_mtu: 1500,
             last_applied_sig: None,
             last_resolved_iface: None,
@@ -1196,13 +1540,20 @@ impl NativeHandles {
             saved_resolv: None,
             v6_dns_routes: Vec::new(),
             ippt_host_ip: None,
+            ippt_dnsmasq_active: false,
             ipa_ippt_active: false,
             ipa_ippt_mac: None,
             ipa_v6_sharing_prefix: None,
             created_rmnet_iface: None,
             mwan3_stopped: false,
             native_nat: None,
-            backoff: ReconnectBackoff::new(),
+            v4_backoff: ReconnectBackoff::new(),
+            v6_backoff: ReconnectBackoff::new(),
+            v4_next_retry_ms: 0,
+            v6_next_retry_ms: 0,
+            v4_last_error: None,
+            v6_last_error: None,
+            netlink_backoff: ReconnectBackoff::new(),
             vendor_daemons_stopped: false,
         }
     }
@@ -1213,6 +1564,7 @@ impl NativeHandles {
             || self.last_applied_sig.is_some()
             || self.created_rmnet_iface.is_some()
             || self.native_nat.is_some()
+            || self.ippt_dnsmasq_active
     }
 }
 
@@ -1268,14 +1620,16 @@ pub(crate) fn build_native_nat_nft_script(
         let mss4 = mtu - 40;
         let mss6 = mtu - 60;
         s.push_str(&format!(
-            "add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set {mss4}\n\
-             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set {mss4}\n\
-             add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set {mss6}\n\
-             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set {mss6}\n"
+            "add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > {mss4} tcp option maxseg size set {mss4}\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > {mss4} tcp option maxseg size set {mss4}\n\
+             add rule inet qm_native_nat forward oifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > {mss6} tcp option maxseg size set {mss6}\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > {mss6} tcp option maxseg size set {mss6}\n"
         ));
     } else {
         s.push_str(&format!(
-            "add rule inet qm_native_nat forward oifname \"{iface}\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n"
+            "add rule inet qm_native_nat forward oifname \"{iface}\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > 1460 tcp option maxseg size set 1460\n\
+             add rule inet qm_native_nat forward iifname \"{iface}\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > 1440 tcp option maxseg size set 1440\n"
         ));
     }
     if include_masq {
@@ -1300,11 +1654,27 @@ pub(crate) fn extract_qm_native_nft_handles(chain_text: &str) -> Vec<u64> {
         .collect()
 }
 
-pub(crate) fn ipt_rules_cover_iface(rules_text: &str, iface: &str) -> bool {
+pub(crate) fn ipt_oif_covers_iface(rules_text: &str, iface: &str) -> bool {
     rules_text.lines().any(|line| {
         let toks: Vec<&str> = line.split_whitespace().collect();
         toks.windows(2).any(|w| w[0] == "-o" && w[1] == iface)
     })
+}
+
+pub(crate) fn ipt_tcpmss_covers_dir(rules_text: &str, dir_flag: &str, iface: &str) -> bool {
+    rules_text.lines().any(|line| {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let has_dir = toks.windows(2).any(|w| w[0] == dir_flag && w[1] == iface);
+        let has_tcpmss = toks.windows(2).any(|w| w[0] == "-j" && w[1] == "TCPMSS");
+        has_dir && has_tcpmss
+    })
+}
+
+/// Checks whether iptables/ip6tables `mangle FORWARD` rules cover TCPMSS clamping for `iface`
+/// on both outbound (`-o`) and inbound (`-i`) paths (ignoring non-TCPMSS rules such as TTL/HL).
+pub(crate) fn ipt_rules_cover_iface(rules_text: &str, iface: &str) -> bool {
+    ipt_tcpmss_covers_dir(rules_text, "-o", iface)
+        && ipt_tcpmss_covers_dir(rules_text, "-i", iface)
 }
 
 async fn apply_native_nat(
@@ -1370,7 +1740,7 @@ async fn apply_native_nat(
         if want_masq
             && let Ok(out) = run(ipt_bin, &["-t", "nat", "-S", "POSTROUTING"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
-            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
+            && !ipt_oif_covers_iface(&out.stdout_str(), iface)
         {
             match run(
                 ipt_bin,
@@ -1386,7 +1756,7 @@ async fn apply_native_nat(
         }
         if let Ok(out) = run(ipt_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
-            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
+            && !ipt_oif_covers_iface(&out.stdout_str(), iface)
         {
             match run(
                 ipt_bin,
@@ -1403,7 +1773,7 @@ async fn apply_native_nat(
         if Path::new(&crate::paths::p(ip6t_bin)).exists()
             && let Ok(out) = run(ip6t_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
-            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
+            && !ipt_oif_covers_iface(&out.stdout_str(), iface)
         {
             match run(
                 ip6t_bin,
@@ -1419,68 +1789,112 @@ async fn apply_native_nat(
         }
         if let Ok(out) = run(ipt_bin, &["-t", "mangle", "-S", "FORWARD"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
-            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
         {
+            let rules = out.stdout_str();
+            let need_out = !ipt_tcpmss_covers_dir(&rules, "-o", iface);
+            let need_in = !ipt_tcpmss_covers_dir(&rules, "-i", iface);
             if mtu < 1500 {
                 let mss4 = (mtu - 40).to_string();
-                let r_out = run(
-                    ipt_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                let r_in = run(
-                    ipt_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
-                    st.ipt_mss_arg = Some(mss4);
+                if need_out {
+                    let r_out = run(
+                        ipt_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_out.is_ok_and(|r| r.ok()) {
+                        st.ipt_mss_out_arg = Some(mss4.clone());
+                    }
+                }
+                if need_in {
+                    let r_in = run(
+                        ipt_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss4],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_in.is_ok_and(|r| r.ok()) {
+                        st.ipt_mss_in_arg = Some(mss4);
+                    }
                 }
             } else {
-                let r_out = run(
-                    ipt_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                if r_out.is_ok_and(|r| r.ok()) {
-                    st.ipt_mss_arg = Some("pmtu".into());
+                if need_out {
+                    let r_out = run(
+                        ipt_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_out.is_ok_and(|r| r.ok()) {
+                        st.ipt_mss_out_arg = Some("pmtu".into());
+                    }
+                }
+                if need_in {
+                    let r_in = run(
+                        ipt_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_in.is_ok_and(|r| r.ok()) {
+                        st.ipt_mss_in_arg = Some("pmtu".into());
+                    }
                 }
             }
         }
         if Path::new(&crate::paths::p(ip6t_bin)).exists()
             && let Ok(out) = run(ip6t_bin, &["-t", "mangle", "-S", "FORWARD"], ExecOpts::new(5, 32 * KIB)).await
             && out.ok()
-            && !ipt_rules_cover_iface(&out.stdout_str(), iface)
         {
+            let rules = out.stdout_str();
+            let need_out = !ipt_tcpmss_covers_dir(&rules, "-o", iface);
+            let need_in = !ipt_tcpmss_covers_dir(&rules, "-i", iface);
             if mtu < 1500 {
                 let mss6 = (mtu - 60).to_string();
-                let r_out = run(
-                    ip6t_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                let r_in = run(
-                    ip6t_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                if r_out.is_ok_and(|r| r.ok()) && r_in.is_ok_and(|r| r.ok()) {
-                    st.ip6t_mss_arg = Some(mss6);
+                if need_out {
+                    let r_out = run(
+                        ip6t_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_out.is_ok_and(|r| r.ok()) {
+                        st.ip6t_mss_out_arg = Some(mss6.clone());
+                    }
+                }
+                if need_in {
+                    let r_in = run(
+                        ip6t_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", &mss6],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_in.is_ok_and(|r| r.ok()) {
+                        st.ip6t_mss_in_arg = Some(mss6);
+                    }
                 }
             } else {
-                let r_out = run(
-                    ip6t_bin,
-                    &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-                if r_out.is_ok_and(|r| r.ok()) {
-                    st.ip6t_mss_arg = Some("pmtu".into());
+                if need_out {
+                    let r_out = run(
+                        ip6t_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_out.is_ok_and(|r| r.ok()) {
+                        st.ip6t_mss_out_arg = Some("pmtu".into());
+                    }
+                }
+                if need_in {
+                    let r_in = run(
+                        ip6t_bin,
+                        &["-t", "mangle", "-A", "FORWARD", "-i", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+                        ExecOpts::new(5, 16 * KIB),
+                    )
+                    .await;
+                    if r_in.is_ok_and(|r| r.ok()) {
+                        st.ip6t_mss_in_arg = Some("pmtu".into());
+                    }
                 }
             }
         }
@@ -1491,10 +1905,30 @@ async fn apply_native_nat(
         || st.ipt_nat
         || st.ipt_forward
         || st.ip6t_forward
-        || st.ipt_mss_arg.is_some()
-        || st.ip6t_mss_arg.is_some()
+        || st.ipt_mss_out_arg.is_some()
+        || st.ipt_mss_in_arg.is_some()
+        || st.ip6t_mss_out_arg.is_some()
+        || st.ip6t_mss_in_arg.is_some()
     {
         nh.native_nat = Some(st);
+    }
+}
+
+async fn delete_ipt_mss_rule(bin: &str, dir_flag: &str, iface: &str, mss_arg: &str) {
+    if mss_arg == "pmtu" {
+        let _ = run(
+            bin,
+            &["-t", "mangle", "-D", "FORWARD", dir_flag, iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+            ExecOpts::new(5, 16 * KIB),
+        )
+        .await;
+    } else {
+        let _ = run(
+            bin,
+            &["-t", "mangle", "-D", "FORWARD", dir_flag, iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", mss_arg],
+            ExecOpts::new(5, 16 * KIB),
+        )
+        .await;
     }
 }
 
@@ -1554,43 +1988,17 @@ async fn teardown_native_nat(nh: &mut NativeHandles, warnings: &mut Vec<String>)
         )
         .await;
     }
-    if let Some(ref mss_arg) = st.ipt_mss_arg {
-        if mss_arg == "pmtu" {
-            let _ = run(
-                ipt_bin,
-                &["-t", "mangle", "-D", "FORWARD", "-o", &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-        } else {
-            for flag in ["-o", "-i"] {
-                let _ = run(
-                    ipt_bin,
-                    &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", mss_arg],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-            }
-        }
+    if let Some(ref mss_arg) = st.ipt_mss_out_arg {
+        delete_ipt_mss_rule(ipt_bin, "-o", &st.iface, mss_arg).await;
     }
-    if let Some(ref mss_arg) = st.ip6t_mss_arg {
-        if mss_arg == "pmtu" {
-            let _ = run(
-                ip6t_bin,
-                &["-t", "mangle", "-D", "FORWARD", "-o", &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-                ExecOpts::new(5, 16 * KIB),
-            )
-            .await;
-        } else {
-            for flag in ["-o", "-i"] {
-                let _ = run(
-                    ip6t_bin,
-                    &["-t", "mangle", "-D", "FORWARD", flag, &st.iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment", "--comment", "qm_native", "-j", "TCPMSS", "--set-mss", mss_arg],
-                    ExecOpts::new(5, 16 * KIB),
-                )
-                .await;
-            }
-        }
+    if let Some(ref mss_arg) = st.ipt_mss_in_arg {
+        delete_ipt_mss_rule(ipt_bin, "-i", &st.iface, mss_arg).await;
+    }
+    if let Some(ref mss_arg) = st.ip6t_mss_out_arg {
+        delete_ipt_mss_rule(ip6t_bin, "-o", &st.iface, mss_arg).await;
+    }
+    if let Some(ref mss_arg) = st.ip6t_mss_in_arg {
+        delete_ipt_mss_rule(ip6t_bin, "-i", &st.iface, mss_arg).await;
     }
 }
 
@@ -1615,12 +2023,12 @@ async fn heal_native_firewall_if_needed(
         table_missing || fwd_missing
     } else if Path::new(&crate::paths::p(ipt_bin)).exists() {
         let fwd_missing = match run(ipt_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await {
-            Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
+            Ok(o) if o.ok() => !ipt_oif_covers_iface(&o.stdout_str(), iface),
             _ => false,
         };
         let fwd6_missing = if Path::new(&crate::paths::p(ip6t_bin)).exists() {
             match run(ip6t_bin, &["-t", "filter", "-S", "zone_wan_dest_accept"], ExecOpts::new(5, 32 * KIB)).await {
-                Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
+                Ok(o) if o.ok() => !ipt_oif_covers_iface(&o.stdout_str(), iface),
                 _ => false,
             }
         } else {
@@ -1630,7 +2038,15 @@ async fn heal_native_firewall_if_needed(
             Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
             _ => false,
         };
-        fwd_missing || fwd6_missing || mss_missing
+        let mss6_missing = if Path::new(&crate::paths::p(ip6t_bin)).exists() {
+            match run(ip6t_bin, &["-t", "mangle", "-S", "FORWARD"], ExecOpts::new(5, 32 * KIB)).await {
+                Ok(o) if o.ok() => !ipt_rules_cover_iface(&o.stdout_str(), iface),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        fwd_missing || fwd6_missing || mss_missing || mss6_missing
     } else {
         false
     };
@@ -1751,6 +2167,14 @@ async fn teardown_ipa_and_routes(
         nh.ipa_ippt_active = false;
         nh.ipa_ippt_mac = None;
     }
+    if tear_v4
+        && (nh.ippt_dnsmasq_active || Path::new(&crate::paths::p(IPPT_DNSMASQ_CONF_PATH)).exists())
+    {
+        if let Err(e) = remove_ippt_dnsmasq_conf().await {
+            warnings.push(e);
+        }
+        nh.ippt_dnsmasq_active = false;
+    }
     if tear_v6 && nh.ipa_v6_sharing_prefix.take().is_some() {
         let args = build_ipa_v6_sharing_disable_args(iface);
         if let Err(e) = run_ipa_cli(&args).await {
@@ -1837,19 +2261,21 @@ async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: 
     nh.last_v4_ip = None;
     nh.last_v6_ip = None;
     nh.last_v6_key = None;
+    nh.last_applied_v4_ip = None;
+    nh.last_applied_v6_ip = None;
+    nh.last_applied_v6_key = None;
     nh.last_link_mtu = 1500;
     nh.last_applied_sig = None;
     nh.last_resolved_iface = None;
+    nh.v4_backoff.reset();
+    nh.v6_backoff.reset();
+    nh.v4_next_retry_ms = 0;
+    nh.v6_next_retry_ms = 0;
+    nh.v4_last_error = None;
+    nh.v6_last_error = None;
+    nh.netlink_backoff.reset();
 
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(links) = netlink::list_links()
-            && let Some(link) = links.into_iter().find(|l| l.name == iface)
-        {
-            let _ = netlink::del_default_routes(&iface, link.ifindex, table);
-            let _ = netlink::flush_iface_addrs(&iface, link.ifindex, None);
-        }
-    })
-    .await;
+    flush_rmnet_stale_state(iface, table).await;
 
     if let Some(created_iface) = nh.created_rmnet_iface.take() {
         let del = created_iface.clone();
@@ -2302,13 +2728,37 @@ fn kernel_tuning_drifted(active_iface: &str) -> bool {
     if read_u64_sys("/proc/sys/net/netfilter/nf_conntrack_max").is_some_and(|v| v < 65536) {
         return true;
     }
-    if read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-        .is_some_and(|g| g != "performance")
-    {
-        return true;
+    for cpu in 0..=3 {
+        let rel = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor");
+        if read_trimmed(&rel).is_some_and(|g| g != "performance") {
+            return true;
+        }
     }
     if read_trimmed("/sys/power/autosleep").is_some_and(|a| a != "off") {
         return true;
+    }
+    for rel in [
+        "/sys/class/net/eth0/gro_flush_timeout",
+        "/sys/class/net/rmnet_ipa0/gro_flush_timeout",
+    ] {
+        if read_trimmed(rel).is_some_and(|v| v != "20000") {
+            return true;
+        }
+    }
+    for q in 0..=3 {
+        let rps_rel = format!("/sys/class/net/rmnet_ipa0/queues/rx-{q}/rps_cpus");
+        if read_trimmed(&rps_rel).is_some_and(|v| v != "c") {
+            return true;
+        }
+        let cnt_rel = format!("/sys/class/net/rmnet_ipa0/queues/rx-{q}/rps_flow_cnt");
+        if read_trimmed(&cnt_rel).is_some_and(|v| v != "4096") {
+            return true;
+        }
+        let expected_xps = if q % 2 == 0 { "4" } else { "8" };
+        let xps_rel = format!("/sys/class/net/rmnet_ipa0/queues/tx-{q}/xps_cpus");
+        if read_trimmed(&xps_rel).is_some_and(|v| v != expected_xps) {
+            return true;
+        }
     }
     if netlink::validate_managed_iface(active_iface).is_ok() {
         let rel = format!("/sys/class/net/{active_iface}/queues/rx-0/rps_cpus");
@@ -2317,6 +2767,26 @@ fn kernel_tuning_drifted(active_iface: &str) -> bool {
         {
             return true;
         }
+        let gro_rel = format!("/sys/class/net/{active_iface}/gro_flush_timeout");
+        if read_trimmed(&gro_rel).is_some_and(|v| v != "20000") {
+            return true;
+        }
+    }
+    if let Ok(irqs) = fs::read_to_string(crate::paths::p("/proc/interrupts")) {
+        for target in plan_irq_affinities(&irqs) {
+            if let Some((rel, is_list)) = irq_affinity_file_for(&target.irq)
+                && let Some(cur) = read_trimmed(&rel)
+            {
+                let expected = if is_list {
+                    target.cpu_list
+                } else {
+                    target.cpu_mask
+                };
+                if cur != expected {
+                    return true;
+                }
+            }
+        }
     }
     false
 }
@@ -2324,6 +2794,7 @@ fn kernel_tuning_drifted(active_iface: &str) -> bool {
 /// Lightweight read-only snapshot exported to `/api/v1/metrics` without
 /// sending any QMI/AT commands or touching sysfs.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct DataplaneMetricsView {
     pub mode: &'static str,
     pub wds_v4_connected: bool,
@@ -2334,14 +2805,17 @@ pub struct DataplaneMetricsView {
     pub tuning_warnings: usize,
     pub indications_total: u64,
     pub netlink_updates_total: u64,
+    pub sfe_loaded: bool,
+    pub reconnect_attempts_total: u64,
+    pub ioss_hwp_rx: Option<u64>,
+    pub ioss_hwp_tx: Option<u64>,
+    pub ioss_exp_rx: Option<u64>,
+    pub ioss_exp_tx: Option<u64>,
 }
 
 pub async fn metrics_view() -> DataplaneMetricsView {
     let h = hub();
-    let mode = match h.config.read().await.mode {
-        DataplaneMode::Native => "native",
-        _ => "legacy",
-    };
+    let mode = h.config.read().await.mode.as_str();
     let snap = h.snapshot.read().await;
     let tuning_warnings = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).len();
     DataplaneMetricsView {
@@ -2354,7 +2828,30 @@ pub async fn metrics_view() -> DataplaneMetricsView {
         tuning_warnings,
         indications_total: snap.indications_received,
         netlink_updates_total: snap.netlink_updates,
+        sfe_loaded: snap.sfe_loaded,
+        reconnect_attempts_total: snap.reconnect_attempts,
+        ioss_hwp_rx: snap.kernel.ipa_offload.eth_hwp_rx_packets,
+        ioss_hwp_tx: snap.kernel.ipa_offload.eth_hwp_tx_packets,
+        ioss_exp_rx: snap.kernel.ipa_offload.eth_exp_rx_packets,
+        ioss_exp_tx: snap.kernel.ipa_offload.eth_exp_tx_packets,
     }
+}
+
+async fn flush_rmnet_stale_state(iface: String, table: u32) {
+    let _ = tokio::task::spawn_blocking(move || {
+        if netlink::validate_managed_iface(&iface).is_err()
+            || netlink::validate_managed_table(table).is_err()
+        {
+            return;
+        }
+        if let Ok(links) = netlink::list_links()
+            && let Some(link) = links.into_iter().find(|l| l.name == iface)
+        {
+            let _ = netlink::del_default_routes(&iface, link.ifindex, table);
+            let _ = netlink::flush_iface_addrs(&iface, link.ifindex, None);
+        }
+    })
+    .await;
 }
 
 fn handle_modem_ssr(
@@ -2385,33 +2882,111 @@ fn handle_modem_ssr(
     nh.last_v4_ip = None;
     nh.last_v6_ip = None;
     nh.last_v6_key = None;
+    // Intentionally preserve `last_applied_v4_ip`, `last_applied_v6_ip`, and
+    // `last_applied_v6_key` so post-SSR reconnect flushes stale WAN conntrack
+    // entries and reloads odhcpd!
+    nh.v4_backoff.reset();
+    nh.v6_backoff.reset();
+    nh.v4_next_retry_ms = 0;
+    nh.v6_next_retry_ms = 0;
+    nh.v4_last_error = None;
+    nh.v6_last_error = None;
+    nh.netlink_backoff.reset();
+}
+
+pub(crate) fn build_conntrack_eviction_args(
+    prev_v4: Option<&str>,
+    v4_changed: bool,
+    prev_v6_key: Option<&(String, u8)>,
+    prev_v6_ip: Option<&str>,
+    v6_changed: bool,
+) -> Vec<Vec<String>> {
+    let mut cmds = Vec::new();
+    // Only flush conntrack entries bound to a *previous* WAN address/prefix when the bearer re-IPs
+    // or recovers from SSR; never run global `conntrack -F` (which drops LAN management SSH sessions!).
+    if v4_changed
+        && let Some(old_ip) = prev_v4
+        && old_ip.parse::<Ipv4Addr>().is_ok()
+    {
+        cmds.push(vec!["-D".into(), "-q".into(), old_ip.into()]);
+        cmds.push(vec!["-D".into(), "-s".into(), old_ip.into()]);
+    }
+    if v6_changed {
+        let mut flushed_v6 = false;
+        if let Some((prefix64, plen)) = prev_v6_key {
+            let prefix_net = format!("{prefix64}::");
+            if prefix_net.parse::<Ipv6Addr>().is_ok() && *plen <= 128 {
+                let cidr = format!("{prefix_net}/{plen}");
+                cmds.push(vec!["-D".into(), "-f".into(), "ipv6".into(), "-s".into(), cidr.clone()]);
+                cmds.push(vec!["-D".into(), "-f".into(), "ipv6".into(), "-q".into(), cidr]);
+                flushed_v6 = true;
+            }
+        }
+        if !flushed_v6
+            && let Some(old_v6) = prev_v6_ip
+            && old_v6.parse::<Ipv6Addr>().is_ok()
+        {
+            cmds.push(vec!["-D".into(), "-f".into(), "ipv6".into(), "-s".into(), old_v6.into()]);
+            cmds.push(vec!["-D".into(), "-f".into(), "ipv6".into(), "-q".into(), old_v6.into()]);
+        }
+    }
+    cmds
 }
 
 async fn flush_stale_wan_conntrack_and_reload_odhcpd(
     prev_v4: Option<&str>,
     v4_changed: bool,
-    had_prev_v6: bool,
+    prev_v6_key: Option<&(String, u8)>,
+    prev_v6_ip: Option<&str>,
     v6_changed: bool,
 ) {
-    // Only flush conntrack entries bound to a *previous* WAN IPv4 address when the bearer re-IPs;
-    // never run global `conntrack -F` (which drops LAN management SSH sessions!).
-    if v4_changed
-        && let Some(old_ip) = prev_v4
-        && old_ip.parse::<Ipv4Addr>().is_ok()
-    {
+    let cmds = build_conntrack_eviction_args(prev_v4, v4_changed, prev_v6_key, prev_v6_ip, v6_changed);
+    if !cmds.is_empty() {
         for bin in ["/usr/sbin/conntrack", "/sbin/conntrack"] {
             if Path::new(&crate::paths::p(bin)).exists() {
-                let _ = run(bin, &["-D", "-q", old_ip], ExecOpts::new(3, 16 * KIB)).await;
+                for argv in &cmds {
+                    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                    let _ = run(bin, &refs, ExecOpts::new(3, 16 * KIB)).await;
+                }
                 break;
             }
         }
     }
-    if had_prev_v6 && v6_changed {
+    if prev_v6_key.is_some() && v6_changed {
         let odhcpd = "/etc/init.d/odhcpd";
         if Path::new(&crate::paths::p(odhcpd)).exists() {
             let _ = run(odhcpd, &["reload"], ExecOpts::new(5, 16 * KIB)).await;
         }
     }
+}
+
+/// Evaluate overall native bearer health with independent per-family backoff.
+/// On IPv6-only carriers in `Ipv4v6` mode, if either v4 or v6 is connected and netlink
+/// succeeded, the bearer is considered healthy (`native-connected`, 15s poll) while the
+/// unavailable family backs off independently.
+pub(crate) fn evaluate_native_bearer_health(
+    v4_up: bool,
+    v6_up: bool,
+    netlink_err: bool,
+    v4_retry_delay: Option<Duration>,
+    v6_retry_delay: Option<Duration>,
+    netlink_delay: Option<Duration>,
+) -> (bool, Duration, String) {
+    let any_up = v4_up || v6_up;
+    if netlink_err {
+        let delay = netlink_delay.unwrap_or(Duration::from_secs(5));
+        return (false, delay, format!("native-backoff-{}s", delay.as_secs()));
+    }
+    if any_up {
+        return (true, Duration::from_secs(15), "native-connected".into());
+    }
+    let delay = [v4_retry_delay, v6_retry_delay]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(Duration::from_secs(5))
+        .clamp(Duration::from_secs(1), Duration::from_secs(60));
+    (false, delay, format!("native-backoff-{}s", delay.as_secs()))
 }
 
 async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
@@ -2424,17 +2999,19 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
     let mut loop_tick: u64 = 0;
     let mut last_ssr_count: u64 = 0;
     let mut pending_phy_reenable = false;
+    let mut unregistered_ticks: u32 = 0;
+    let mut flushed_unregistered = false;
 
     loop {
         loop_tick = loop_tick.wrapping_add(1);
         let cfg = h.config.read().await.clone();
         if bus.is_none() {
-            match QrtrBus::connect() {
+            match qmi::qrtr::shared_bus() {
                 Ok(b) => {
                     last_ssr_count = b.snapshot().ssr_count;
                     bus_rx = Some(b.subscribe());
                     bus = Some(b);
-                    state.push_daemon_log("dataplane: AF_QIPCRTR control bus connected");
+                    state.push_daemon_log("dataplane: AF_QIPCRTR shared control bus connected");
                 }
                 Err(e) => {
                     let mut snap = DataplaneSnapshot {
@@ -2478,6 +3055,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                 last_ssr_count,
                 "SSR counter latched",
             );
+            if cfg.mode == DataplaneMode::Native {
+                let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                flush_rmnet_stale_state(flush_if, flush_tbl).await;
+            }
             pending_phy_reenable = true;
         }
         let prev_counts = {
@@ -2508,6 +3090,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         match cfg.mode {
             DataplaneMode::Coexist => {
                 native_tick = 0;
+                unregistered_ticks = 0;
+                flushed_unregistered = false;
                 NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
                 if nh.has_native_state() {
                     teardown_native_handles(&state, &mut nh, &cfg).await;
@@ -2534,6 +3118,9 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                         nh.v4_client = None;
                         nh.last_v4_ip = None;
+                        nh.v4_backoff.reset();
+                        nh.v4_next_retry_ms = 0;
+                        nh.v4_last_error = None;
                     }
                     if f == "all" || f == "ipv6" {
                         if let (Some(cli), Some(hdl)) = (&nh.v6_client, nh.v6_handle.take()) {
@@ -2542,8 +3129,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         nh.v6_client = None;
                         nh.last_v6_ip = None;
                         nh.last_v6_key = None;
+                        nh.v6_backoff.reset();
+                        nh.v6_next_retry_ms = 0;
+                        nh.v6_last_error = None;
                     }
-                    nh.backoff.reset();
+                    nh.netlink_backoff.reset();
                 }
 
                 NATIVE_MODE_ACTIVE.store(true, Ordering::Relaxed);
@@ -2580,23 +3170,64 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
 
                 let ps_ready = snap.nas_sys.as_ref().is_some_and(|s| s.registered);
                 if !ps_ready {
+                    unregistered_ticks = unregistered_ticks.saturating_add(1);
                     NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+                    if unregistered_ticks >= 2 && !flushed_unregistered {
+                        nh.v4_client = None;
+                        nh.v6_client = None;
+                        nh.v4_handle = None;
+                        nh.v6_handle = None;
+                        nh.last_v4_ip = None;
+                        nh.last_v6_ip = None;
+                        nh.last_v6_key = None;
+                        let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                        let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                        flush_rmnet_stale_state(flush_if, flush_tbl).await;
+                        flushed_unregistered = true;
+                        state.push_daemon_log("dataplane: flushed stale rmnet addresses/routes after sustained PS loss");
+                    }
                     snap.supervisor_state = "native-waiting-registration".into();
                 } else {
+                    unregistered_ticks = 0;
+                    flushed_unregistered = false;
                     let mut v4_rt = None;
                     let mut v6_rt = None;
-                    let mut had_err = false;
+                    let mut v4_failed_this_tick = false;
+                    let mut v6_failed_this_tick = false;
+                    let mut v4_retry_delay: Option<Duration> = None;
+                    let mut v6_retry_delay: Option<Duration> = None;
+                    let mut netlink_err = false;
+                    let mut netlink_delay: Option<Duration> = None;
+                    let now_ms = crate::state::mono_ms();
 
                     if cfg.ip_family.wants_v4() {
                         if let Some(cli) = nh.v4_client.clone().filter(|c| c.is_alive()) {
                             if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
                                 snap.wds_v4.pkt_status = Some(st.clone());
                                 if st.status == PktConnStatus::Connected && !st.reconfig_required {
-                                    if let Ok(rt) = wds::get_runtime_settings(cli.as_ref()).await {
-                                        v4_rt = Some(rt.clone());
-                                        snap.wds_v4.runtime = Some(rt);
-                                        snap.wds_v4.handle = nh.v4_handle;
-                                        snap.wds_v4.state = "connected";
+                                    match wds::get_runtime_settings(cli.as_ref()).await {
+                                        Ok(rt) => {
+                                            v4_rt = Some(rt.clone());
+                                            snap.wds_v4.runtime = Some(rt);
+                                            snap.wds_v4.handle = nh.v4_handle;
+                                            snap.wds_v4.state = "connected";
+                                            nh.v4_backoff.reset();
+                                            nh.v4_next_retry_ms = 0;
+                                            nh.v4_last_error = None;
+                                        }
+                                        Err(e) => {
+                                            nh.v4_client = None;
+                                            nh.v4_handle = None;
+                                            nh.last_v4_ip = None;
+                                            v4_failed_this_tick = true;
+                                            let d = nh.v4_backoff.next_delay();
+                                            nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                            v4_retry_delay = Some(d);
+                                            let msg = format!("get_runtime_settings: {e}");
+                                            nh.v4_last_error = Some(msg.clone());
+                                            snap.wds_v4.state = "backoff";
+                                            snap.wds_v4.last_error = Some(msg);
+                                        }
                                     }
                                 } else {
                                     nh.v4_client = None;
@@ -2609,29 +3240,43 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 nh.last_v4_ip = None;
                             }
                         }
-                        if nh.v4_client.is_none() {
-                            snap.reconnect_attempts += 1;
-                            match bring_up_native_family(
-                                b,
-                                &ind_tx,
-                                &cfg,
-                                4,
-                                "WDS_V4",
-                                &mut snap.wds_v4,
-                                &mut snap.warnings,
-                            )
-                            .await
-                            {
-                                Ok((c, hdl, rt)) => {
-                                    nh.v4_client = Some(c);
-                                    nh.v4_handle = Some(hdl);
-                                    v4_rt = Some(rt);
+                        if nh.v4_client.is_none() && !v4_failed_this_tick {
+                            if now_ms >= nh.v4_next_retry_ms {
+                                snap.reconnect_attempts += 1;
+                                match bring_up_native_family(
+                                    b,
+                                    &ind_tx,
+                                    &cfg,
+                                    4,
+                                    "WDS_V4",
+                                    &mut snap.wds_v4,
+                                    &mut snap.warnings,
+                                )
+                                .await
+                                {
+                                    Ok((c, hdl, rt)) => {
+                                        nh.v4_client = Some(c);
+                                        nh.v4_handle = Some(hdl);
+                                        nh.v4_backoff.reset();
+                                        nh.v4_next_retry_ms = 0;
+                                        nh.v4_last_error = None;
+                                        v4_rt = Some(rt);
+                                    }
+                                    Err(e) => {
+                                        let d = nh.v4_backoff.next_delay();
+                                        nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                        v4_retry_delay = Some(d);
+                                        let msg = e.to_string();
+                                        nh.v4_last_error = Some(msg.clone());
+                                        snap.wds_v4.state = "backoff";
+                                        snap.wds_v4.last_error = Some(msg);
+                                    }
                                 }
-                                Err(e) => {
-                                    had_err = true;
-                                    snap.wds_v4.state = "backoff";
-                                    snap.wds_v4.last_error = Some(e.to_string());
-                                }
+                            } else {
+                                let rem_ms = nh.v4_next_retry_ms.saturating_sub(now_ms);
+                                v4_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
+                                snap.wds_v4.state = "backoff";
+                                snap.wds_v4.last_error = nh.v4_last_error.clone();
                             }
                         }
                     }
@@ -2641,16 +3286,35 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
                                 snap.wds_v6.pkt_status = Some(st.clone());
                                 if st.status == PktConnStatus::Connected && !st.reconfig_required {
-                                    if let Ok(mut rt) = wds::get_runtime_settings(cli.as_ref()).await {
-                                        if !ipv6_bearer_changed(Some(&rt), nh.last_v6_key.as_ref())
-                                            && let Some(applied_v6) = nh.last_v6_ip.as_ref()
-                                        {
-                                            rt.ipv6_addr = Some(applied_v6.clone());
+                                    match wds::get_runtime_settings(cli.as_ref()).await {
+                                        Ok(mut rt) => {
+                                            if !ipv6_bearer_changed(Some(&rt), nh.last_v6_key.as_ref())
+                                                && let Some(applied_v6) = nh.last_v6_ip.as_ref()
+                                            {
+                                                rt.ipv6_addr = Some(applied_v6.clone());
+                                            }
+                                            v6_rt = Some(rt.clone());
+                                            snap.wds_v6.runtime = Some(rt);
+                                            snap.wds_v6.handle = nh.v6_handle;
+                                            snap.wds_v6.state = "connected";
+                                            nh.v6_backoff.reset();
+                                            nh.v6_next_retry_ms = 0;
+                                            nh.v6_last_error = None;
                                         }
-                                        v6_rt = Some(rt.clone());
-                                        snap.wds_v6.runtime = Some(rt);
-                                        snap.wds_v6.handle = nh.v6_handle;
-                                        snap.wds_v6.state = "connected";
+                                        Err(e) => {
+                                            nh.v6_client = None;
+                                            nh.v6_handle = None;
+                                            nh.last_v6_ip = None;
+                                            nh.last_v6_key = None;
+                                            v6_failed_this_tick = true;
+                                            let d = nh.v6_backoff.next_delay();
+                                            nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                            v6_retry_delay = Some(d);
+                                            let msg = format!("get_runtime_settings: {e}");
+                                            nh.v6_last_error = Some(msg.clone());
+                                            snap.wds_v6.state = "backoff";
+                                            snap.wds_v6.last_error = Some(msg);
+                                        }
                                     }
                                 } else {
                                     nh.v6_client = None;
@@ -2665,29 +3329,43 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 nh.last_v6_key = None;
                             }
                         }
-                        if nh.v6_client.is_none() {
-                            snap.reconnect_attempts += 1;
-                            match bring_up_native_family(
-                                b,
-                                &ind_tx,
-                                &cfg,
-                                6,
-                                "WDS_V6",
-                                &mut snap.wds_v6,
-                                &mut snap.warnings,
-                            )
-                            .await
-                            {
-                                Ok((c, hdl, rt)) => {
-                                    nh.v6_client = Some(c);
-                                    nh.v6_handle = Some(hdl);
-                                    v6_rt = Some(rt);
+                        if nh.v6_client.is_none() && !v6_failed_this_tick {
+                            if now_ms >= nh.v6_next_retry_ms {
+                                snap.reconnect_attempts += 1;
+                                match bring_up_native_family(
+                                    b,
+                                    &ind_tx,
+                                    &cfg,
+                                    6,
+                                    "WDS_V6",
+                                    &mut snap.wds_v6,
+                                    &mut snap.warnings,
+                                )
+                                .await
+                                {
+                                    Ok((c, hdl, rt)) => {
+                                        nh.v6_client = Some(c);
+                                        nh.v6_handle = Some(hdl);
+                                        nh.v6_backoff.reset();
+                                        nh.v6_next_retry_ms = 0;
+                                        nh.v6_last_error = None;
+                                        v6_rt = Some(rt);
+                                    }
+                                    Err(e) => {
+                                        let d = nh.v6_backoff.next_delay();
+                                        nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                        v6_retry_delay = Some(d);
+                                        let msg = e.to_string();
+                                        nh.v6_last_error = Some(msg.clone());
+                                        snap.wds_v6.state = "backoff";
+                                        snap.wds_v6.last_error = Some(msg);
+                                    }
                                 }
-                                Err(e) => {
-                                    had_err = true;
-                                    snap.wds_v6.state = "backoff";
-                                    snap.wds_v6.last_error = Some(e.to_string());
-                                }
+                            } else {
+                                let rem_ms = nh.v6_next_retry_ms.saturating_sub(now_ms);
+                                v6_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
+                                snap.wds_v6.state = "backoff";
+                                snap.wds_v6.last_error = nh.v6_last_error.clone();
                             }
                         }
                     }
@@ -2720,18 +3398,30 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                         match apply_native_netlink(&cfg, v4_rt.as_ref(), v6_rt.as_ref(), apply_v4, apply_v6).await {
                             Ok(applied) => {
-                                let prev_v4_for_ct = nh.last_v4_ip.clone();
-                                let had_prev_v6 = nh.last_v6_key.is_some();
+                                let prev_v4_for_ct = nh.last_applied_v4_ip.clone();
+                                let prev_v6_key_for_ct = nh.last_applied_v6_key.clone();
+                                let prev_v6_ip_for_ct = nh.last_applied_v6_ip.clone();
                                 snap.netlink_updates += 1;
                                 let resolved_iface = applied.resolved_iface.clone();
                                 nh.last_link_mtu = applied.link_mtu;
                                 if apply_v4 {
-                                    nh.last_v4_ip = applied.v4_ip.map(|ip| ip.to_string());
+                                    let new_v4 = applied.v4_ip.map(|ip| ip.to_string());
+                                    nh.last_v4_ip = new_v4.clone();
+                                    if new_v4.is_some() {
+                                        nh.last_applied_v4_ip = new_v4;
+                                    }
                                     nh.ippt_host_ip = applied.ippt_host_ip;
                                 }
                                 if apply_v6 {
+                                    let new_v6_key = v6_rt.as_ref().and_then(ipv6_bearer_key);
                                     nh.last_v6_ip = applied.v6_addr_str.clone();
-                                    nh.last_v6_key = v6_rt.as_ref().and_then(ipv6_bearer_key);
+                                    nh.last_v6_key = new_v6_key.clone();
+                                    if applied.v6_addr_str.is_some() {
+                                        nh.last_applied_v6_ip = applied.v6_addr_str.clone();
+                                    }
+                                    if new_v6_key.is_some() {
+                                        nh.last_applied_v6_key = new_v6_key;
+                                    }
                                     nh.v6_dns_routes = applied.v6_dns;
                                 }
                                 nh.last_applied_sig = Some(cur_sig);
@@ -2739,9 +3429,10 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
 
                                 flush_stale_wan_conntrack_and_reload_odhcpd(
                                     prev_v4_for_ct.as_deref(),
-                                    v4_changed,
-                                    had_prev_v6,
-                                    v6_changed,
+                                    v4_changed && applied.v4_ip.is_some(),
+                                    prev_v6_key_for_ct.as_ref(),
+                                    prev_v6_ip_for_ct.as_deref(),
+                                    v6_changed && applied.v6_addr_str.is_some(),
                                 )
                                 .await;
 
@@ -2772,6 +3463,24 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                         }
                                         Err(e) => snap.warnings.push(e),
                                     }
+                                    if let Some(v4_ip) = applied.v4_ip {
+                                        let gw = v4_rt
+                                            .as_ref()
+                                            .and_then(|r| r.ipv4_gateway.as_deref())
+                                            .and_then(|s| s.parse::<Ipv4Addr>().ok());
+                                        match write_ippt_dnsmasq_conf(mac, v4_ip, gw).await {
+                                            Ok(()) => nh.ippt_dnsmasq_active = true,
+                                            Err(e) => snap.warnings.push(format!("IPPT dnsmasq config: {e}")),
+                                        }
+                                    }
+                                } else if !cfg.ippt
+                                    && (nh.ippt_dnsmasq_active
+                                        || Path::new(&crate::paths::p(IPPT_DNSMASQ_CONF_PATH)).exists())
+                                {
+                                    if let Err(e) = remove_ippt_dnsmasq_conf().await {
+                                        snap.warnings.push(e);
+                                    }
+                                    nh.ippt_dnsmasq_active = false;
                                 }
 
                                 if apply_v6
@@ -2816,16 +3525,18 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                     )
                                     .await;
                                 }
-                                nh.backoff.reset();
+                                nh.netlink_backoff.reset();
                             }
                             Err(e) => {
-                                had_err = true;
+                                netlink_err = true;
+                                netlink_delay = Some(nh.netlink_backoff.next_delay());
                                 snap.warnings.push(format!("native netlink config: {e}"));
                             }
                         }
-                    } else if !had_err && (v4_rt.is_some() || v6_rt.is_some()) {
-                        nh.backoff.reset();
-                        // Self-heal firewall rules after fw4/fw3 reload (~every 60s), including IPPT MSS clamp.
+                    } else if v4_rt.is_some() || v6_rt.is_some() {
+                        nh.netlink_backoff.reset();
+                        // Self-heal firewall rules after fw4/fw3 reload (~every 60s), including IPPT MSS clamp
+                        // and IPv6-only carriers in Ipv4v6 mode.
                         if native_tick.is_multiple_of(4)
                             && let Some(active_iface) = nh.last_resolved_iface.clone()
                         {
@@ -2846,23 +3557,26 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                     }
 
-                    if !had_err && (v4_rt.is_some() || v6_rt.is_some()) {
+                    let (healthy, sleep_dur, sup_state) = evaluate_native_bearer_health(
+                        v4_rt.is_some(),
+                        v6_rt.is_some(),
+                        netlink_err,
+                        v4_retry_delay,
+                        v6_retry_delay,
+                        netlink_delay,
+                    );
+                    if healthy {
                         let _ = NATIVE_CONNECTED_SINCE.compare_exchange(
                             0,
-                            now_secs(),
+                            crate::state::mono_ms(),
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                         );
                     } else if v4_rt.is_none() && v6_rt.is_none() {
                         NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
                     }
-
-                    if had_err {
-                        next_sleep = nh.backoff.next_delay();
-                        snap.supervisor_state = format!("native-backoff-{}s", next_sleep.as_secs());
-                    } else {
-                        snap.supervisor_state = "native-connected".into();
-                    }
+                    next_sleep = sleep_dur;
+                    snap.supervisor_state = sup_state;
                 }
             }
         }
@@ -2888,7 +3602,15 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         }
 
         if cfg.sfe_fastpath && loop_tick.is_multiple_of(4) && !is_sfe_loaded() {
-            snap.warnings.extend(reconcile_sfe_fastpath(true, false).await);
+            snap.warnings.extend(
+                reconcile_sfe_fastpath_with_guard(
+                    true,
+                    false,
+                    cfg.preserve_ipa_offload,
+                    cfg.ippt,
+                )
+                .await,
+            );
         }
 
         snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
@@ -2938,6 +3660,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     if cur_ssr > last_ssr_count {
                         last_ssr_count = cur_ssr;
                         handle_modem_ssr(&state, &mut ph, &mut nh, node, last_ssr_count, &reason);
+                        if cfg.mode == DataplaneMode::Native {
+                            let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                            let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                            flush_rmnet_stale_state(flush_if, flush_tbl).await;
+                        }
                         pending_phy_reenable = true;
                     }
                 }
@@ -3014,8 +3741,17 @@ pub async fn apply_config_from_backup(app: &AppState, mut next: DataplaneConfig)
             .unwrap_or_default();
         *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
     }
-    if next.sfe_fastpath != prev.sfe_fastpath {
-        let _ = reconcile_sfe_fastpath(next.sfe_fastpath, !next.sfe_fastpath).await;
+    if next.sfe_fastpath != prev.sfe_fastpath
+        || (next.sfe_fastpath
+            && (next.preserve_ipa_offload != prev.preserve_ipa_offload || next.ippt != prev.ippt))
+    {
+        let _ = reconcile_sfe_fastpath_with_guard(
+            next.sfe_fastpath,
+            !next.sfe_fastpath,
+            next.preserve_ipa_offload,
+            next.ippt,
+        )
+        .await;
     }
     *h.config.write().await = next.clone();
     if next.mode == DataplaneMode::Native {
@@ -3217,8 +3953,17 @@ async fn post_config(
             .unwrap_or_default();
         *h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()) = warns;
     }
-    let sfe_warns = if next.sfe_fastpath != prev.sfe_fastpath {
-        reconcile_sfe_fastpath(next.sfe_fastpath, !next.sfe_fastpath).await
+    let sfe_warns = if next.sfe_fastpath != prev.sfe_fastpath
+        || (next.sfe_fastpath
+            && (next.preserve_ipa_offload != prev.preserve_ipa_offload || next.ippt != prev.ippt))
+    {
+        reconcile_sfe_fastpath_with_guard(
+            next.sfe_fastpath,
+            !next.sfe_fastpath,
+            next.preserve_ipa_offload,
+            next.ippt,
+        )
+        .await
     } else {
         Vec::new()
     };
@@ -3684,15 +4429,16 @@ mod tests {
         assert!(script.contains("table inet qm_native_nat"));
         assert!(script.contains("oifname \"rmnet_data1\" meta nfproto ipv4 masquerade"));
         assert!(script.contains("oifname \"rmnet_data1\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu"));
-        assert!(!script.contains("iifname \"rmnet_data1\" tcp flags syn / syn,rst tcp option maxseg size set rt mtu"));
+        assert!(script.contains("iifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > 1460 tcp option maxseg size set 1460"));
+        assert!(script.contains("iifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > 1440 tcp option maxseg size set 1440"));
 
-        // IPPT with skip_nat=true + T-Mobile 1428 MTU: keeps symmetric v4/v6 MSS clamping active while omitting masquerade!
+        // IPPT with skip_nat=true + T-Mobile 1428 MTU: keeps symmetric v4/v6 MSS clamping active with `> {mss}` guard so smaller VPN SYNs are never clamped upward!
         let ippt_mss = build_native_nat_nft_script("rmnet_data1", false, 1428).unwrap();
         assert!(!ippt_mss.contains("masquerade"));
-        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set 1388"));
-        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size set 1388"));
-        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set 1368"));
-        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size set 1368"));
+        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > 1388 tcp option maxseg size set 1388"));
+        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv4 tcp flags syn / syn,rst tcp option maxseg size > 1388 tcp option maxseg size set 1388"));
+        assert!(ippt_mss.contains("oifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > 1368 tcp option maxseg size set 1368"));
+        assert!(ippt_mss.contains("iifname \"rmnet_data1\" meta nfproto ipv6 tcp flags syn / syn,rst tcp option maxseg size > 1368 tcp option maxseg size set 1368"));
 
         assert!(build_native_nat_nft_script("eth0", true, 1500).is_err());
         assert!(build_native_nat_nft_script("br-lan", true, 1500).is_err());
@@ -3717,9 +4463,23 @@ mod tests {
         );
         assert_eq!(extract_qm_native_nft_handles(chain_with_handles), vec![77, 88]);
 
-        let ipt = "-A POSTROUTING -o rmnet_data10 -j MASQUERADE\n-A POSTROUTING -o rmnet_data1 -m comment --comment qm_native -j MASQUERADE\n";
-        assert!(ipt_rules_cover_iface(ipt, "rmnet_data1"));
-        assert!(!ipt_rules_cover_iface("-A POSTROUTING -o rmnet_data10 -j MASQUERADE\n", "rmnet_data1"));
+        let ipt_nat = "-A POSTROUTING -o rmnet_data10 -j MASQUERADE\n-A POSTROUTING -o rmnet_data1 -m comment --comment qm_native -j MASQUERADE\n";
+        assert!(ipt_oif_covers_iface(ipt_nat, "rmnet_data1"));
+        assert!(!ipt_oif_covers_iface("-A POSTROUTING -o rmnet_data10 -j MASQUERADE\n", "rmnet_data1"));
+
+        // ipt_rules_cover_iface must require `-j TCPMSS` on both `-o` and `-i` (ignoring TTL/HL rules).
+        let ttl_only = "-A FORWARD -o rmnet_data1 -j TTL --ttl-set 65\n-A FORWARD -i rmnet_data1 -j TTL --ttl-set 65\n";
+        assert!(!ipt_rules_cover_iface(ttl_only, "rmnet_data1"));
+        let out_only = "-A FORWARD -o rmnet_data1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1388\n";
+        assert!(!ipt_rules_cover_iface(out_only, "rmnet_data1"));
+        assert!(ipt_tcpmss_covers_dir(out_only, "-o", "rmnet_data1"));
+        assert!(!ipt_tcpmss_covers_dir(out_only, "-i", "rmnet_data1"));
+        let both_dirs = concat!(
+            "-A FORWARD -o rmnet_data1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1388\n",
+            "-A FORWARD -i rmnet_data1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1388\n",
+        );
+        assert!(ipt_rules_cover_iface(both_dirs, "rmnet_data1"));
+        assert!(!ipt_rules_cover_iface(both_dirs, "rmnet_data0"));
 
         let mut nh = NativeHandles::new();
         assert!(!nh.has_native_state());
@@ -3772,24 +4532,168 @@ mod tests {
     }
 
     #[test]
-    fn pins_eth0_msi_irqs_to_cpu2_3_via_smp_affinity_list() {
+    fn pins_eth0_msi_irqs_to_cpu2_3_and_gsi_to_cpu1_and_restores_on_default() {
         let sbx = crate::paths::TestSandbox::new("eth0_irqs");
         sbx.write(
             "/proc/interrupts",
             concat!(
                 "           CPU0       CPU1       CPU2       CPU3\n",
                 " 22:       1000          0          0          0   GICv3 102 Edge      ipcc_0\n",
-                " 45:          0       9000          0          0   GICv3 210 Level     gsi\n",
+                " 45:       9000          0          0          0   GICv3 210 Level     gsi\n",
                 " 81:          0          0       5000          0   PCI-MSI 524288 Edge      eth0-0\n",
                 " 82:          0          0       4000          0   PCI-MSI 524289 Edge      eth0-1\n",
             ),
         );
+        let p45 = sbx.write("/proc/irq/45/smp_affinity_list", "0-3\n");
         let p81 = sbx.write("/proc/irq/81/smp_affinity_list", "0-3\n");
         let p82 = sbx.write("/proc/irq/82/smp_affinity_list", "0-3\n");
 
         let assigned = pin_eth0_irqs_to_cpu2_3();
-        assert_eq!(assigned, vec![("81".into(), "2-3"), ("82".into(), "2-3")]);
-        assert_eq!(fs::read_to_string(p81).unwrap().trim(), "2-3");
-        assert_eq!(fs::read_to_string(p82).unwrap().trim(), "2-3");
+        assert_eq!(
+            assigned,
+            vec![("45".into(), "1"), ("81".into(), "2"), ("82".into(), "3")]
+        );
+        assert_eq!(fs::read_to_string(&p45).unwrap().trim(), "1");
+        assert_eq!(fs::read_to_string(&p81).unwrap().trim(), "2");
+        assert_eq!(fs::read_to_string(&p82).unwrap().trim(), "3");
+        assert!(!kernel_tuning_drifted("rmnet_data0"));
+
+        // Drift detection catches IRQ affinity reset.
+        fs::write(&p82, "0-3\n").unwrap();
+        assert!(kernel_tuning_drifted("rmnet_data0"));
+
+        // Restore on Default profile reverts saved IRQ affinities.
+        let mut warns = Vec::new();
+        restore_nic_offloads_and_irqs(&mut warns);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(fs::read_to_string(&p45).unwrap().trim(), "0-3");
+        assert_eq!(fs::read_to_string(&p81).unwrap().trim(), "0-3");
+        assert_eq!(fs::read_to_string(&p82).unwrap().trim(), "0-3");
+    }
+
+    #[tokio::test]
+    async fn ssr_preserves_last_applied_ips_for_v4_and_v6_conntrack_eviction() {
+        let sbx = crate::paths::TestSandbox::new("dp_ssr_ct");
+        let www = sbx.root.join("www");
+        fs::create_dir_all(&www).unwrap();
+        let app = AppState::for_tests(www, crate::auth::AuthStore::new(sbx.root.join("sessions")));
+        let mut ph = ProbeHandles::default();
+        let mut nh = NativeHandles::new();
+        nh.last_v4_ip = Some("100.64.10.20".into());
+        nh.last_applied_v4_ip = Some("100.64.10.20".into());
+        nh.last_v6_ip = Some("2607:fb90:1234:5678::1".into());
+        nh.last_applied_v6_ip = Some("2607:fb90:1234:5678::1".into());
+        nh.last_v6_key = Some(("2607:fb90:1234:5678".into(), 64));
+        nh.last_applied_v6_key = Some(("2607:fb90:1234:5678".into(), 64));
+
+        handle_modem_ssr(&app, &mut ph, &mut nh, 0, 1, "test-ssr");
+        // Live pointers cleared so netlink re-applies on reconnect...
+        assert!(nh.last_v4_ip.is_none());
+        assert!(nh.last_v6_ip.is_none());
+        assert!(nh.last_v6_key.is_none());
+        // ...while last_applied_* remain intact for conntrack eviction!
+        assert_eq!(nh.last_applied_v4_ip.as_deref(), Some("100.64.10.20"));
+        assert_eq!(
+            nh.last_applied_v6_key,
+            Some(("2607:fb90:1234:5678".into(), 64))
+        );
+
+        let args = build_conntrack_eviction_args(
+            nh.last_applied_v4_ip.as_deref(),
+            true,
+            nh.last_applied_v6_key.as_ref(),
+            nh.last_applied_v6_ip.as_deref(),
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                vec!["-D", "-q", "100.64.10.20"],
+                vec!["-D", "-s", "100.64.10.20"],
+                vec!["-D", "-f", "ipv6", "-s", "2607:fb90:1234:5678::/64"],
+                vec!["-D", "-f", "ipv6", "-q", "2607:fb90:1234:5678::/64"],
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_only_carrier_in_ipv4v6_mode_is_healthy_and_ram_caps_socket_bufs() {
+        let (healthy, sleep, state_str) = evaluate_native_bearer_health(
+            false,
+            true,
+            false,
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+        );
+        assert!(healthy);
+        assert_eq!(sleep, Duration::from_secs(15));
+        assert_eq!(state_str, "native-connected");
+
+        let (healthy_none, sleep_none, state_none) = evaluate_native_bearer_health(
+            false,
+            false,
+            false,
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(5)),
+            None,
+        );
+        assert!(!healthy_none);
+        assert_eq!(sleep_none, Duration::from_secs(5));
+        assert_eq!(state_none, "native-backoff-5s");
+
+        assert_eq!(parse_memtotal_mib("MemTotal:       491520 kB\n"), Some(480));
+        assert_eq!(socket_buf_max_bytes_for_ram(Some(480)), 8_388_608);
+        assert_eq!(socket_buf_max_bytes_for_ram(Some(512)), 8_388_608);
+        assert_eq!(socket_buf_max_bytes_for_ram(Some(1024)), 16_777_216);
+        assert_eq!(socket_buf_max_bytes_for_ram(None), 16_777_216);
+
+        let ethtool_k = "rx-gro-list: on\nrx-udp-gro-forwarding: off [requested off]\n";
+        assert_eq!(parse_ethtool_gro_features(ethtool_k), (Some(true), Some(false)));
+    }
+
+    #[tokio::test]
+    async fn ippt_dnsmasq_conf_sfe_guard_corrupt_config_and_metrics_coexist() {
+        let sbx = crate::paths::TestSandbox::new("dp_ippt_sfe");
+        sbx.write(DATAPLANE_CONFIG_PATH, "{corrupt json");
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                // Corrupt dataplane.json is quarantined and returns defaults.
+                let cfg = load_config();
+                assert_eq!(cfg, DataplaneConfig::default());
+
+                // IPPT dnsmasq config write & clean removal.
+                write_ippt_dnsmasq_conf(
+                    "AA:BB:CC:DD:EE:FF",
+                    Ipv4Addr::new(100, 64, 1, 2),
+                    Some(Ipv4Addr::new(100, 64, 1, 1)),
+                )
+                .await
+                .unwrap();
+                let real = sbx.root.join(IPPT_DNSMASQ_CONF_PATH.trim_start_matches('/'));
+                let body = fs::read_to_string(&real).unwrap();
+                assert!(body.contains("dhcp-host=aa:bb:cc:dd:ee:ff,set:cellcore_ippt,100.64.1.2,120s"));
+                assert!(body.contains("dhcp-option=tag:cellcore_ippt,option:router,100.64.1.1"));
+                assert!(remove_ippt_dnsmasq_conf().await.unwrap());
+                assert!(!real.exists());
+
+                // SFE mutual exclusion guard blocks loading when IPA offload or IPPT is active.
+                let w_ipa = reconcile_sfe_fastpath_with_guard(true, false, true, false).await;
+                assert!(w_ipa.iter().any(|w| w.contains("mutually exclusive")));
+                let w_ippt = reconcile_sfe_fastpath_with_guard(true, false, false, true).await;
+                assert!(w_ippt.iter().any(|w| w.contains("IP Passthrough")));
+
+                // Monotonic native WAN uptime.
+                NATIVE_CONNECTED_SINCE.store(crate::state::mono_ms(), Ordering::Relaxed);
+                assert!(native_wan_uptime_secs().is_some_and(|s| s >= 1));
+                NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+                assert!(native_wan_uptime_secs().is_none());
+
+                // DataplaneMetricsView reports "coexist" (never "legacy") and expanded fields.
+                let mv = metrics_view().await;
+                assert_ne!(mv.mode, "legacy");
+                assert!(matches!(mv.mode, "coexist" | "native"));
+            })
+            .await;
     }
 }

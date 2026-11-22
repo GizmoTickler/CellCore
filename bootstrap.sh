@@ -322,16 +322,40 @@ run_remote "
 if [ -n "$LOCAL_IPK" ]; then
   echo "==> Installing local package ${LOCAL_IPK}..."
   push_file "$LOCAL_IPK" "/tmp/sdxpinn-cellcore.ipk"
-  run_remote "opkg update || true; opkg install /tmp/sdxpinn-cellcore.ipk && rm -f /tmp/sdxpinn-cellcore.ipk"
+  run_remote "opkg update || true; opkg install /tmp/sdxpinn-cellcore.ipk"
 else
   echo "==> Installing sdxpinn-cellcore from signed ${FEED_NAME}..."
   run_remote "opkg update && opkg install sdxpinn-cellcore"
 fi
 
-# 7. Final health verification
+# 8. Final health verification & rescue .ipk staging
 echo "==> Verifying CellCore daemon..."
 sleep 2
 run_remote "cellctl verify --expect-wan 0 && cellctl overlay status"
+echo "==> Staging verified rescue package -> /etc/cellcore-rescue/cellcore.ipk..."
+if [ -n "$LOCAL_IPK" ]; then
+  run_remote "
+    mkdir -p /etc/cellcore-rescue
+    if [ -f /tmp/sdxpinn-cellcore.ipk ]; then
+      cp -f /tmp/sdxpinn-cellcore.ipk /etc/cellcore-rescue/cellcore.ipk.tmp && \
+        mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
+      rm -f /tmp/sdxpinn-cellcore.ipk
+    fi
+  "
+else
+  run_remote "
+    RESCUE_DL=/tmp/cellcore-rescue-dl.\$\$
+    mkdir -p \"\$RESCUE_DL\" /etc/cellcore-rescue
+    if (cd \"\$RESCUE_DL\" && opkg download sdxpinn-cellcore >/dev/null 2>&1); then
+      ipk_f=\$(ls -1 \"\$RESCUE_DL\"/sdxpinn-cellcore_*.ipk \"\$RESCUE_DL\"/*.ipk 2>/dev/null | head -n 1)
+      if [ -n \"\$ipk_f\" ] && [ -f \"\$ipk_f\" ]; then
+        cp -f \"\$ipk_f\" /etc/cellcore-rescue/cellcore.ipk.tmp && \
+          mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
+      fi
+    fi
+    rm -rf \"\$RESCUE_DL\"
+  "
+fi
 LAN_IP=$(run_remote "uci -q get network.lan.ipaddr || echo 192.168.225.1" | tr -d '\r\n')
 echo ""
 echo "============================================================"

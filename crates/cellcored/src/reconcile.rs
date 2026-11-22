@@ -194,6 +194,12 @@ pub fn run_boot_reconcile(enforce_uhttpd_loopback: bool) -> ReconcileReport {
         ensure_uhttpd_loopback(&mut actions, &mut warnings);
     }
 
+    // 9b. Auto-restore any unconfirmed firewall commit-confirm rollback left across a crash/reboot
+    crate::admin::firewall::restore_pending_rollback_blocking(&mut actions, &mut warnings);
+
+    // 9c. Prune legacy QuecManager keep_alive_worker.sh entries from /etc/crontabs/root
+    prune_legacy_crontabs(&mut actions, &mut warnings);
+
     // 10. Purge legacy CGI/LuCI leftovers if present
     for stale in [
         "/etc/opkg/keys/6262698f038d1226",
@@ -762,18 +768,26 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
         }
     }
 
-    // TTL / HL
+    // TTL / HL (verify both IPv4 --ttl-set and IPv6 --hl-set)
     let ttl_s = crate::paths::p("/etc/firewall.user.ttl");
     let ttl_file = Path::new(&ttl_s);
     if ttl_file.exists() {
-        let cur = run_cmd_blocking("iptables", &["-t", "mangle", "-S", "POSTROUTING"]).unwrap_or_default();
-        if !cur.contains("--ttl-set") {
-            let _ = Command::new(crate::paths::p("/bin/sh")).arg(ttl_file).output();
+        let ttl_content = fs::read_to_string(ttl_file).unwrap_or_default();
+        let cur4 = run_cmd_blocking("iptables", &["-t", "mangle", "-S", "POSTROUTING"]).unwrap_or_default();
+        let need_v4 = !cur4.contains("--ttl-set");
+        let need_v6 = if ttl_content.contains("--hl-set") || ttl_content.contains("ip6tables") {
+            let cur6 = run_cmd_blocking("ip6tables", &["-t", "mangle", "-S", "POSTROUTING"]).unwrap_or_default();
+            !cur6.contains("--hl-set")
+        } else {
+            false
+        };
+        if need_v4 || need_v6 {
+            let _ = Command::new("sh").arg(ttl_file).output();
             actions.push("Re-applied /etc/firewall.user.ttl rules".into());
         }
     }
 
-    // MTU + symmetric TCPMSS clamping
+    // MTU + symmetric TCPMSS clamping (verify script & live rules match active rmnet_data* ifaces)
     let mtu_s = crate::paths::p("/etc/firewall.user.mtu");
     let mtu_file = Path::new(&mtu_s);
     if let Ok(content) = fs::read_to_string(mtu_file)
@@ -802,12 +816,62 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
         }
         if mtu_val < 1500 && !ifaces.is_empty() {
             let desired = build_mtu_firewall_script(&ifaces, mtu_val);
-            if !desired.is_empty() && !content.contains("TCPMSS") {
+            if !desired.is_empty() && !mtu_script_covers_ifaces(&content, &ifaces) {
                 let _ = write_atomic("/etc/firewall.user.mtu", &desired, 0o644);
             }
-            let _ = Command::new(crate::paths::p("/bin/sh")).arg(mtu_file).output();
+            let _ = Command::new("sh").arg(mtu_file).output();
         }
         actions.push(format!("Verified WAN MTU={m_str}"));
+    }
+}
+
+pub(crate) fn mtu_script_covers_ifaces(content: &str, ifaces: &[String]) -> bool {
+    if ifaces.is_empty() {
+        return true;
+    }
+    ifaces.iter().all(|iface| {
+        let has_rule = |bin: &str, dir: &str| {
+            content.lines().any(|line| {
+                line.contains(bin)
+                    && line.contains(&format!("{dir} {iface} "))
+                    && line.contains("TCPMSS")
+            })
+        };
+        has_rule("iptables", "-o")
+            && has_rule("iptables", "-i")
+            && has_rule("ip6tables", "-o")
+            && has_rule("ip6tables", "-i")
+    })
+}
+
+const LEGACY_KEEP_ALIVE_CRON_MARKER: &str = "/www/cgi-bin/quecmanager/experimental/keep_alive_worker.sh";
+
+pub(crate) fn prune_legacy_crontabs(actions: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let cron_path = "/etc/crontabs/root";
+    let mapped = crate::paths::p(cron_path);
+    let Ok(orig) = fs::read_to_string(&mapped) else {
+        return;
+    };
+    if !orig.contains(LEGACY_KEEP_ALIVE_CRON_MARKER) {
+        return;
+    }
+    let kept: Vec<&str> = orig
+        .lines()
+        .filter(|line| !line.contains(LEGACY_KEEP_ALIVE_CRON_MARKER))
+        .collect();
+    let mut updated = kept.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    match write_atomic(cron_path, &updated, 0o600) {
+        Ok(()) => {
+            actions.push("Pruned legacy keep_alive_worker.sh entry from /etc/crontabs/root".into());
+            let cron_init = crate::paths::p("/etc/init.d/cron");
+            if Path::new(&cron_init).exists() {
+                let _ = Command::new(&cron_init).arg("reload").output();
+            }
+        }
+        Err(e) => warnings.push(format!("prune {cron_path}: {e}")),
     }
 }
 
@@ -1028,5 +1092,48 @@ mod tests {
             "second run must be idempotent: {:?}",
             rep2.actions
         );
+    }
+
+    #[test]
+    fn reconcile_verifies_ipv6_hl_mtu_iface_coverage_and_prunes_legacy_cron() {
+        let env = crate::paths::TestSandbox::new("reconcile-v160");
+        let sh_log = env.root.join("ttl-run.log");
+        env.write(
+            "/etc/firewall.user.ttl",
+            format!(
+                "#!/bin/sh\necho applied >> {}\n# ip6tables -t mangle -A POSTROUTING -o rmnet+ -j HL --hl-set 65\n",
+                sh_log.display()
+            ),
+        );
+        // iptables already has --ttl-set, but ip6tables is missing --hl-set -> must re-apply!
+        env.write_exec(
+            "/bin/iptables",
+            "#!/bin/sh\necho '-A POSTROUTING -o rmnet+ -j TTL --ttl-set 65'\nexit 0\n",
+        );
+        env.write_exec("/bin/ip6tables", "#!/bin/sh\necho '-P POSTROUTING ACCEPT'\nexit 0\n");
+
+        env.write(
+            "/etc/crontabs/root",
+            "*/5 * * * * /usr/sbin/other_job\n* * * * * /www/cgi-bin/quecmanager/experimental/keep_alive_worker.sh\n",
+        );
+
+        let mut actions = Vec::new();
+        let mut warnings = Vec::new();
+        crate::paths::TEST_ENV.sync_scope(env.env(), || {
+            reapply_network_policies(&mut actions, &mut warnings);
+            prune_legacy_crontabs(&mut actions, &mut warnings);
+        });
+        assert!(actions.iter().any(|a| a.contains("firewall.user.ttl")), "{actions:?}");
+        assert!(sh_log.exists(), "missing IPv6 --hl-set must trigger re-applying firewall.user.ttl");
+
+        let cron_after = fs::read_to_string(env.root.join("etc/crontabs/root")).unwrap();
+        assert!(cron_after.contains("/usr/sbin/other_job"));
+        assert!(!cron_after.contains("keep_alive_worker.sh"));
+        assert!(actions.iter().any(|a| a.contains("keep_alive_worker.sh")));
+
+        let s0 = build_mtu_firewall_script(&["rmnet_data0".into()], 1428);
+        assert!(mtu_script_covers_ifaces(&s0, &["rmnet_data0".into()]));
+        assert!(!mtu_script_covers_ifaces(&s0, &["rmnet_data0".into(), "rmnet_data1".into()]));
+        assert!(!mtu_script_covers_ifaces(&s0, &["rmnet_data1".into()]));
     }
 }

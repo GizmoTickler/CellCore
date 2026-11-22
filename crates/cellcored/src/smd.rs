@@ -17,6 +17,8 @@ pub const DEFAULT_SMD_DEVICE: &str = "/dev/smd11";
 pub const FALLBACK_SMD_DEVICE: &str = "/dev/smd7";
 /// Consecutive failed `QMRESYNC` cycles before closing & reopening the serial fd (~90s wedged).
 pub const MAX_CONSECUTIVE_RESYNC_FAILURES: u32 = 3;
+/// Maximum buffered partial bytes in [`Framer::pending`] before dropping and forcing resync.
+pub const MAX_FRAMER_PENDING: usize = 64 * 1024;
 
 /// Long commands that have run at least this long yield to Emergency work.
 pub const PREEMPT_GRACE: Duration = Duration::from_secs(2);
@@ -183,7 +185,12 @@ pub struct SmdClient {
 impl SmdClient {
     pub fn spawn(device: impl Into<String>) -> Self {
         let device = device.into();
-        Self::spawn_with_opener(Box::new(move || open_device_with_fallback(&device)))
+        let mut attempt = 0usize;
+        Self::spawn_with_opener(Box::new(move || {
+            let res = open_device_rotating(&device, attempt);
+            attempt = attempt.wrapping_add(1);
+            res
+        }))
     }
 
     /// Spawn the AT actor on an arbitrary fd source (tests use a socketpair).
@@ -212,6 +219,7 @@ impl SmdClient {
             echo_restore_refused_gen: None,
             unresponsive: false,
             consecutive_resync_failures: 0,
+            consecutive_timeouts: 0,
         };
         tokio::spawn(actor.run());
         Self {
@@ -521,6 +529,8 @@ struct Current {
 #[derive(Default)]
 pub struct Framer {
     pending: Vec<u8>,
+    pending_pos: usize,
+    overflowed: bool,
     stale: VecDeque<Instant>,
     echo: Option<bool>,
     current: Option<Current>,
@@ -594,7 +604,7 @@ impl Framer {
     /// `STALE_TTL` expires, when a reply is credited to it, or when a resync
     /// completes; see [`Framer::start_sync`] for what a resync guarantees.)
     pub fn in_sync(&self) -> bool {
-        self.sync.is_none() && self.stale.is_empty()
+        !self.overflowed && self.sync.is_none() && self.stale.is_empty()
     }
 
     pub fn syncing(&self) -> bool {
@@ -643,6 +653,7 @@ impl Framer {
     /// echo is miscounted.
     pub fn start_sync(&mut self, probe: &str) {
         self.current = None;
+        self.overflowed = false;
         self.sync = Some(SyncProbe {
             token: probe.trim().to_ascii_uppercase(),
             fence: Fence::None,
@@ -695,6 +706,22 @@ impl Framer {
     /// Drop any buffered partial line (idle URC noise) before a new command.
     pub fn clear_partial(&mut self) {
         self.pending.clear();
+        self.pending_pos = 0;
+    }
+
+    fn compact_pending(&mut self) {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        } else if self.pending_pos >= 4096 {
+            self.pending.drain(..self.pending_pos);
+            self.pending_pos = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len().saturating_sub(self.pending_pos)
     }
 
     /// The current command will not be waited for any longer. Its final
@@ -712,24 +739,48 @@ impl Framer {
     }
 
     /// Feed bytes; returns `Some((ok, raw))` once the current command's
-    /// response is complete.
+    /// response is complete. Caps unread buffer at [`MAX_FRAMER_PENDING`]
+    /// (dropping buffered noise and forcing a resync on overflow) and uses a
+    /// read cursor for O(N) scanning.
     pub fn feed(&mut self, bytes: &[u8]) -> Option<(bool, String)> {
+        if self.pending_pos > 0 && self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        let unread = self.pending.len().saturating_sub(self.pending_pos);
+        if unread.saturating_add(bytes.len()) > MAX_FRAMER_PENDING {
+            self.pending.clear();
+            self.pending_pos = 0;
+            self.overflowed = true;
+            return None;
+        }
         self.pending.extend_from_slice(bytes);
-        loop {
-            let pos = self.pending.iter().position(|&b| b == b'\n' || b == b'\r')?;
-            let line_bytes: Vec<u8> = self.pending.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).to_string();
+        while let Some(rel) = self.pending[self.pending_pos..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+        {
+            let line_end = self.pending_pos + rel;
+            let term = self.pending[line_end];
+            let line = String::from_utf8_lossy(&self.pending[self.pending_pos..line_end]).into_owned();
+            self.pending_pos = line_end + 1;
+            if term == b'\r' && self.pending.get(self.pending_pos) == Some(&b'\n') {
+                self.pending_pos += 1;
+            }
             if let Some(done) = self.process_line(&line) {
+                self.compact_pending();
                 return Some(done);
             }
         }
+        self.compact_pending();
+        None
     }
 
     /// True when the unterminated tail of the buffer is an SMS `>` prompt.
     fn take_prompt(&mut self) -> bool {
-        let tail = String::from_utf8_lossy(&self.pending).to_string();
+        let tail = String::from_utf8_lossy(&self.pending[self.pending_pos..]).to_string();
         if tail.trim_start().starts_with('>') {
             self.pending.clear();
+            self.pending_pos = 0;
             return true;
         }
         false
@@ -918,23 +969,52 @@ pub fn open_device_fd(device: &str) -> Result<RawFd, String> {
     Ok(fd)
 }
 
-/// Open the primary SMD AT port, falling back to `/dev/smd7` on real hardware if the
-/// primary node (typically `/dev/smd11`) cannot be opened.
-pub fn open_device_with_fallback(device: &str) -> Result<RawFd, String> {
-    match open_device_fd(device) {
-        Ok(fd) => Ok(fd),
-        Err(primary_err) => {
-            let fallback = crate::paths::p(FALLBACK_SMD_DEVICE);
-            if device != fallback
-                && device != FALLBACK_SMD_DEVICE
-                && let Ok(fd) = open_device_fd(&fallback)
-            {
-                eprintln!("cellcored: {primary_err}; opened fallback {fallback}");
+/// Return ordered SMD device candidates for `attempt`, alternating between
+/// `/dev/smd11` and `/dev/smd7` across reopens so a wedged SMD channel fails
+/// over to the peer port instead of retrying the same wedged node forever.
+pub(crate) fn smd_device_candidates(primary: &str, attempt: usize) -> Vec<String> {
+    let default_mapped = crate::paths::p(DEFAULT_SMD_DEVICE);
+    let fallback_mapped = crate::paths::p(FALLBACK_SMD_DEVICE);
+    let alternate = if primary == fallback_mapped || primary == FALLBACK_SMD_DEVICE {
+        default_mapped
+    } else {
+        fallback_mapped
+    };
+    if alternate == primary {
+        return vec![primary.to_string()];
+    }
+    if attempt.is_multiple_of(2) {
+        vec![primary.to_string(), alternate]
+    } else {
+        vec![alternate, primary.to_string()]
+    }
+}
+
+/// Open an SMD AT port using rotating failover candidates (`/dev/smd11` ↔ `/dev/smd7`).
+pub fn open_device_rotating(primary: &str, attempt: usize) -> Result<RawFd, String> {
+    let candidates = smd_device_candidates(primary, attempt);
+    let mut last_err = None;
+    for (idx, dev) in candidates.iter().enumerate() {
+        match open_device_fd(dev) {
+            Ok(fd) => {
+                if idx > 0 || (attempt > 0 && dev != primary) {
+                    eprintln!("cellcored: opened SMD port {dev} (attempt {attempt}, primary {primary})");
+                }
                 return Ok(fd);
             }
-            Err(primary_err)
+            Err(e) => {
+                last_err = Some(e);
+            }
         }
     }
+    Err(last_err.unwrap_or_else(|| format!("Failed to open {primary}")))
+}
+
+/// Open the primary SMD AT port, falling back to `/dev/smd7` on real hardware if the
+/// primary node (typically `/dev/smd11`) cannot be opened.
+#[allow(dead_code)]
+pub fn open_device_with_fallback(device: &str) -> Result<RawFd, String> {
+    open_device_rotating(device, 0)
 }
 
 fn write_all_fd(fd: RawFd, data: &[u8]) -> Result<(), String> {
@@ -1135,6 +1215,8 @@ struct Actor {
     /// Consecutive resync timeouts on the current open fd. At `>= MAX_CONSECUTIVE_RESYNC_FAILURES`,
     /// the fd is treated as wedged and reopened via `mark_broken`.
     consecutive_resync_failures: u32,
+    /// Consecutive AT command timeouts in `send_and_wait` on the current open fd.
+    consecutive_timeouts: u32,
 }
 
 enum WaitOutcome {
@@ -1264,6 +1346,7 @@ impl Actor {
                 self.probe_sent = None;
                 self.unresponsive = false;
                 self.consecutive_resync_failures = 0;
+                self.consecutive_timeouts = 0;
                 // A fresh start: a pending echo restore is tried again.
                 self.sync_gen += 1;
                 self.healthy.store(true, AtomicOrdering::Relaxed);
@@ -1341,6 +1424,7 @@ impl Actor {
         self.probe_sent = None;
         self.unresponsive = false;
         self.consecutive_resync_failures = 0;
+        self.consecutive_timeouts = 0;
         self.healthy.store(false, AtomicOrdering::Relaxed);
         format!("Broken SMD stream: {err}")
     }
@@ -1724,7 +1808,7 @@ impl Actor {
         self.framer.begin(command);
         if let Err(e) = self.write_raw(format!("{command}\r\n").into_bytes()).await {
             self.framer.abandon(Instant::now() + STALE_TTL);
-            return Err(e);
+            return Err(self.mark_broken(&e));
         }
         match self.wait_response(deadline, preempt, false).await {
             WaitOutcome::Done(ok, raw) => {
@@ -1732,6 +1816,7 @@ impl Actor {
                 // channel answers.
                 self.unresponsive = false;
                 self.consecutive_resync_failures = 0;
+                self.consecutive_timeouts = 0;
                 self.healthy.store(true, AtomicOrdering::Relaxed);
                 Ok(make_response(command, ok, raw, started))
             }
@@ -1741,6 +1826,10 @@ impl Actor {
                 // Return at the caller's deadline. Whatever this command still
                 // prints is consumed by the resync that precedes the next one.
                 self.framer.abandon(Instant::now() + STALE_TTL);
+                self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+                if self.consecutive_timeouts >= MAX_CONSECUTIVE_RESYNC_FAILURES {
+                    let _ = self.mark_broken("consecutive AT command timeouts");
+                }
                 Err(format!("AT command timed out ({command})"))
             }
             WaitOutcome::Preempted => {
@@ -1765,12 +1854,18 @@ impl Actor {
         match self.resync(tokio::time::Instant::now() + timeout, None).await {
             Ok(()) => {}
             Err(WaitOutcome::Broken(e)) => return Err(self.mark_broken(&e)),
-            Err(_) => return Err("Timed out waiting for SMS > prompt: AT channel did not resync".into()),
+            Err(_) => {
+                if self.consecutive_resync_failures >= MAX_CONSECUTIVE_RESYNC_FAILURES {
+                    let _ = self.mark_broken("consecutive QMRESYNC probes failed");
+                }
+                return Err("Timed out waiting for SMS > prompt: AT channel did not resync".into());
+            }
         }
         let started = Instant::now();
         self.framer.begin(cmgs_cmd);
-        if let Some(p) = self.port.as_ref() {
-            p.write(format!("{cmgs_cmd}\r").into_bytes()).await?;
+        if let Err(e) = self.write_raw(format!("{cmgs_cmd}\r").into_bytes()).await {
+            self.framer.abandon(Instant::now() + STALE_TTL);
+            return Err(self.mark_broken(&e));
         }
         let prompt_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         match self.wait_response(prompt_deadline, None, true).await {
@@ -1778,17 +1873,16 @@ impl Actor {
             WaitOutcome::Done(ok, raw) => return Ok(make_response(cmgs_cmd, ok, raw, started)),
             WaitOutcome::Broken(e) => return Err(self.mark_broken(&e)),
             WaitOutcome::TimedOut | WaitOutcome::Preempted => {
-                if let Some(p) = self.port.as_ref() {
-                    let _ = p.write(vec![0x1b]).await;
-                }
+                let _ = self.write_raw(vec![0x1b]).await;
                 self.framer.abandon(Instant::now() + STALE_TTL);
                 let _ = self.drain_until_quiet().await;
                 return Err("Timed out waiting for SMS > prompt".into());
             }
         }
         self.framer.begin_pdu_body(hex_pdu);
-        if let Some(p) = self.port.as_ref() {
-            p.write(format!("{hex_pdu}\x1a").into_bytes()).await?;
+        if let Err(e) = self.write_raw(format!("{hex_pdu}\x1a").into_bytes()).await {
+            self.framer.abandon(Instant::now() + STALE_TTL);
+            return Err(self.mark_broken(&e));
         }
         let deadline = tokio::time::Instant::now() + timeout;
         match self.wait_response(deadline, None, false).await {
@@ -3203,6 +3297,75 @@ mod tests {
             .expect("reopened port 2 should answer");
         assert!(recovered.ok);
         assert!(recovered.body.contains("+CFUN: 1"));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn framer_caps_pending_at_64kib_and_cursor_scans_cleanly() {
+        let mut f = Framer::default();
+        f.begin("AT+TEST");
+        // Feed many lines in one chunk to exercise cursor scanning
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"AT+TEST\r\n");
+        for i in 0..200 {
+            chunk.extend_from_slice(format!("+DATA: {i}\r\n").as_bytes());
+        }
+        chunk.extend_from_slice(b"OK\r\n");
+        let (ok, raw) = f.feed(&chunk).expect("response parsed");
+        assert!(ok);
+        assert!(raw.contains("+DATA: 199"));
+        assert_eq!(f.pending_len(), 0);
+        assert!(f.in_sync());
+
+        // Overflow (> 64 KiB without line terminator) drops buffer and forces resync
+        let noise = vec![b'X'; MAX_FRAMER_PENDING + 128];
+        assert!(f.feed(&noise).is_none());
+        assert_eq!(f.pending_len(), 0);
+        assert!(!f.in_sync(), "overflow must force resync");
+
+        // Starting and completing a sync probe clears the overflow flag
+        f.start_sync("AT+QMRESYNC=42");
+        let _ = f.feed(b"AT+QMRESYNC=42\r\nERROR\r\n");
+        assert!(f.in_sync());
+    }
+
+    #[test]
+    fn smd_device_candidates_rotate_between_smd11_and_smd7() {
+        let c0 = smd_device_candidates(DEFAULT_SMD_DEVICE, 0);
+        assert_eq!(c0, vec![DEFAULT_SMD_DEVICE.to_string(), FALLBACK_SMD_DEVICE.to_string()]);
+        let c1 = smd_device_candidates(DEFAULT_SMD_DEVICE, 1);
+        assert_eq!(c1, vec![FALLBACK_SMD_DEVICE.to_string(), DEFAULT_SMD_DEVICE.to_string()]);
+        let c2 = smd_device_candidates(DEFAULT_SMD_DEVICE, 2);
+        assert_eq!(c2, vec![DEFAULT_SMD_DEVICE.to_string(), FALLBACK_SMD_DEVICE.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn write_failure_marks_port_broken_and_reopens() {
+        let (a1, b1) = socketpair();
+        let (a2, b2) = socketpair();
+        // Close peer b1 immediately so writes to a1 fail with EPIPE/ECONNRESET
+        unsafe { libc::close(b1) };
+        let _t2 = fake_modem(b2, true, Box::new(|_| vec![(0, "+CFUN: 1\r\nOK\r\n".into())]));
+
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opens_cl = opens.clone();
+        let fds = std::sync::Mutex::new(VecDeque::from([a1, a2]));
+        let client = SmdClient::spawn_with_opener(Box::new(move || {
+            opens_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fds.lock().unwrap().pop_front().ok_or_else(|| "no more fds".into())
+        }));
+
+        let err = client
+            .exec("AT+CFUN?", Priority::Interactive, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Broken"), "write/read failure must mark broken: {err}");
+
+        let ok = client
+            .exec("AT+CFUN?", Priority::Interactive, Duration::from_secs(1))
+            .await
+            .expect("second call must reopen onto healthy port");
+        assert!(ok.ok);
         assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

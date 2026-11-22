@@ -24,6 +24,7 @@ use super::{
 use crate::http::HttpCtx;
 
 pub const CONFIRM_SECS: u64 = 90;
+pub const FW_ROLLBACK_PENDING_PATH: &str = "/etc/cellcore/fw-rollback.pending";
 const MAX_FILE: usize = 64 * 1024;
 
 // ── read model ──────────────────────────────────────────────────────────────
@@ -167,6 +168,103 @@ async fn fw_reload(fw: &str) -> Result<(), String> {
     if out.ok() { Ok(()) } else { Err(out.err_summary(&format!("{fw} reload"))) }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedFwRollback {
+    token: String,
+    summary: String,
+    snapshot: String,
+    created_at: u64,
+}
+
+fn persist_pending_rollback(token: &str, summary: &str, snapshot: &str) -> Result<(), String> {
+    let rec = PersistedFwRollback {
+        token: token.to_string(),
+        summary: summary.to_string(),
+        snapshot: snapshot.to_string(),
+        created_at: crate::auth::now_secs(),
+    };
+    crate::state::save_json_atomic(FW_ROLLBACK_PENDING_PATH, &rec, 0o600)
+}
+
+fn clear_pending_rollback_file() {
+    let _ = std::fs::remove_file(crate::paths::p(FW_ROLLBACK_PENDING_PATH));
+}
+
+/// Auto-restore any unconfirmed firewall commit-confirm rollback persisted on
+/// disk before a crash, restart, or power loss. Called during daemon boot
+/// reconcile so an unconfirmed lockout change can never survive a restart.
+pub fn restore_pending_rollback_blocking(actions: &mut Vec<String>, warnings: &mut Vec<String>) -> bool {
+    let mapped = crate::paths::p(FW_ROLLBACK_PENDING_PATH);
+    let path = std::path::Path::new(&mapped);
+    if !path.exists() {
+        return false;
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!("read {FW_ROLLBACK_PENDING_PATH}: {e}"));
+            return false;
+        }
+    };
+    let rec: PersistedFwRollback = match serde_json::from_str(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            warnings.push(format!("corrupt {FW_ROLLBACK_PENDING_PATH} ({e}); removing"));
+            let _ = std::fs::remove_file(path);
+            return false;
+        }
+    };
+
+    let _ = crate::uci::run_cmd_blocking("uci", &["revert", "firewall"]);
+    let uci_mapped = crate::paths::p("/bin/uci");
+    let uci_bin = if std::path::Path::new(&uci_mapped).exists() {
+        uci_mapped
+    } else {
+        "uci".to_string()
+    };
+    let mut import_cmd = std::process::Command::new(&uci_bin);
+    import_cmd
+        .args(["import", "firewall"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let imported = match import_cmd.spawn() {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(rec.snapshot.as_bytes());
+            }
+            child.wait_with_output().is_ok_and(|o| o.status.success())
+        }
+        Err(e) => {
+            warnings.push(format!("firewall startup rollback uci import spawn: {e}"));
+            false
+        }
+    };
+    if !imported {
+        warnings.push(format!(
+            "Failed to import persisted firewall rollback snapshot ({})",
+            rec.summary
+        ));
+        return false;
+    }
+    if let Err(e) = crate::uci::run_cmd_blocking("uci", &["commit", "firewall"]) {
+        warnings.push(format!("firewall startup rollback uci commit: {e}"));
+        return false;
+    }
+    let fw = detect_firewall_bin();
+    if let Err(e) = crate::uci::run_cmd_blocking(fw, &["reload"]) {
+        warnings.push(format!("firewall startup rollback {fw} reload: {e}"));
+    }
+    let _ = std::fs::remove_file(path);
+    actions.push(format!(
+        "Auto-restored unconfirmed firewall rollback via {fw}: {}",
+        rec.summary
+    ));
+    true
+}
+
 /// Restore the snapshot behind `token` (if it is still pending).
 async fn rollback(ctx: &HttpCtx, token: &str, why: &str) -> Result<bool, String> {
     let _g = mutate_lock().await;
@@ -181,6 +279,7 @@ async fn rollback(ctx: &HttpCtx, token: &str, why: &str) -> Result<bool, String>
     ucicfg::restore_snapshot("firewall", &p.snapshot).await?;
     let fw = detect_firewall_bin();
     let r = fw_reload(fw).await;
+    clear_pending_rollback_file();
     audit(ctx, format!("firewall change rolled back via {fw} ({why}): {}", p.summary));
     r.map(|_| true)
 }
@@ -195,18 +294,27 @@ async fn apply_with_confirm(ctx: &HttpCtx, new_type: Option<&str>, ops: Vec<Op>,
         Ok(s) => s,
         Err(e) => return server(e),
     };
+    let token = new_token();
+    if let Err(e) = persist_pending_rollback(&token, &summary, &snapshot) {
+        return server(format!("persist firewall rollback snapshot: {e}"));
+    }
     let new_id = match ucicfg::apply("firewall", new_type, ops).await {
         Ok(id) => id,
-        Err(e) => return server(e),
+        Err(e) => {
+            clear_pending_rollback_file();
+            return server(e);
+        }
     };
     let fw = detect_firewall_bin();
     if let Err(e) = fw_reload(fw).await {
         let rb = ucicfg::restore_snapshot("firewall", &snapshot).await;
         let _ = fw_reload(fw).await;
+        if rb.is_ok() {
+            clear_pending_rollback_file();
+        }
         audit(ctx, format!("firewall change rejected by {fw}, restored ({:?}): {summary}", rb.is_ok()));
         return server(format!("{fw} rejected the change, previous rules restored: {e}"));
     }
-    let token = new_token();
     if let Ok(mut p) = pending().lock() {
         *p = Some(Pending {
             token: token.clone(),
@@ -242,6 +350,7 @@ pub async fn post_confirm(State(ctx): State<HttpCtx>, Json(req): Json<TokenReq>)
         Some(p) if p.token == req.token => {
             let s = g.take().map(|p| p.summary).unwrap_or_default();
             drop(g);
+            clear_pending_rollback_file();
             audit(&ctx, format!("firewall change confirmed: {s}"));
             ok(serde_json::json!({ "status": "ok" }))
         }
@@ -650,6 +759,14 @@ pub fn zone_ops(r: &ZoneReq) -> Result<Vec<Op>, String> {
     ])
 }
 
+/// Any zone whose name or network list includes `"lan"` (including SDX75's `lan_wan`)
+/// carries management UI/SSH traffic and requires typed `LOCKOUT` confirmation before
+/// changing input/output policies away from `ACCEPT`.
+pub fn is_lan_protected_zone(zname: &str, networks: &[String]) -> bool {
+    zname.to_ascii_lowercase().contains("lan")
+        || networks.iter().any(|n| n.to_ascii_lowercase().contains("lan"))
+}
+
 pub async fn post_zone(State(ctx): State<HttpCtx>, Json(req): Json<ZoneReq>) -> Response {
     let s = match ucicfg::show("firewall").await {
         Ok(s) => s,
@@ -660,11 +777,12 @@ pub async fn post_zone(State(ctx): State<HttpCtx>, Json(req): Json<ZoneReq>) -> 
         Err(r) => return r,
     };
     let zname = sec.get_or("name", &req.id).to_string();
+    let znetworks = sec.list("network");
     let ops = match zone_ops(&req) {
         Ok(o) => o,
         Err(e) => return bad(e),
     };
-    if zname == "lan"
+    if is_lan_protected_zone(&zname, &znetworks)
         && (req.input.trim() != "ACCEPT" || req.output.trim() != "ACCEPT")
         && let Err(r) = require_confirm(
             req.confirm.as_deref(),
@@ -978,5 +1096,58 @@ mod tests {
         assert!(forwarding_ops(&ForwardingReq { src: "lan".into(), dest: "wan".into(), enabled: None }, &names(), &existing).is_err());
         assert!(forwarding_ops(&ForwardingReq { src: "lan".into(), dest: "lan".into(), enabled: None }, &names(), &existing).is_err());
         assert!(forwarding_ops(&ForwardingReq { src: "nope".into(), dest: "wan".into(), enabled: None }, &names(), &existing).is_err());
+    }
+
+    #[test]
+    fn protects_all_lan_zones_including_lan_wan() {
+        assert!(is_lan_protected_zone("lan", &[]));
+        assert!(is_lan_protected_zone("lan_wan", &[]));
+        assert!(is_lan_protected_zone("LAN_MGMT", &[]));
+        assert!(is_lan_protected_zone("custom", &["lan".into()]));
+        assert!(!is_lan_protected_zone("wan", &["wan".into(), "wan_v6".into()]));
+        assert!(!is_lan_protected_zone("swip", &[]));
+    }
+
+    #[test]
+    fn startup_restores_persisted_fw_rollback_pending_file() {
+        let env = crate::paths::TestSandbox::new("fw-rb-persist");
+        let uci_log = env.root.join("uci.log");
+        let imported_file = env.root.join("imported.uci");
+        let fw_log = env.root.join("fw.log");
+        env.write_exec(
+            "/bin/uci",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"import\" ]; then cat > {}; fi\nexit 0\n",
+                uci_log.display(),
+                imported_file.display()
+            ),
+        );
+        env.write_exec(
+            "/bin/fw4",
+            &format!("#!/bin/sh\necho \"fw4 $*\" >> {}\nexit 0\n", fw_log.display()),
+        );
+        env.write("/sbin/fw4", "");
+
+        crate::paths::TEST_ENV.sync_scope(env.env(), || {
+            persist_pending_rollback("tok123", "update zone lan_wan", "package firewall\nconfig defaults\n")
+                .unwrap();
+            let pending_path = std::path::PathBuf::from(crate::paths::p(FW_ROLLBACK_PENDING_PATH));
+            assert!(pending_path.exists());
+
+            let mut actions = Vec::new();
+            let mut warnings = Vec::new();
+            assert!(restore_pending_rollback_blocking(&mut actions, &mut warnings));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(!pending_path.exists(), "pending rollback file must be removed after restore");
+            assert_eq!(
+                std::fs::read_to_string(&imported_file).unwrap(),
+                "package firewall\nconfig defaults\n"
+            );
+            let uci_calls = std::fs::read_to_string(&uci_log).unwrap();
+            assert!(uci_calls.contains("import firewall"));
+            assert!(uci_calls.contains("commit firewall"));
+            assert_eq!(std::fs::read_to_string(&fw_log).unwrap().trim(), "fw4 reload");
+            assert!(actions.iter().any(|a| a.contains("Auto-restored unconfirmed firewall rollback")));
+        });
     }
 }

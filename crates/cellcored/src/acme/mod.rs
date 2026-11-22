@@ -188,16 +188,12 @@ pub struct ActiveCertInfo {
 }
 
 pub fn load_config() -> AcmeConfig {
-    let path = crate::paths::p(ACME_CONFIG_PATH);
-    fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    crate::state::load_json_or_default(ACME_CONFIG_PATH)
 }
 
 pub fn save_config(cfg: &AcmeConfig) -> Result<(), String> {
     let raw = serde_json::to_vec_pretty(cfg).map_err(|e| format!("serialize acme config: {e}"))?;
-    atomic_write(Path::new(&crate::paths::p(ACME_CONFIG_PATH)), &raw, 0o600)
+    atomic_write(Path::new(ACME_CONFIG_PATH), &raw, 0o600)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,42 +482,69 @@ async fn acme_http(method: &str, url: &str, body: Option<&str>) -> Result<AcmeHt
     })
 }
 
+pub(crate) fn is_acme_bad_nonce(status: u16, body: &str) -> bool {
+    status == 400 && body.contains("urn:ietf:params:acme:error:badNonce")
+}
+
+pub(crate) fn is_acme_account_not_found(status: u16, body: &str) -> bool {
+    (status == 400 || status == 404)
+        && body.contains("urn:ietf:params:acme:error:accountDoesNotExist")
+}
+
 async fn post_jws(
     key_path: &Path,
     url: &str,
+    new_nonce_url: &str,
     nonce: &mut String,
     kid: Option<&str>,
     jwk: Option<&serde_json::Value>,
     payload: Option<&serde_json::Value>,
 ) -> Result<AcmeHttpResp, String> {
-    let mut protected = serde_json::json!({
-        "alg": "ES256",
-        "nonce": nonce.as_str(),
-        "url": url,
-    });
-    if let Some(k) = kid {
-        protected["kid"] = serde_json::json!(k);
-    } else if let Some(j) = jwk {
-        protected["jwk"] = j.clone();
+    for attempt in 0..=2u8 {
+        let mut protected = serde_json::json!({
+            "alg": "ES256",
+            "nonce": nonce.as_str(),
+            "url": url,
+        });
+        if let Some(k) = kid {
+            protected["kid"] = serde_json::json!(k);
+        } else if let Some(j) = jwk {
+            protected["jwk"] = j.clone();
+        }
+        let prot_b64 = b64url(protected.to_string().as_bytes());
+        let pay_b64 = match payload {
+            Some(p) => b64url(p.to_string().as_bytes()),
+            None => String::new(), // POST-as-GET (RFC 8555 §6.3)
+        };
+        let signing_input = format!("{prot_b64}.{pay_b64}");
+        let sig = sign_es256(key_path, signing_input.as_bytes()).await?;
+        let body = serde_json::json!({
+            "protected": prot_b64,
+            "payload": pay_b64,
+            "signature": sig,
+        })
+        .to_string();
+        let resp = acme_http("POST", url, Some(&body)).await?;
+        if let Some(n) = &resp.nonce {
+            *nonce = n.clone();
+        }
+        if is_acme_bad_nonce(resp.status, &resp.body) && attempt < 2 {
+            if resp.nonce.is_none()
+                && let Ok(nr) = acme_http("HEAD", new_nonce_url, None).await
+                && let Some(fresh) = nr.nonce
+            {
+                *nonce = fresh;
+            }
+            append_log(format!(
+                "ACME badNonce on {url}; retrying ({}/2) with fresh Replay-Nonce",
+                attempt + 1
+            ))
+            .await;
+            continue;
+        }
+        return Ok(resp);
     }
-    let prot_b64 = b64url(protected.to_string().as_bytes());
-    let pay_b64 = match payload {
-        Some(p) => b64url(p.to_string().as_bytes()),
-        None => String::new(), // POST-as-GET (RFC 8555 §6.3)
-    };
-    let signing_input = format!("{prot_b64}.{pay_b64}");
-    let sig = sign_es256(key_path, signing_input.as_bytes()).await?;
-    let body = serde_json::json!({
-        "protected": prot_b64,
-        "payload": pay_b64,
-        "signature": sig,
-    })
-    .to_string();
-    let resp = acme_http("POST", url, Some(&body)).await?;
-    if let Some(n) = &resp.nonce {
-        *nonce = n.clone();
-    }
-    Ok(resp)
+    unreachable!()
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +738,48 @@ pub async fn issue_certificate(mut cfg: AcmeConfig) -> Result<String, String> {
     result
 }
 
+async fn register_acme_account(
+    cfg: &mut AcmeConfig,
+    acct_key_path: &Path,
+    new_account_url: &str,
+    new_nonce_url: &str,
+    nonce: &mut String,
+    jwk: &serde_json::Value,
+    acct_cache_key: &str,
+) -> Result<String, String> {
+    append_log("Registering ACME account...").await;
+    let mut payload = serde_json::json!({ "termsOfServiceAgreed": true });
+    if !cfg.email.trim().is_empty() {
+        payload["contact"] = serde_json::json!([format!("mailto:{}", cfg.email.trim())]);
+    }
+    if !cfg.eab_kid.trim().is_empty() && !cfg.eab_hmac_key.trim().is_empty() {
+        let eab = build_eab_jws(&cfg.eab_kid, &cfg.eab_hmac_key, new_account_url, jwk)?;
+        payload["externalAccountBinding"] = eab;
+    } else if cfg.issuer.requires_eab() {
+        return Err(format!(
+            "Issuer '{}' requires External Account Binding (EAB Key ID + HMAC Key)",
+            cfg.issuer.key_tag()
+        ));
+    }
+    let resp = post_jws(
+        acct_key_path,
+        new_account_url,
+        new_nonce_url,
+        nonce,
+        None,
+        Some(jwk),
+        Some(&payload),
+    )
+    .await?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("ACME newAccount failed (HTTP {}): {}", resp.status, resp.body));
+    }
+    let loc = resp.location.ok_or("ACME newAccount missing Location header")?;
+    cfg.account_urls.insert(acct_cache_key.to_string(), loc.clone());
+    let _ = save_config(cfg);
+    Ok(loc)
+}
+
 async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, String> {
     append_log(format!("Fetching ACME directory: {dir_url}")).await;
     let dir_resp = acme_http("GET", dir_url, None).await?;
@@ -739,50 +804,66 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
 
     // Register or locate ACME account
     let acct_cache_key = format!("{}|{}", cfg.issuer.key_tag(), dir_url);
-    let kid = if let Some(cached) = cfg.account_urls.get(&acct_cache_key).filter(|u| !u.is_empty()) {
+    let mut used_cached_acct = false;
+    let mut kid = if let Some(cached) = cfg.account_urls.get(&acct_cache_key).filter(|u| !u.is_empty()) {
         append_log("Reusing existing ACME account registration").await;
+        used_cached_acct = true;
         cached.clone()
     } else {
-        append_log("Registering ACME account...").await;
-        let mut payload = serde_json::json!({ "termsOfServiceAgreed": true });
-        if !cfg.email.trim().is_empty() {
-            payload["contact"] = serde_json::json!([format!("mailto:{}", cfg.email.trim())]);
-        }
-        if !cfg.eab_kid.trim().is_empty() && !cfg.eab_hmac_key.trim().is_empty() {
-            let eab = build_eab_jws(&cfg.eab_kid, &cfg.eab_hmac_key, new_account_url, &jwk)?;
-            payload["externalAccountBinding"] = eab;
-        } else if cfg.issuer.requires_eab() {
-            return Err(format!(
-                "Issuer '{}' requires External Account Binding (EAB Key ID + HMAC Key)",
-                cfg.issuer.key_tag()
-            ));
-        }
-        let resp = post_jws(&acct_key_path, new_account_url, &mut nonce, None, Some(&jwk), Some(&payload)).await?;
-        if !(200..300).contains(&resp.status) {
-            return Err(format!("ACME newAccount failed (HTTP {}): {}", resp.status, resp.body));
-        }
-        let loc = resp.location.ok_or("ACME newAccount missing Location header")?;
-        cfg.account_urls.insert(acct_cache_key, loc.clone());
-        let _ = save_config(cfg);
-        loc
+        register_acme_account(
+            cfg,
+            &acct_key_path,
+            new_account_url,
+            new_nonce_url,
+            &mut nonce,
+            &jwk,
+            &acct_cache_key,
+        )
+        .await?
     };
 
-    // Create new order
+    // Create new order (re-registering if cached account was pruned by CA)
     let identifiers: Vec<serde_json::Value> = cfg
         .domains
         .iter()
         .map(|d| serde_json::json!({ "type": "dns", "value": d.trim() }))
         .collect();
     append_log(format!("Creating order for {} domain(s)...", identifiers.len())).await;
-    let order_resp = post_jws(
+    let mut order_resp = post_jws(
         &acct_key_path,
         new_order_url,
+        new_nonce_url,
         &mut nonce,
         Some(&kid),
         None,
         Some(&serde_json::json!({ "identifiers": identifiers })),
     )
     .await?;
+    if used_cached_acct && is_acme_account_not_found(order_resp.status, &order_resp.body) {
+        append_log("ACME server returned accountDoesNotExist; clearing cached account URL and re-registering").await;
+        cfg.account_urls.remove(&acct_cache_key);
+        let _ = save_config(cfg);
+        kid = register_acme_account(
+            cfg,
+            &acct_key_path,
+            new_account_url,
+            new_nonce_url,
+            &mut nonce,
+            &jwk,
+            &acct_cache_key,
+        )
+        .await?;
+        order_resp = post_jws(
+            &acct_key_path,
+            new_order_url,
+            new_nonce_url,
+            &mut nonce,
+            Some(&kid),
+            None,
+            Some(&serde_json::json!({ "identifiers": identifiers })),
+        )
+        .await?;
+    }
     if !(200..300).contains(&order_resp.status) {
         return Err(format!("ACME newOrder failed (HTTP {}): {}", order_resp.status, order_resp.body));
     }
@@ -807,7 +888,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
     };
 
     for authz_url in &authzs {
-        let ar = post_jws(&acct_key_path, authz_url, &mut nonce, Some(&kid), None, None).await?;
+        let ar = post_jws(&acct_key_path, authz_url, new_nonce_url, &mut nonce, Some(&kid), None, None).await?;
         let aj: serde_json::Value = serde_json::from_str(&ar.body)
             .map_err(|e| format!("parse authz JSON: {e}"))?;
         let domain = aj["identifier"]["value"].as_str().unwrap_or("unknown").to_string();
@@ -848,6 +929,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
             let tr = post_jws(
                 &acct_key_path,
                 &ch_url,
+                new_nonce_url,
                 &mut nonce,
                 Some(&kid),
                 None,
@@ -859,7 +941,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
             }
             for _ in 0..30 {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                let pr = post_jws(&acct_key_path, authz_url, &mut nonce, Some(&kid), None, None).await?;
+                let pr = post_jws(&acct_key_path, authz_url, new_nonce_url, &mut nonce, Some(&kid), None, None).await?;
                 let pj: serde_json::Value = serde_json::from_str(&pr.body).unwrap_or_default();
                 match pj["status"].as_str() {
                     Some("valid") => {
@@ -892,6 +974,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
     let fin_resp = post_jws(
         &acct_key_path,
         &finalize_url,
+        new_nonce_url,
         &mut nonce,
         Some(&kid),
         None,
@@ -912,7 +995,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let or = post_jws(&acct_key_path, &order_url, &mut nonce, Some(&kid), None, None).await?;
+        let or = post_jws(&acct_key_path, &order_url, new_nonce_url, &mut nonce, Some(&kid), None, None).await?;
         let oj: serde_json::Value = serde_json::from_str(&or.body).unwrap_or_default();
         match oj["status"].as_str() {
             Some("valid") => {
@@ -927,7 +1010,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
     let cert_url = cert_url.ok_or("Timed out waiting for ACME certificate issuance")?;
 
     append_log("Downloading issued certificate chain...").await;
-    let cert_resp = post_jws(&acct_key_path, &cert_url, &mut nonce, Some(&kid), None, None).await?;
+    let cert_resp = post_jws(&acct_key_path, &cert_url, new_nonce_url, &mut nonce, Some(&kid), None, None).await?;
     if !(200..300).contains(&cert_resp.status) || !cert_resp.body.contains("BEGIN CERTIFICATE") {
         return Err(format!("Certificate download failed (HTTP {})", cert_resp.status));
     }
@@ -1623,5 +1706,39 @@ mod tests {
         assert!(!is_wall_clock_ready_for_acme(120));
         assert!(!is_wall_clock_ready_for_acme(1_735_689_599));
         assert!(is_wall_clock_ready_for_acme(1_735_689_600));
+    }
+
+    #[test]
+    fn detects_bad_nonce_and_account_does_not_exist_and_quarantines_corrupt_config() {
+        assert!(is_acme_bad_nonce(
+            400,
+            r#"{"type":"urn:ietf:params:acme:error:badNonce","detail":"JWS has an invalid anti-replay nonce"}"#
+        ));
+        assert!(!is_acme_bad_nonce(200, "urn:ietf:params:acme:error:badNonce"));
+        assert!(!is_acme_bad_nonce(400, r#"{"type":"urn:ietf:params:acme:error:malformed"}"#));
+
+        assert!(is_acme_account_not_found(
+            400,
+            r#"{"type":"urn:ietf:params:acme:error:accountDoesNotExist"}"#
+        ));
+        assert!(is_acme_account_not_found(
+            404,
+            r#"{"type":"urn:ietf:params:acme:error:accountDoesNotExist"}"#
+        ));
+        assert!(!is_acme_account_not_found(200, "accountDoesNotExist"));
+
+        let sbx = crate::paths::TestSandbox::new("acme-corrupt");
+        sbx.write(ACME_CONFIG_PATH, "{corrupt json");
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            let cfg = load_config();
+            assert!(!cfg.enabled);
+            assert!(cfg.domains.is_empty());
+            let dir = sbx.root.join("etc/cellcore");
+            let quarantined = fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("acme.json.corrupt."));
+            assert!(quarantined, "corrupt acme.json must be quarantined via load_json_or_default");
+        });
     }
 }

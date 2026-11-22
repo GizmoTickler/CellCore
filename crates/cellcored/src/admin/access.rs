@@ -437,6 +437,13 @@ pub async fn post_dropbear(State(ctx): State<HttpCtx>, Json(req): Json<DropbearR
             restart.err().map(|e| format!(" ({e})")).unwrap_or_default()
         ));
     }
+    if port != cur.port {
+        let old_port = cur.port;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::hardening::sync_wan_ssh_drop_rules(Some(old_port), port);
+        })
+        .await;
+    }
     audit(&ctx, format!("dropbear: port={port} password={} root_password={} iface={:?}", req.password_auth, req.root_password_auth, req.interface));
     ok(serde_json::json!({ "status": "ok", "port": port }))
 }

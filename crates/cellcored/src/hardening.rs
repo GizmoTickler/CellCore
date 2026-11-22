@@ -137,16 +137,78 @@ pub fn dropbear_configured_port() -> u16 {
 }
 
 const NFT_SSH_LAN_PATH: &str = "/etc/nftables.d/25-cellcore-ssh-lan.nft";
+const FIREWALL_USER_PATH: &str = "/etc/firewall.user";
+const FW_USER_SSH_BEGIN: &str = "# cellcore-ssh-wan-guard-begin";
+const FW_USER_SSH_END: &str = "# cellcore-ssh-wan-guard-end";
 
-fn has_wan_ssh_drop_rule(port: u16) -> bool {
-    if Path::new(&crate::paths::p(NFT_SSH_LAN_PATH)).exists() {
-        return true;
+pub(crate) fn update_firewall_user_ssh_guard(existing: &str, port: u16) -> String {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        let t = line.trim();
+        if t == FW_USER_SSH_BEGIN {
+            skipping = true;
+            continue;
+        }
+        if t == FW_USER_SSH_END {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(FW_USER_SSH_BEGIN);
+    out.push('\n');
+    for bin in ["iptables", "ip6tables"] {
+        for ifp in ["rmnet+", "wwan+"] {
+            out.push_str(&format!(
+                "{bin} -C INPUT -i {ifp} -p tcp --dport {port} -j DROP 2>/dev/null || {bin} -I INPUT 1 -i {ifp} -p tcp --dport {port} -j DROP\n"
+            ));
+        }
+    }
+    out.push_str(FW_USER_SSH_END);
+    out.push('\n');
+    out
+}
+
+pub(crate) fn has_wan_ssh_drop_rule(port: u16) -> bool {
+    let nft_path = crate::paths::p(NFT_SSH_LAN_PATH);
+    if let Ok(nft_body) = fs::read_to_string(&nft_path) {
+        let want = format!("tcp dport {port} drop");
+        if nft_body.contains(&want) {
+            return true;
+        }
     }
     let v4 = run_cmd_blocking_timeout("iptables", &["-S", "INPUT"], Duration::from_secs(2))
         .unwrap_or_default();
     let needle = format!("--dport {port}");
     (v4.contains("rmnet+") && v4.contains(&needle) && v4.contains("DROP"))
         || (v4.contains("rmnet") && v4.contains("MGW1_WAN_IN"))
+}
+
+/// Update live iptables/ip6tables rules, `/etc/nftables.d/25-cellcore-ssh-lan.nft`,
+/// and fw3 `/etc/firewall.user` persistence when Dropbear's SSH port changes (or on harden).
+pub fn sync_wan_ssh_drop_rules(old_port: Option<u16>, port: u16) {
+    if let Some(old) = old_port
+        && old != port
+    {
+        let old_s = old.to_string();
+        for bin in ["iptables", "ip6tables"] {
+            for ifp in ["rmnet+", "wwan+"] {
+                let _ = run_cmd_blocking_timeout(
+                    bin,
+                    &["-D", "INPUT", "-i", ifp, "-p", "tcp", "--dport", &old_s, "-j", "DROP"],
+                    Duration::from_secs(2),
+                );
+            }
+        }
+    }
+    apply_wan_ssh_drop_rules(port);
 }
 
 fn apply_wan_ssh_drop_rules(port: u16) {
@@ -174,6 +236,14 @@ fn apply_wan_ssh_drop_rules(port: u16) {
         );
         if crate::state::atomic_write(Path::new(NFT_SSH_LAN_PATH), nft_rule.as_bytes(), 0o644).is_ok() {
             let _ = run_cmd_blocking_timeout("fw4", &["reload"], Duration::from_secs(5));
+        }
+    }
+    let fw_user_mapped = crate::paths::p(FIREWALL_USER_PATH);
+    if Path::new(&fw_user_mapped).exists() {
+        let existing = fs::read_to_string(&fw_user_mapped).unwrap_or_default();
+        let updated = update_firewall_user_ssh_guard(&existing, port);
+        if updated != existing {
+            let _ = crate::state::atomic_write(Path::new(FIREWALL_USER_PATH), updated.as_bytes(), 0o644);
         }
     }
 }
@@ -855,6 +925,32 @@ mod tests {
         crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
             assert_eq!(probe_tcp_port_listener(22), Some((true, false)));
             assert_eq!(probe_tcp_port_listener(2222), Some((false, false)));
+        });
+    }
+
+    #[test]
+    fn wan_ssh_drop_rule_verifies_active_port_and_updates_fw3_and_nft() {
+        let sbx = TestSandbox::new("hardening-ssh-port");
+        fs::create_dir_all(sbx.root.join("etc/nftables.d")).unwrap();
+        sbx.write("/etc/firewall.user", "# custom user rules\n");
+        sbx.write_exec("/bin/iptables", "#!/bin/sh\nexit 1\n");
+        sbx.write_exec("/bin/ip6tables", "#!/bin/sh\nexit 1\n");
+        sbx.write_exec("/bin/fw4", "#!/bin/sh\nexit 0\n");
+
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            apply_wan_ssh_drop_rules(22);
+            assert!(has_wan_ssh_drop_rule(22));
+            assert!(!has_wan_ssh_drop_rule(2222), "stale port 22 rule must not satisfy port 2222");
+
+            sync_wan_ssh_drop_rules(Some(22), 2222);
+            assert!(has_wan_ssh_drop_rule(2222));
+            assert!(!has_wan_ssh_drop_rule(22));
+
+            let fw_user = fs::read_to_string(sbx.root.join("etc/firewall.user")).unwrap();
+            assert!(fw_user.contains("# custom user rules"));
+            assert!(fw_user.contains("--dport 2222 -j DROP"));
+            assert!(!fw_user.contains("--dport 22 -j DROP"));
+            assert_eq!(fw_user.matches(FW_USER_SSH_BEGIN).count(), 1);
         });
     }
 }
