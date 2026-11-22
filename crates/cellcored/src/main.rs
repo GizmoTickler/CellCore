@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.5.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.6.0");
     }
 
     #[test]

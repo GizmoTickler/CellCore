@@ -1351,7 +1351,7 @@ pub(crate) async fn is_sim_slot_present(state: &AppState, target_slot: u8) -> bo
     }
     #[cfg(not(test))]
     {
-        if let Ok(bus) = crate::qmi::qrtr::QrtrBus::connect() {
+        if let Ok(bus) = crate::qmi::qrtr::shared_bus() {
             let (ind_tx, _ind_rx) = mpsc::channel(4);
             let uim_state = if let Ok(ep) = bus
                 .open_service(crate::qmi::SVC_UIM, "UIM_CHK", ind_tx, Duration::from_secs(2))

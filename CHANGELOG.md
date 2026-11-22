@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0 — Holistic Stability, Dataplane Safety, Self-Healing UI, Flash Longevity & Cloudflare Tunnel Observability
+
+- **Dataplane Safety, Conntrack/SSR Cleanup & Offload Tuning (`dataplane.rs`, `netlink.rs`, `reconcile.rs`, `handlers.rs`):**
+  - Fixed upward nftables MSS clamping (`tcp option maxseg size > {mss}` guard so WireGuard/IPsec/tunnel SYNs are never bumped upward), tightened iptables `TCPMSS` detection, and unified `NetworkMutateReq::Mtu` live rule sync/cleanup.
+  - Preserved `last_applied_v4_ip`/`last_applied_v6_key` across disconnect/reconnect/SSR so targeted IPv4 (`-q` & `-s`) and IPv6 conntrack eviction + `odhcpd` reload actually fire, flushed stale `rmnet_data*` IPs/routes on SSR/`!ps_ready`, fixed IPv6-only permanent backoff, and switched `NATIVE_CONNECTED_SINCE` to monotonic time.
+  - Fixed live IRQ pinning (`eth0-*` split across CPU 2/3, `gsi` on CPU 1), `rx-gro-list off` + save/restore on `Default`, RAM-capped socket buffers, `spawn_blocking` startup tuning, IPAv5/SFE mutual-exclusion warning, and optional atomic IPPT `dnsmasq` short-lease sync.
+- **Self-Healing, QMI/SMD Hardening & Lockout Protection (`qmi/*`, `smd.rs`, `telemetry.rs`, `profiles.rs`, `admin/*`, `acme/mod.rs`, `ota.rs`, `appbackup.rs`):**
+  - Fixed `QrtrBus` FD/task leak with a shared daemon-wide bus + clean shutdown & `wait_for_service()`; persistent filtered `TMD`/`SAR` DSP clients; read-only `WDS_GET_PKT_STATISTICS` / `WDS_GET_CURRENT_CHANNEL_RATE`.
+  - Fail-closed `SO_BINDTODEVICE` multi-target/IPv6 LinkWatch (eliminating false-healthy LAN probes), inactive-SIM fail-closed QMI UIM check, async PCI-verified Dead-Man's Switch with `/tmp` persistence, SMD `/dev/smd11 ↔ /dev/smd7` timeout failover + 64 KiB cursor framer, and `r10-modem-ctl` `maintenance_pause` watchdog coordination.
+  - Eliminated RTC-less `sysfixtime` scheduled-reboot boot-loop; persisted firewall commit-confirm rollback across restarts + `lan_wan` guard + Dropbear port NFT sync; added ACME `badNonce`/account recovery + cryptographic cert/key fallback; auto-staged `/etc/cellcore-rescue/cellcore.ipk` + complete `opkg` rollback; fixed UCI `cellcore` namespace commits; expanded `appbackup.rs` for v1.4/v1.5 settings; added per-loop + RSS/FD watchdog monitoring.
+- **Flash Longevity, HTTP/WS Perf & Deep Observability (`auth.rs`, `http.rs`, `state.rs`, `speedtest.rs`, `obs/*`, `main.rs`):**
+  - Eliminated per-request browser `fsync` (120 s throttled tmpfs session touch), debounced 50 MiB `data_usage.json` & delta-gated `obs_state.json` UBIFS flushes, compacted state JSON, and moved disk saves to `spawn_blocking`.
+  - Wired `CompressionLayer` (gzip/br), zero-clone `Utf8Bytes` WS fan-out with 30 s/90 s dead-peer reaper, cached `https_redirect`, in-process X.509 expiry check, and `TCP_INFO` upload speedtest accuracy.
+  - Auto-bound `10.254.x.x/32` WARP management loopbacks; added local `cloudflared` tunnel health metrics (`cloudflared_up`, `cloudflared_ha_connections`), `eth0_speed_mbps`, `/proc/net/dev` error/drop counters, IOSS raw packet counters, numeric `rrc_residency_seconds_total`, process RSS/FDs, and fixed `wan_disconnects_total`, `quecwatch_state="cooldown"`, stale PHY/DSP clearing, and failover guard route coverage.
+- **React 19 UX Overhaul & 1 Hz Performance (`src/**`, `vite.config.ts`):**
+  - Surfaced Dead-Man's Switch banner/config + `persist` + schedule Save in `LockView`, built the full **Self-Healing Control Center** in `HealthView` (all 7 LinkWatch controls, 5-stage ladder, recovery timeline), and rendered live WS alerts in `AppShell`.
+  - Split `OverviewPage` into isolated memoized cards (ending 1 Hz spline re-renders), added the 5-card System Health & Self-Healing Pulse strip + live 3 h signal history updates, promoted `RadioTuningCard` to `Radio → PHY & Tuning`, fixed `AlignView`/`TowerFinderCard`/`BandsView`/`DataPlaneView`/`MaintenanceView`/`LatencyView`/`LogsView` bugs, improved mobile/keyboard/modal accessibility, and lazy-loaded heavy cellular tabs (`index` bundle cut `347 kB → 163 kB`).
+
 ## 1.5.0 — Painless Per-Antenna Solo Aiming, Laptop Audio + Voice Readout & Guided Port Identifier
 
 - **Per-Antenna Solo Focus Mode (`AlignView.tsx`, `CellularPage.tsx`, `handlers.rs`):**

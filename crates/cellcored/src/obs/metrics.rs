@@ -779,17 +779,26 @@ pub fn render(m: &MetricsInput) -> String {
         dp.qrtr_ssr_total as f64,
     );
     if !dp.mode.is_empty() {
-        p.head("dataplane_mode", "Active dataplane mode (one-hot: native or legacy).", "gauge");
-        for mode in ["native", "legacy"] {
+        p.head("dataplane_mode", "Active dataplane mode (one-hot: native or coexist).", "gauge");
+        for mode in ["native", "coexist"] {
             p.sample("dataplane_mode", &[("mode", mode)], b(dp.mode == mode));
         }
         p.head("dataplane_wds_connected", "1 when the native QMI WDS session for the IP family is connected.", "gauge");
         p.sample("dataplane_wds_connected", &[("family", "v4")], b(dp.wds_v4_connected));
         p.sample("dataplane_wds_connected", &[("family", "v6")], b(dp.wds_v6_connected));
         p.opt_gauge("dataplane_ipa_clk_mhz", "Current Qualcomm IPA hardware offload clock rate (MHz).", dp.ipa_clk_mhz.map(|v| v as f64));
+        p.gauge("dataplane_sfe_loaded", "1 when Qualcomm shortcut-fe (SFE) fastpath modules are loaded.", b(dp.sfe_loaded));
         p.gauge("dataplane_tuning_warnings", "Number of active high-throughput kernel tuning warnings.", dp.tuning_warnings as f64);
         p.counter("dataplane_indications_total", "QMI indications received by the native dataplane supervisor.", dp.indications_total as f64);
         p.counter("dataplane_netlink_updates_total", "Netlink address/route applies performed by the native dataplane.", dp.netlink_updates_total as f64);
+        p.counter("dataplane_reconnect_attempts_total", "Native WDS reconnect attempts performed by the dataplane supervisor.", dp.reconnect_attempts_total as f64);
+    }
+    if dp.ioss_hwp_rx.is_some() || dp.ioss_hwp_tx.is_some() || dp.ioss_exp_rx.is_some() || dp.ioss_exp_tx.is_some() {
+        p.head("ipa_ioss_packets_total", "Qualcomm IPAv5/IOSS Ethernet hardware vs exception packet counters.", "counter");
+        if let Some(v) = dp.ioss_hwp_rx { p.sample("ipa_ioss_packets_total", &[("path", "hwp"), ("direction", "rx")], v as f64); }
+        if let Some(v) = dp.ioss_hwp_tx { p.sample("ipa_ioss_packets_total", &[("path", "hwp"), ("direction", "tx")], v as f64); }
+        if let Some(v) = dp.ioss_exp_rx { p.sample("ipa_ioss_packets_total", &[("path", "exp"), ("direction", "rx")], v as f64); }
+        if let Some(v) = dp.ioss_exp_tx { p.sample("ipa_ioss_packets_total", &[("path", "exp"), ("direction", "tx")], v as f64); }
     }
 
     // --- SDX75 PHY / QoS / Security telemetry ---------------------------
