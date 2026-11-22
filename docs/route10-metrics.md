@@ -14,14 +14,14 @@ command (`command="/usr/sbin/r10-modem-ctl"` in the modem's
 | `metrics` | Prometheus text exposition (format 0.0.4) | Read from cached daemon state. **No AT commands.** |
 | `role active` / `role standby` | `result=ok role=<role> ttl_s=180` | None. Sets the failover hint. |
 
-`status` is unchanged (same 17 keys, fresh AT on every call).
+`status` keeps its 17 RF/WAN keys unchanged at steady state and appends `maintenance_pause=1` while antenna alignment, LinkWatch recovery, or cell-lock recovery is actively running so external watchdogs avoid overlapping resets.
 
 `metrics` prints nothing on stdout when the daemon cannot answer (the reason
 goes to stderr and the exit code is 1), so a failed fetch can never write an
 error string into a `.prom` file.
 
-The same text is served at `GET /api/v1/metrics` on the modem, behind the web
-UI session for now. A scoped API token for scrapers is planned.
+The same text is served at `GET /api/v1/metrics` on the modem, authenticated by
+either the web UI session or a scoped read-only API token (`Authorization: Bearer`).
 
 ## Proposed `cell-watchdog.sh` change
 
@@ -109,13 +109,15 @@ How Route10 decides is up to you. Some options:
 
 While the modem is active it defers its own disruptive work: the scheduled
 reboot, the cell-lock schedule, MBN/APN realignment, and LinkWatch CFUN
-cycling and SIM switching. In the web UI, QSCAN, OTA upgrades, speedtests,
-band, mode and cell locks, MBN changes and reboots need an explicit
-confirmation.
+cycling and SIM switching. In the web UI / API, QSCAN, OTA upgrades, speedtests,
+band/mode/cell locks, MBN changes, raw AT commands (`/api/v1/modem/at`), LAN
+subnet changes (`/api/v1/network/lan`), dataplane reconfiguration/reconnect
+(`/api/v1/dataplane/config`, `/api/v1/dataplane/reconnect`), and reboots require
+explicit confirmation (`X-QM-Force: 1`).
 **Route10's own `wan-restart` / `modem-reset` / `reboot` are never gated.**
 They are logged as events and always run.
 
-## Metric reference
+## Metric reference (CellCore v1.6.0)
 
 All names are prefixed `cellcore_`. Labels are bounded.
 
@@ -124,10 +126,12 @@ All names are prefixed `cellcore_`. Labels are bounded.
 | `build_info` | gauge | `version` |
 | `snapshot_age_seconds`, `cfun`, `registered` | gauge | – |
 | `rsrp_dbm`, `rsrq_db`, `sinr_db` | gauge | `chain` (0–3) |
-| `serving_cell_info` (=1) | gauge | `rat`, `band`, `pci`, `arfcn`, `state`, `duplex` |
-| `serving_rsrp_dbm`, `serving_rsrq_db`, `serving_sinr_db`, `tx_power_dbm` | gauge | – |
-| `ca_components`, `ca_bandwidth_mhz` | gauge | – |
-| `ca_component_bandwidth_mhz` | gauge | `index`, `role`, `band` |
+| `antenna_chain_present` | gauge | `chain` (0–3) |
+| `antenna_active_chains`, `antenna_rsrp_spread_db` | gauge | – |
+| `serving_cell_info` (=1) | gauge | `rat`, `band`, `pci`, `arfcn`, `duplex` |
+| `serving_rsrp_dbm`, `serving_rsrq_db`, `serving_sinr_db`, `tx_power_dbm`, `nsa_nr5g_rsrp_dbm`, `nsa_nr5g_sinr_db` | gauge | – |
+| `ca_components`, `ca_bandwidth_mhz`, `ul_ca_active`, `ul_bandwidth_mhz` | gauge | – |
+| `ca_component_bandwidth_mhz`, `ca_component_dl_mimo_layers`, `ca_component_ul_mimo_layers` | gauge | `index`, `role`, `band` |
 | `timing_advance` | gauge | `rat` (lte/nr) |
 | `timing_advance_meters` | gauge | – |
 | `temperature_celsius` | gauge | `sensor` |
@@ -140,19 +144,27 @@ All names are prefixed `cellcore_`. Labels are bounded.
 | `data_cycle_projected_bytes`, `data_cycle_days`, `data_cycle_days_elapsed`, `data_quota_bytes`, `data_cycle_used_ratio`, `standby_bytes_today` | gauge | – |
 | `data_lifetime_bytes` | counter | `direction` |
 | `ping_up`, `ping_latency_ms`, `ping_latency_avg_ms`, `ping_loss_ratio` | gauge | – |
-| `quecwatch_enabled`, `quecwatch_retry` | gauge | – |
-| `quecwatch_state` (one-hot) | gauge | `state` |
-| `speedtest_last_{timestamp_seconds,download_mbps,upload_mbps,ping_ms,jitter_ms}` | gauge | – |
+| `quecwatch_enabled`, `quecwatch_retry`, `cell_lock_active`, `cell_lock_bypassed` | gauge | – |
+| `quecwatch_state` (one-hot) | gauge | `state` (`idle`, `healthy`, `degraded`, `failing`, `recovering`, `cooldown`, `disabled`) |
+| `speedtest_last_{timestamp_seconds,download_mbps,upload_mbps,ping_ms,jitter_ms}`, `speedtest_{dl,ul}_loaded_latency_ms` | gauge | – |
 | `memory_bytes`, `flash_bytes` | gauge | `type` |
-| `conntrack_entries`, `conntrack_max`, `device_uptime_seconds`, `wan_up`, `wan_session_uptime_seconds` | gauge | – |
-| `wan_disconnects_total` | counter | – |
-| `events_total` | counter | `type` (20 fixed types) |
+| `conntrack_entries`, `conntrack_max`, `device_uptime_seconds`, `wan_up`, `wan_session_uptime_seconds` (0 when down), `eth0_speed_mbps` | gauge | – |
+| `wan_disconnects_total` (always emitted, even while WAN is down) | counter | – |
+| `iface_{rx,tx}_{errors,drops}_total` | counter | `iface` |
+| `process_resident_memory_bytes`, `process_open_fds` | gauge | – |
+| `cloudflared_up`, `cloudflared_ha_connections` (when `cloudflared` is installed/running) | gauge | – |
+| `events_total` | counter | `type` (27 fixed types) |
 | `failover_active`, `failover_hint_fresh`, `failover_avg_bps`, `failover_baseline_bps`, `failover_episode_seconds`, `failover_episode_bytes` | gauge | – |
 | `failover_source` (one-hot) | gauge | `source` (hint/throughput) |
 | `failover_episodes_total` | counter | – |
 | `notifications_{sent,failed}_total` | counter | `sink` (email/webhook/ntfy) |
 | `notifications_suppressed_total` | counter | `reason` |
 | `notifications_dropped_total` | counter | – |
+| `dataplane_mode`, `dataplane_wds_connected`, `dataplane_ipa_clk_mhz`, `dataplane_tuning_warnings`, `ipa_hardware_offload_pct` | gauge | `mode` / `family` |
+| `dataplane_indications_total`, `dataplane_netlink_updates_total`, `qrtr_ssr_total` | counter | – |
+| `nr5g_csi_{ri,cqi}`, `nr5g_tx_power_dbm`, `nr5g_tx_headroom_db`, `nr5g_pathloss_db`, `nr5g_{dl,ul}_{mcs,mod_order}`, `nr5g_mimo_layers`, `nr5g_active_rank`, `nr5g_ssb_beam_id`, `nr5g_five_qi`, `nr5g_ambr_mbps`, `air_cipher_null`, `rrc_state_code`, `nr5g_{dl,ul}_bler_pct`, `lte_dl_bler_pct` | gauge | `channel` / `apn` / `qfi` / `direction` |
+| `rrc_residency_seconds_total` | counter | `state` (`connected`, `idle`, `inactive`) |
+| `qmi_tmd_throttling`, `qmi_tmd_mitigation_level`, `qmi_sar_state`, `tls_cert_acme_active`, `tls_cert_days_remaining` | gauge | `device` |
 
 Counters reset when the daemon restarts (standard Prometheus counter
 semantics). The exceptions are `data_lifetime_bytes` and

@@ -30,7 +30,7 @@ use std::{
     collections::VecDeque,
     sync::{
         LazyLock, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -40,7 +40,10 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     auth::now_secs,
-    state::{AppState, ETC_QM_DIR, load_json_or_default, save_json_atomic},
+    state::{
+        AppState, ETC_QM_DIR, load_json_or_default, mono_ms, save_json_atomic,
+        save_json_atomic_async, save_json_compact_atomic,
+    },
 };
 
 pub use api::{metrics_routes, routes};
@@ -49,9 +52,11 @@ pub use events::{EventKind, Severity, emit};
 pub const OBS_STATE_PATH: &str = "/etc/cellcore/obs_state.json";
 pub const OBS_CONFIG_PATH: &str = "/etc/cellcore/observability.json";
 pub const EVENTS_PATH: &str = "/etc/cellcore/events.json";
-/// Flash wear bound: the ring and counters are written at most this often
-/// (plus on SIGTERM / reboot).
+/// Periodic flush check interval (monotonic).
 pub const FLUSH_INTERVAL_SECS: u64 = 3600;
+/// Gate hourly `obs_state.json` flash writes on >= 10 MiB delta or >= 24h (eliminating standby NAND wear).
+pub const OBS_FLUSH_MIN_BYTES: u64 = 10 * 1024 * 1024;
+pub const OBS_FLUSH_MAX_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Poison-tolerant lock: a panic is an abort in release builds, so a
 /// poisoned mutex can only be seen in tests; never propagate it.
@@ -86,12 +91,13 @@ pub struct Obs {
     pub persisted: Mutex<PersistedObs>,
     pub state_dirty: AtomicBool,
     last_flushed: Mutex<Option<PersistedObs>>,
+    last_state_flush_mono_ms: AtomicU64,
     pub config: Mutex<config::ObsConfig>,
     pub events: Mutex<events::EventStore>,
     pub detector: Mutex<events::SnapshotDetector>,
     pub failover: Mutex<failover::FailoverRuntime>,
     pub notify: Mutex<notify::NotifyRuntime>,
-    ws: OnceLock<broadcast::Sender<String>>,
+    ws: OnceLock<broadcast::Sender<axum::extract::ws::Utf8Bytes>>,
     notify_tx: OnceLock<mpsc::Sender<events::Event>>,
 }
 
@@ -99,6 +105,7 @@ static OBS: LazyLock<Obs> = LazyLock::new(|| Obs {
     persisted: Mutex::new(PersistedObs::default()),
     state_dirty: AtomicBool::new(false),
     last_flushed: Mutex::new(None),
+    last_state_flush_mono_ms: AtomicU64::new(0),
     config: Mutex::new(config::ObsConfig::default()),
     events: Mutex::new(events::EventStore::default()),
     detector: Mutex::new(events::SnapshotDetector::default()),
@@ -121,12 +128,16 @@ impl Obs {
         self.state_dirty.swap(false, Ordering::Relaxed)
     }
 
+    pub fn has_ws_clients(&self) -> bool {
+        self.ws.get().is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
     fn broadcast(&self, value: &serde_json::Value) {
         if let Some(tx) = self.ws.get()
             && tx.receiver_count() > 0
             && let Ok(text) = serde_json::to_string(value)
         {
-            let _ = tx.send(text);
+            let _ = tx.send(axum::extract::ws::Utf8Bytes::from(text));
         }
     }
 }
@@ -178,6 +189,8 @@ pub fn start(state: &AppState) {
     *lock(&OBS.last_flushed) = disk_baseline;
     *lock(&OBS.persisted) = prev;
     OBS.state_dirty.store(dirty_at_start, Ordering::Relaxed);
+    OBS.last_state_flush_mono_ms
+        .store(mono_ms(), Ordering::Release);
 
     emit(
         EventKind::DaemonStart,
@@ -198,17 +211,27 @@ pub fn start(state: &AppState) {
     tokio::spawn(run_obs_loop(state.clone()));
 }
 
-/// Everything flushed to flash. Called hourly, on SIGTERM and right before a
-/// reboot (through `telemetry::flush_persistent_state`).
+/// Immediate flush to flash (SIGTERM / reboot / tests).
 /// Skips NAND writes for `/etc/cellcore/obs_state.json` when unchanged (`!state_dirty`).
 pub fn flush_now(clean_shutdown: bool) {
+    flush_impl(true, clean_shutdown, mono_ms());
+}
+
+/// Hourly periodic flush: gates `obs_state.json` flash writes on `state_dirty`
+/// (episode/OTA/boot_reason), `>= 10 MiB` traffic delta, or `>= 24h` elapsed,
+/// eliminating 8,760 standby writes/year on UBIFS flash.
+pub fn flush_periodic() {
+    flush_impl(false, false, mono_ms());
+}
+
+fn flush_impl(force: bool, clean_shutdown: bool, now_mono_ms: u64) {
     let snapshot = {
         let mut ev = lock(&OBS.events);
         let dirty = ev.take_dirty();
         dirty.then(|| ev.to_stored())
     };
     if let Some(stored) = snapshot {
-        let _ = save_json_atomic(EVENTS_PATH, &stored, 0o600);
+        let _ = save_json_compact_atomic(EVENTS_PATH, &stored, 0o600);
     }
     let maybe_state = {
         let mut p = lock(&OBS.persisted);
@@ -222,17 +245,44 @@ pub fn flush_now(clean_shutdown: bool) {
             OBS.mark_state_dirty();
         }
         let mut last = lock(&OBS.last_flushed);
-        let flagged = OBS.take_state_dirty();
-        if flagged || last.as_ref() != Some(&*p) {
-            let cloned = p.clone();
-            *last = Some(cloned.clone());
-            Some(cloned)
-        } else {
+        let changed = last.as_ref() != Some(&*p);
+        let flagged = OBS.state_dirty.load(Ordering::Relaxed);
+        if !changed && !flagged {
             None
+        } else {
+            let byte_delta = match last.as_ref() {
+                Some(prev) => p
+                    .lifetime_rx
+                    .saturating_add(p.lifetime_tx)
+                    .saturating_sub(prev.lifetime_rx.saturating_add(prev.lifetime_tx)),
+                None => OBS_FLUSH_MIN_BYTES,
+            };
+            let last_ms = OBS.last_state_flush_mono_ms.load(Ordering::Acquire);
+            let elapsed_secs = if last_ms == 0 {
+                OBS_FLUSH_MAX_INTERVAL_SECS
+            } else {
+                now_mono_ms.saturating_sub(last_ms) / 1000
+            };
+            let should_write = force
+                || clean_shutdown
+                || flagged
+                || byte_delta >= OBS_FLUSH_MIN_BYTES
+                || elapsed_secs >= OBS_FLUSH_MAX_INTERVAL_SECS;
+            if should_write {
+                OBS.take_state_dirty();
+                let cloned = p.clone();
+                *last = Some(cloned.clone());
+                Some(cloned)
+            } else {
+                None
+            }
         }
     };
-    if let Some(p) = maybe_state {
-        let _ = save_json_atomic(OBS_STATE_PATH, &p, 0o600);
+    if let Some(p) = maybe_state
+        && save_json_compact_atomic(OBS_STATE_PATH, &p, 0o600).is_ok()
+    {
+        OBS.last_state_flush_mono_ms
+            .store(now_mono_ms, Ordering::Release);
     }
 }
 
@@ -243,20 +293,27 @@ pub fn set_boot_reason(reason: &str) {
     OBS.mark_state_dirty();
 }
 
+#[allow(dead_code)]
 pub fn save_config() -> Result<(), String> {
     let cfg = lock(&OBS.config).clone();
     save_json_atomic(OBS_CONFIG_PATH, &cfg, 0o600)
 }
 
+pub async fn save_config_async() -> Result<(), String> {
+    let cfg = lock(&OBS.config).clone();
+    save_json_atomic_async(OBS_CONFIG_PATH, cfg, 0o600).await
+}
+
 async fn run_obs_loop(state: AppState) {
     let mut tick: u64 = 0;
-    let mut last_flush = now_secs();
-    let mut last_sms = 0u64;
+    let mut last_flush_ms = mono_ms();
+    let mut last_sms_ms = 0u64;
     let mut usage_probe = usage_cycle::DeltaProbe::default();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         tick = tick.wrapping_add(1);
         let now = now_secs();
+        let now_m = mono_ms();
 
         // 1 s: byte deltas + failover state machine
         let (iface, rx, tx, bps) = {
@@ -283,13 +340,17 @@ async fn run_obs_loop(state: AppState) {
             events::check_ota_status();
         }
         let sms = lock(&OBS.config).notify.sms_forward.clone();
-        if sms.enabled && now.saturating_sub(last_sms) >= sms.interval_secs.max(notify::SMS_MIN_INTERVAL_SECS) {
-            last_sms = now;
+        if sms.enabled
+            && (last_sms_ms == 0
+                || now_m.saturating_sub(last_sms_ms)
+                    >= sms.interval_secs.max(notify::SMS_MIN_INTERVAL_SECS) * 1000)
+        {
+            last_sms_ms = now_m;
             notify::sms_forward_tick(&state).await;
         }
-        if now.saturating_sub(last_flush) >= FLUSH_INTERVAL_SECS {
-            last_flush = now;
-            tokio::task::spawn_blocking(|| flush_now(false));
+        if now_m.saturating_sub(last_flush_ms) >= FLUSH_INTERVAL_SECS * 1000 {
+            last_flush_ms = now_m;
+            tokio::task::spawn_blocking(flush_periodic);
         }
     }
 }

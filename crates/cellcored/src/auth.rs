@@ -18,6 +18,8 @@ const CRYPT_B64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk
 pub const SESSION_DIR: &str = "/tmp/cellcore/sessions";
 pub const SESSION_MAX_AGE_SECS: u64 = 28_800; // 8 hours
 pub const SESSION_IDLE_AGE_SECS: u64 = 7_200; // 2 hours
+/// Minimum interval between rewriting a session file in `/tmp` on `touch`.
+pub const SESSION_PERSIST_INTERVAL_SECS: u64 = 120;
 pub const MAX_SESSIONS: usize = 64;
 pub const MAX_RATE_LIMIT_PEERS: usize = 256;
 const RATE_WINDOW_SECS: u64 = 60;
@@ -38,6 +40,8 @@ pub struct SessionRecord {
     pub created_mono: Instant,
     #[serde(skip, default = "Instant::now")]
     pub last_seen_mono: Instant,
+    #[serde(skip, default = "Instant::now")]
+    pub last_persisted_mono: Instant,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,7 @@ impl AuthStore {
                             rec.created_mono = now_mono;
                             rec.last_seen_mono = now_mono;
                         }
+                        rec.last_persisted_mono = now_mono;
                         loaded.insert(rec.token.clone(), rec);
                         continue;
                     }
@@ -216,6 +221,7 @@ impl AuthStore {
             last_seen: now,
             created_mono: now_mono,
             last_seen_mono: now_mono,
+            last_persisted_mono: now_mono,
         };
         let mut evicted_any = false;
         {
@@ -270,9 +276,16 @@ impl AuthStore {
         if touch {
             rec.last_seen = now;
             rec.last_seen_mono = now_mono;
+            let should_persist = now_mono.saturating_duration_since(rec.last_persisted_mono)
+                >= Duration::from_secs(SESSION_PERSIST_INTERVAL_SECS);
+            if should_persist {
+                rec.last_persisted_mono = now_mono;
+            }
             let cloned = rec.clone();
             drop(sessions);
-            self.persist_session(&cloned);
+            if should_persist {
+                self.persist_session(&cloned);
+            }
             return Some(cloned);
         }
         Some(rec.clone())
@@ -329,10 +342,12 @@ impl AuthStore {
     }
 
     fn persist_session(&self, rec: &SessionRecord) {
-        self.ensure_dir();
         let path = self.session_path(&rec.token);
-        if let Ok(json) = serde_json::to_string(rec) {
-            let _ = crate::state::atomic_write(&path, json.as_bytes(), 0o600);
+        if let Ok(json) = serde_json::to_vec(rec)
+            && crate::state::atomic_write_tmpfs(&path, &json, 0o600).is_err()
+        {
+            self.ensure_dir();
+            let _ = crate::state::atomic_write_tmpfs(&path, &json, 0o600);
         }
     }
 }
@@ -930,6 +945,31 @@ mod tests {
             let _ = store.begin_attempt(peer).await;
         }
         assert!(store.rate_limits.lock().await.len() <= MAX_RATE_LIMIT_PEERS);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn touch_throttles_session_file_rewrites_to_120s() {
+        let dir = std::env::temp_dir().join(format!("qm-auth-throttle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = AuthStore::new(&dir);
+        let sess = store.create_session().await.unwrap();
+        let path = dir.join(format!("{}.json", sess.token));
+        assert!(path.exists());
+
+        // Remove the file to observe whether a rapid touch rewrites it.
+        fs::remove_file(&path).unwrap();
+        assert!(store.validate_token(&sess.token, true).await.is_some());
+        assert!(!path.exists(), "rapid touch within 120s must not rewrite session file");
+
+        // Age last_persisted_mono beyond 120s and touch again -> rewrites file.
+        {
+            let mut g = store.sessions.lock().await;
+            let rec = g.get_mut(&sess.token).unwrap();
+            rec.last_persisted_mono = Instant::now() - Duration::from_secs(SESSION_PERSIST_INTERVAL_SECS + 1);
+        }
+        assert!(store.validate_token(&sess.token, true).await.is_some());
+        assert!(path.exists(), "touch after 120s must persist updated session file");
         let _ = fs::remove_dir_all(&dir);
     }
 }

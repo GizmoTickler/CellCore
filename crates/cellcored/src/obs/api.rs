@@ -16,7 +16,7 @@ use serde::Deserialize;
 use super::{
     config::{self, Header, WebhookFormat},
     events::EventKind,
-    failover, lock, metrics, notify, obs, save_config, usage_cycle,
+    failover, lock, metrics, notify, obs, save_config_async, usage_cycle,
 };
 use crate::{
     admin::{bad, ok, server},
@@ -139,7 +139,7 @@ async fn post_failover_config(Json(b): Json<FailoverCfgReq>) -> Response {
             f.hint_ttl_secs = v;
         }
     }
-    if let Err(e) = save_config() {
+    if let Err(e) = save_config_async().await {
         return server(e);
     }
     ok(failover::status_json())
@@ -173,7 +173,7 @@ async fn post_usage_alerts(State(ctx): State<HttpCtx>, Json(b): Json<UsageAlerts
             c.usage.standby_floor_bytes = v;
         }
     }
-    if let Err(e) = save_config() {
+    if let Err(e) = save_config_async().await {
         return server(e);
     }
     get_cycle(State(ctx)).await
@@ -379,7 +379,7 @@ async fn post_notify(Json(b): Json<NotifyReq>) -> Response {
         notify::sms_forward_enabled_changed(true);
     }
     lock(&obs().config).notify = next;
-    if let Err(e) = save_config() {
+    if let Err(e) = save_config_async().await {
         return server(e);
     }
     get_notify().await

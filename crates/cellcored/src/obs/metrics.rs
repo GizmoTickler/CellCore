@@ -17,8 +17,8 @@ use super::{
 use crate::{
     smd::LATENCY_BUCKETS_MS,
     state::{
-        AppState, DataUsageState, MemoryTelemetry, ModemSnapshot, PingPoint, LinkWatchRuntime, SpeedtestRun,
-        SystemInternals, UptimeTelemetry,
+        AppState, DataUsageState, LinkWatchRuntime, MemoryTelemetry, ModemSnapshot, PingPoint,
+        SpeedtestRun, SystemInternals, TrafficInterfaceStats, UptimeTelemetry,
     },
 };
 
@@ -81,14 +81,17 @@ pub struct NotifyView {
 pub struct MetricsInput {
     pub version: String,
     pub now: u64,
+    pub mono_now_ms: u64,
     pub modem: ModemSnapshot,
     pub rx_bps: u64,
     pub tx_bps: u64,
+    pub interfaces: Vec<TrafficInterfaceStats>,
     pub ping: Vec<PingPoint>,
     pub memory: MemoryTelemetry,
     pub internals: SystemInternals,
     pub device_uptime: u64,
     pub session_uptime: Option<UptimeTelemetry>,
+    pub wan_disconnects_total: u64,
     pub quecwatch_enabled: bool,
     pub quecwatch: LinkWatchRuntime,
     pub last_speedtest: Option<SpeedtestRun>,
@@ -103,6 +106,8 @@ pub struct MetricsInput {
     pub tls_cert: crate::acme::ActiveCertInfo,
     pub cell_lock_active: bool,
     pub cell_lock_bypassed: bool,
+    pub process_rss_bytes: u64,
+    pub process_open_fds: u64,
 }
 
 pub fn usage_view(u: &DataUsageState, today: Civil, secs: u32) -> UsageView {
@@ -126,14 +131,17 @@ pub fn usage_view(u: &DataUsageState, today: Civil, secs: u32) -> UsageView {
 /// Snapshot everything a scrape needs (read locks only).
 pub async fn gather(state: &AppState) -> MetricsInput {
     let now = crate::auth::now_secs();
+    let mono_now_ms = crate::state::mono_ms();
     let modem = state.modem.read().await.clone();
-    let (rx_bps, tx_bps) = {
+    let (rx_bps, tx_bps, interfaces) = {
         let tr = state.traffic.read().await;
-        tr.interfaces
+        let (rx, tx) = tr
+            .interfaces
             .iter()
             .find(|i| i.name == tr.primary_iface)
             .map(|p| (p.rx.bps, p.tx.bps))
-            .unwrap_or((0, 0))
+            .unwrap_or((0, 0));
+        (rx, tx, tr.interfaces.clone())
     };
     let ping: Vec<PingPoint> = {
         let rt = state.ping_realtime.read().await;
@@ -143,6 +151,7 @@ pub async fn gather(state: &AppState) -> MetricsInput {
     let internals = state.internals.read().await.clone();
     let device_uptime = state.device_uptime.read().await.uptime_seconds;
     let session = state.session_uptime.read().await.clone();
+    let wan_disconnects_total = u64::from(crate::telemetry::disconnect_count());
     let session_uptime = (session.is_connected == Some(true)).then_some(session);
     let (quecwatch_enabled, has_cell_lock) = {
         let cfg = state.settings.read().await;
@@ -189,7 +198,7 @@ pub async fn gather(state: &AppState) -> MetricsInput {
                 mono_now.saturating_duration_since(at) <= std::time::Duration::from_secs(hint_ttl)
             }),
             episodes_total: p.failover_episodes,
-            episode_secs: f.episode.as_ref().map(|e| now.saturating_sub(e.started_at)).unwrap_or(0),
+            episode_secs: f.episode_elapsed_secs(now),
             episode_bytes: f.episode.as_ref().map(|e| e.bytes).unwrap_or(0),
         }
     };
@@ -203,21 +212,42 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         NotifyView { sent: n.sent.clone(), failed: n.failed.clone(), suppressed: n.suppressed.clone(), dropped: n.dropped }
     };
     let dataplane = crate::dataplane::metrics_view().await;
-    let phy = state.phy_diag.read().await.clone();
-    let dsp = state.dsp_telemetry.read().await.clone();
+    // Clear stale PHY & DSP telemetry on CFUN=0, disconnected, or age > 90s.
+    let phy_ts = state.phy_diag_updated_ms.load(Ordering::Acquire);
+    let phy_stale = modem.identity.cfun != 1
+        || !crate::telemetry::is_modem_registered(modem.serving.as_ref())
+        || (phy_ts > 0 && mono_now_ms.saturating_sub(phy_ts) > 90_000);
+    let phy = if phy_stale {
+        crate::radio_tuning::PhyDiagnostics::default()
+    } else {
+        state.phy_diag.read().await.clone()
+    };
+    let dsp_ts = state.dsp_telemetry_updated_ms.load(Ordering::Acquire);
+    let dsp_stale = modem.identity.cfun != 1
+        || (dsp_ts > 0 && mono_now_ms.saturating_sub(dsp_ts) > 90_000);
+    let dsp = if dsp_stale {
+        crate::qmi::dsp::DspTelemetrySnapshot::default()
+    } else {
+        state.dsp_telemetry.read().await.clone()
+    };
     let tls_cert = state.tls_cert_info.read().await.clone();
+    let process_rss_bytes = state.process_rss_bytes.load(Ordering::Relaxed);
+    let process_open_fds = state.process_open_fds.load(Ordering::Relaxed);
 
     MetricsInput {
         version: state.version.clone(),
         now,
+        mono_now_ms,
         modem,
         rx_bps,
         tx_bps,
+        interfaces,
         ping,
         memory,
         internals,
         device_uptime,
         session_uptime,
+        wan_disconnects_total,
         quecwatch_enabled,
         quecwatch,
         last_speedtest,
@@ -232,6 +262,8 @@ pub async fn gather(state: &AppState) -> MetricsInput {
         tls_cert,
         cell_lock_active,
         cell_lock_bypassed,
+        process_rss_bytes,
+        process_open_fds,
     }
 }
 
@@ -316,20 +348,50 @@ fn b(v: bool) -> f64 {
     if v { 1.0 } else { 0.0 }
 }
 
-pub const QUECWATCH_STATES: [&str; 6] = ["idle", "healthy", "degraded", "failing", "recovering", "disabled"];
+pub const QUECWATCH_STATES: [&str; 7] = [
+    "idle",
+    "healthy",
+    "degraded",
+    "failing",
+    "recovering",
+    "cooldown",
+    "disabled",
+];
+
+pub fn parse_eth_speed_mbps(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("down") {
+        return Some(0.0);
+    }
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<f64>().ok()
+}
 
 pub fn render(m: &MetricsInput) -> String {
-    let mut p = Prom { out: String::with_capacity(12 * 1024) };
+    let mut p = Prom { out: String::with_capacity(14 * 1024) };
 
     p.head("build_info", "Daemon version.", "gauge");
     p.sample("build_info", &[("version", &m.version)], 1.0);
 
     // --- radio -----------------------------------------------------------
     let modem = &m.modem;
+    let snap_age = if modem.updated_mono_ms > 0 && m.mono_now_ms >= modem.updated_mono_ms {
+        (m.mono_now_ms.saturating_sub(modem.updated_mono_ms) / 1000) as f64
+    } else if modem.updated_at == 0 {
+        -1.0
+    } else {
+        m.now.saturating_sub(modem.updated_at) as f64
+    };
     p.gauge(
         "snapshot_age_seconds",
         "Seconds since the cached modem snapshot was refreshed.",
-        if modem.updated_at == 0 { -1.0 } else { m.now.saturating_sub(modem.updated_at) as f64 },
+        snap_age,
     );
     p.gauge("cfun", "Modem functionality level (AT+CFUN, 1 = full).", f64::from(modem.identity.cfun));
     for (name, help, vals) in [
@@ -401,7 +463,6 @@ pub fn render(m: &MetricsInput) -> String {
                 ("band", &s.band),
                 ("pci", &s.pci.map(|v| v.to_string()).unwrap_or_default()),
                 ("arfcn", &s.arfcn.map(|v| v.to_string()).unwrap_or_default()),
-                ("state", &s.state),
                 ("duplex", &s.duplex_mode),
             ],
             1.0,
@@ -409,7 +470,10 @@ pub fn render(m: &MetricsInput) -> String {
         p.opt_gauge("serving_rsrp_dbm", "Serving cell RSRP (dBm).", s.rsrp);
         p.opt_gauge("serving_rsrq_db", "Serving cell RSRQ (dB).", s.rsrq);
         p.opt_gauge("serving_sinr_db", "Serving cell SINR (dB).", s.sinr);
-        p.opt_gauge("tx_power_dbm", "UE transmit power reported for the serving cell (dBm).", s.tx_power);
+        let tx_power = s
+            .tx_power
+            .or_else(|| m.phy.nr5g_tx_pwr_detail.as_ref().map(|t| f64::from(t.pusch_dbm)));
+        p.opt_gauge("tx_power_dbm", "UE transmit power reported for the serving cell (dBm).", tx_power);
         p.opt_gauge("nsa_nr5g_rsrp_dbm", "EN-DC 5G NR NSA secondary leg RSRP (dBm).", s.nsa_nr5g_rsrp);
         p.opt_gauge("nsa_nr5g_sinr_db", "EN-DC 5G NR NSA secondary leg SINR (dB).", s.nsa_nr5g_sinr);
     }
@@ -611,11 +675,63 @@ pub fn render(m: &MetricsInput) -> String {
     }
     p.gauge("device_uptime_seconds", "Modem OS uptime.", m.device_uptime as f64);
     p.gauge("wan_up", "1 when the cellular WAN interface is up.", b(m.session_uptime.is_some()));
-    if let Some(s) = m.session_uptime.as_ref() {
-        p.gauge("wan_session_uptime_seconds", "Current WAN session uptime.", s.uptime_seconds as f64);
-        if let Some(d) = s.disconnect_count {
-            p.counter("wan_disconnects_total", "WAN session drops seen by this daemon run.", f64::from(d));
+    let wan_up_secs = m.session_uptime.as_ref().map(|s| s.uptime_seconds).unwrap_or(0);
+    p.gauge("wan_session_uptime_seconds", "Current WAN session uptime (0 when down).", wan_up_secs as f64);
+    let disconnects = m
+        .session_uptime
+        .as_ref()
+        .and_then(|s| s.disconnect_count.map(u64::from))
+        .unwrap_or(m.wan_disconnects_total)
+        .max(m.wan_disconnects_total);
+    p.counter("wan_disconnects_total", "WAN session drops seen by this daemon run.", disconnects as f64);
+    p.opt_gauge(
+        "eth0_speed_mbps",
+        "Negotiated eth0 link speed in Mbit/s (0 when link is down).",
+        parse_eth_speed_mbps(&i.eth_speed),
+    );
+    if !m.interfaces.is_empty() {
+        p.head("iface_rx_errors_total", "Interface receive errors from /proc/net/dev.", "counter");
+        for iface in &m.interfaces {
+            p.sample("iface_rx_errors_total", &[("iface", &iface.name)], iface.rx.errors as f64);
         }
+        p.head("iface_rx_drops_total", "Interface receive packet drops from /proc/net/dev.", "counter");
+        for iface in &m.interfaces {
+            p.sample("iface_rx_drops_total", &[("iface", &iface.name)], iface.rx.drops as f64);
+        }
+        p.head("iface_tx_errors_total", "Interface transmit errors from /proc/net/dev.", "counter");
+        for iface in &m.interfaces {
+            p.sample("iface_tx_errors_total", &[("iface", &iface.name)], iface.tx.errors as f64);
+        }
+        p.head("iface_tx_drops_total", "Interface transmit packet drops from /proc/net/dev.", "counter");
+        for iface in &m.interfaces {
+            p.sample("iface_tx_drops_total", &[("iface", &iface.name)], iface.tx.drops as f64);
+        }
+    }
+    if m.process_rss_bytes > 0 {
+        p.gauge(
+            "process_resident_memory_bytes",
+            "Resident set size (RSS) of cellcored in bytes.",
+            m.process_rss_bytes as f64,
+        );
+    }
+    if m.process_open_fds > 0 {
+        p.gauge(
+            "process_open_fds",
+            "Number of open file descriptors held by cellcored.",
+            m.process_open_fds as f64,
+        );
+    }
+    if i.cloudflared_present || i.cloudflared_running {
+        p.gauge(
+            "cloudflared_up",
+            "1 when local cloudflared tunnel daemon is running with active HA connections.",
+            b(i.cloudflared_up),
+        );
+        p.gauge(
+            "cloudflared_ha_connections",
+            "Number of active Cloudflare Tunnel HA connections scraped from cloudflared.",
+            i.cloudflared_ha_connections as f64,
+        );
     }
 
     // --- events / failover / notifications ------------------------------
@@ -735,6 +851,19 @@ pub fn render(m: &MetricsInput) -> String {
     if let Some(rrc) = phy.rrc_state.as_ref() {
         p.gauge("rrc_state_code", "RRC state code (0=disconnected, 1=idle, 2=connected, 3=inactive).", f64::from(rrc.state_code));
     }
+    if let Some(res) = phy.rrc_residency.as_ref() {
+        p.head(
+            "rrc_residency_seconds_total",
+            "Cumulative time spent in each RRC state reported by AT+QNWCFG=\"rrc_time_info\" (seconds).",
+            "counter",
+        );
+        p.sample("rrc_residency_seconds_total", &[("state", "connected")], res.connected as f64);
+        p.sample("rrc_residency_seconds_total", &[("state", "idle")], res.idle as f64);
+        p.sample("rrc_residency_seconds_total", &[("state", "inactive")], res.inactive as f64);
+    }
+    p.opt_gauge("nr5g_dl_bler_pct", "5G NR downlink block error rate (%).", phy.nr5g_dl_bler);
+    p.opt_gauge("nr5g_ul_bler_pct", "5G NR uplink block error rate (%).", phy.nr5g_ul_bler);
+    p.opt_gauge("lte_dl_bler_pct", "LTE downlink block error rate (%).", phy.lte_dl_bler);
 
     // --- SDX75 QRTR QMI DSP telemetry (TMD thermal + SAR backoff) -------
     let dsp = &m.dsp;
@@ -811,7 +940,8 @@ mod tests {
         let t = render(&sample_input());
         assert_eq!(line_value(&t, "cellcore_rsrp_dbm{chain=\"1\"}").as_deref(), Some("-101.5"));
         assert!(!t.contains("cellcore_rsrp_dbm{chain=\"2\"}"), "missing chain omitted");
-        assert!(t.contains("cellcore_serving_cell_info{rat=\"NR5G-SA\",band=\"n41\",pci=\"258\",arfcn=\"521310\",state=\"NOCONN\",duplex=\"TDD\"} 1\n"));
+        assert!(t.contains("cellcore_serving_cell_info{rat=\"NR5G-SA\",band=\"n41\",pci=\"258\",arfcn=\"521310\",duplex=\"TDD\"} 1\n"));
+        assert!(!t.contains("state=\"NOCONN\""));
         assert_eq!(line_value(&t, "cellcore_registered ").as_deref(), Some("1"));
         assert_eq!(line_value(&t, "cellcore_ca_components ").as_deref(), Some("2"));
         assert_eq!(line_value(&t, "cellcore_ca_bandwidth_mhz ").as_deref(), Some("120"));
@@ -1005,5 +1135,86 @@ mod tests {
         assert_eq!(line_value(&t, "cellcore_speedtest_ul_loaded_latency_ms ").as_deref(), Some("44"));
         assert_eq!(line_value(&t, "cellcore_ipa_hardware_offload_pct ").as_deref(), Some("98"));
         assert_eq!(line_value(&t, "cellcore_qrtr_ssr_total ").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn renders_v160_wan_down_cooldown_eth_iface_process_rrc_and_cloudflared() {
+        let mut m = sample_input();
+        // WAN down with monotonic disconnect counter preserved
+        m.session_uptime = None;
+        m.wan_disconnects_total = 4;
+        // LinkWatch in cooldown must NOT be masked as idle
+        m.quecwatch_enabled = true;
+        m.quecwatch.status = "cooldown".into();
+        // Monotonic snapshot age overrides wall-clock jump
+        m.modem.updated_mono_ms = 50_000;
+        m.mono_now_ms = 57_400;
+        // Fallback tx_power_dbm from phy_diag when serving.tx_power is None
+        if let Some(s) = m.modem.serving.as_mut() {
+            s.tx_power = None;
+        }
+        m.phy.nr5g_tx_pwr_detail = Some(crate::radio_tuning::TxPowerDetail {
+            pusch_dbm: 19,
+            pucch_dbm: 14,
+            max_dbm: 26,
+            srs_dbm: 0,
+            headroom_db: 7,
+        });
+        m.phy.rrc_residency = Some(crate::radio_tuning::RrcResidencySecs {
+            connected: 420,
+            idle: 1800,
+            inactive: 65,
+        });
+        m.phy.nr5g_dl_bler = Some(1.5);
+        m.internals.eth_speed = "2500Mb/s".into();
+        m.internals.cloudflared_present = true;
+        m.internals.cloudflared_running = true;
+        m.internals.cloudflared_up = true;
+        m.internals.cloudflared_ha_connections = 4;
+        m.process_rss_bytes = 18 * 1024 * 1024;
+        m.process_open_fds = 42;
+        m.interfaces = vec![TrafficInterfaceStats {
+            name: "rmnet_data0".into(),
+            state: "up".into(),
+            rx: crate::state::TrafficDirectionStats {
+                bytes_total: 1000,
+                bps: 0,
+                packets_per_sec: 0,
+                errors: 3,
+                drops: 7,
+            },
+            tx: crate::state::TrafficDirectionStats {
+                bytes_total: 500,
+                bps: 0,
+                packets_per_sec: 0,
+                errors: 1,
+                drops: 2,
+            },
+        }];
+
+        let t = render(&m);
+        assert_eq!(line_value(&t, "cellcore_wan_up ").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_wan_session_uptime_seconds ").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_wan_disconnects_total ").as_deref(), Some("4"));
+        assert_eq!(line_value(&t, "cellcore_quecwatch_state{state=\"cooldown\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_quecwatch_state{state=\"idle\"}").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_snapshot_age_seconds ").as_deref(), Some("7"));
+        assert_eq!(line_value(&t, "cellcore_tx_power_dbm ").as_deref(), Some("19"));
+        assert_eq!(line_value(&t, "cellcore_eth0_speed_mbps ").as_deref(), Some("2500"));
+        assert_eq!(line_value(&t, "cellcore_iface_rx_errors_total{iface=\"rmnet_data0\"}").as_deref(), Some("3"));
+        assert_eq!(line_value(&t, "cellcore_iface_rx_drops_total{iface=\"rmnet_data0\"}").as_deref(), Some("7"));
+        assert_eq!(line_value(&t, "cellcore_iface_tx_errors_total{iface=\"rmnet_data0\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_iface_tx_drops_total{iface=\"rmnet_data0\"}").as_deref(), Some("2"));
+        assert_eq!(line_value(&t, "cellcore_process_resident_memory_bytes ").as_deref(), Some("18874368"));
+        assert_eq!(line_value(&t, "cellcore_process_open_fds ").as_deref(), Some("42"));
+        assert_eq!(line_value(&t, "cellcore_rrc_residency_seconds_total{state=\"connected\"}").as_deref(), Some("420"));
+        assert_eq!(line_value(&t, "cellcore_rrc_residency_seconds_total{state=\"idle\"}").as_deref(), Some("1800"));
+        assert_eq!(line_value(&t, "cellcore_rrc_residency_seconds_total{state=\"inactive\"}").as_deref(), Some("65"));
+        assert_eq!(line_value(&t, "cellcore_nr5g_dl_bler_pct ").as_deref(), Some("1.5"));
+        assert_eq!(line_value(&t, "cellcore_cloudflared_up ").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_cloudflared_ha_connections ").as_deref(), Some("4"));
+        assert_eq!(parse_eth_speed_mbps("down"), Some(0.0));
+        assert_eq!(parse_eth_speed_mbps("1000Mb/s"), Some(1000.0));
+        assert_eq!(parse_eth_speed_mbps(""), None);
     }
 }

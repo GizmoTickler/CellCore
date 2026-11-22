@@ -20,7 +20,10 @@ use tokio::{
 
 use crate::{
     auth::now_secs,
-    state::{AppState, SpeedtestLiveState, SpeedtestRun, SpeedtestSample, format_now_hms, save_json_atomic},
+    state::{
+        AppState, SpeedtestLiveState, SpeedtestRun, SpeedtestSample, format_now_hms,
+        save_json_atomic_async,
+    },
 };
 
 pub const SPEEDTEST_HISTORY_PATH: &str = "/etc/cellcore/speedtest_history.json";
@@ -595,10 +598,13 @@ pub async fn start_speedtest_with_engine(
                                     engine: Some("ookla".into()),
                                 };
                                 drop(live);
-                                let mut hist = state.speedtest_history.write().await;
-                                hist.insert(0, run);
-                                hist.truncate(50);
-                                let _ = save_json_atomic(&hist_path, &*hist, 0o600);
+                                let hist_snap = {
+                                    let mut hist = state.speedtest_history.write().await;
+                                    hist.insert(0, run);
+                                    hist.truncate(50);
+                                    hist.clone()
+                                };
+                                let _ = save_json_atomic_async(&hist_path, hist_snap, 0o600).await;
                                 let live_after = state.speedtest_live.read().await;
                                 broadcast_speedtest(&state, &live_after);
                                 continue;
@@ -869,6 +875,45 @@ async fn native_dl_worker(
     }
 }
 
+static NATIVE_UL_PAYLOAD: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn native_ul_payload() -> &'static [u8] {
+    NATIVE_UL_PAYLOAD.get_or_init(|| vec![0x5Au8; 128 * 1024])
+}
+
+#[cfg(target_os = "linux")]
+fn read_tcp_bytes_acked(fd: std::os::fd::RawFd) -> Option<u64> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    let needed = std::mem::offset_of!(libc::tcp_info, tcpi_bytes_acked) + std::mem::size_of::<u64>();
+    if rc == 0 && (len as usize) >= needed {
+        Some(info.tcpi_bytes_acked)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_tcp_bytes_acked(_fd: std::os::fd::RawFd) -> Option<u64> {
+    None
+}
+
+pub fn compute_probe_loss_pct(sent: u64, failed: u64) -> Option<f64> {
+    if sent == 0 {
+        return None;
+    }
+    Some(round2(((failed.min(sent) as f64) / (sent as f64)) * 100.0))
+}
+
 async fn native_ul_worker(
     addr: SocketAddr,
     host: String,
@@ -880,7 +925,7 @@ async fn native_ul_worker(
     let header = format!(
         "POST /__up?measId={meas_id} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nContent-Type: application/octet-stream\r\nContent-Length: {NATIVE_UL_CHUNK_BYTES}\r\nConnection: keep-alive\r\n\r\n"
     );
-    let payload = vec![0x5Au8; 128 * 1024];
+    let payload = native_ul_payload();
     while !*stop_rx.borrow() {
         // Keep SO_SNDBUF bounded (128 KiB per stream) so cellular uploads don't
         // experience fake initial buffer-fill spikes followed by drain stalls.
@@ -888,6 +933,8 @@ async fn native_ul_worker(
             tokio::time::sleep(Duration::from_millis(120)).await;
             continue;
         };
+        let mut last_acked: u64 = 0;
+        let mut use_tcp_info = read_tcp_bytes_acked(stream.as_raw_fd()).is_some();
         while !*stop_rx.borrow() {
             if stream.write_all(header.as_bytes()).await.is_err() {
                 break;
@@ -904,8 +951,30 @@ async fn native_ul_worker(
                             break;
                         }
                         sent += to_send;
-                        bytes_total.fetch_add(to_send as u64, Ordering::Relaxed);
+                        if use_tcp_info {
+                            if let Some(acked) = read_tcp_bytes_acked(stream.as_raw_fd()) {
+                                let delta = acked.saturating_sub(last_acked);
+                                if delta > 0 {
+                                    bytes_total.fetch_add(delta, Ordering::Relaxed);
+                                    last_acked = acked;
+                                }
+                            } else {
+                                use_tcp_info = false;
+                                bytes_total.fetch_add(to_send as u64, Ordering::Relaxed);
+                            }
+                        } else {
+                            bytes_total.fetch_add(to_send as u64, Ordering::Relaxed);
+                        }
                     }
+                }
+            }
+            if use_tcp_info
+                && let Some(acked) = read_tcp_bytes_acked(stream.as_raw_fd())
+            {
+                let delta = acked.saturating_sub(last_acked);
+                if delta > 0 {
+                    bytes_total.fetch_add(delta, Ordering::Relaxed);
+                    last_acked = acked;
                 }
             }
             if failed || *stop_rx.borrow() {
@@ -937,12 +1006,15 @@ async fn native_ul_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn native_loaded_ping_worker(
     addr: SocketAddr,
     host: String,
     meas_id: u64,
     bypass_dev: Option<String>,
     samples: Arc<Mutex<Vec<f64>>>,
+    probes_sent: Arc<AtomicU64>,
+    probes_failed: Arc<AtomicU64>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut stream_opt: Option<TcpStream> = None;
@@ -950,6 +1022,7 @@ async fn native_loaded_ping_worker(
         if stream_opt.is_none() {
             stream_opt = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await.ok();
         }
+        probes_sent.fetch_add(1, Ordering::Relaxed);
         if let Some(s) = stream_opt.as_mut() {
             match probe_http_rtt(s, &host, meas_id).await {
                 Ok((rtt, _)) => {
@@ -958,9 +1031,12 @@ async fn native_loaded_ping_worker(
                     }
                 }
                 Err(_) => {
+                    probes_failed.fetch_add(1, Ordering::Relaxed);
                     stream_opt = None;
                 }
             }
+        } else {
+            probes_failed.fetch_add(1, Ordering::Relaxed);
         }
         tokio::select! {
             _ = stop_rx.changed() => break,
@@ -1043,33 +1119,55 @@ async fn run_native_pipeline(
     durs: NativePhaseDurations,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let addr: SocketAddr = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("No IP address resolved for {host}"))?;
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| format!("DNS lookup timed out for {host}"))?
+    .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
+    .collect();
+    if addrs.is_empty() {
+        return Err(format!("No IP address resolved for {host}"));
+    }
 
-    let bypass_dev = if addr.ip().is_loopback() {
-        None
-    } else {
-        crate::vpn::bypass_iface()
-    };
+    // Iterate all resolved SocketAddrs (IPv4 + IPv6) until one connects cleanly.
+    let mut connected: Option<(SocketAddr, Option<String>, TcpStream)> = None;
+    let mut last_err = format!("Failed to connect to {host}");
+    for cand in addrs {
+        let bypass_dev = if cand.ip().is_loopback() {
+            None
+        } else {
+            crate::vpn::bypass_iface()
+        };
+        match connect_native_socket(cand, bypass_dev.as_deref(), None, None).await {
+            Ok(stream) => {
+                connected = Some((cand, bypass_dev, stream));
+                break;
+            }
+            Err(e) => {
+                last_err = format!("connect {cand}: {e}");
+            }
+        }
+    }
+    let (addr, bypass_dev, mut ping_stream) = connected.ok_or(last_err)?;
 
     // --- Phase 1: Idle Latency & Edge Discovery ---
     let meas_id = now_secs()
         .wrapping_mul(1_000_003)
         .wrapping_add(u64::from(std::process::id()));
-    let mut ping_stream = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await?;
     let mut idle_rtts: Vec<f64> = Vec::with_capacity(9);
     let mut ext_ip: Option<String> = None;
     let mut colo: Option<String> = None;
+    let probes_sent = Arc::new(AtomicU64::new(0));
+    let probes_failed = Arc::new(AtomicU64::new(0));
 
     for i in 0..10 {
         if *cancel_rx.borrow() {
             return Ok(());
         }
-        let (rtt, hdr) = probe_http_rtt(&mut ping_stream, host, meas_id).await?;
         if i == 0 {
+            let (_rtt, hdr) = probe_http_rtt(&mut ping_stream, host, meas_id).await?;
             let (ip, c) = parse_cf_meta_headers(&hdr);
             ext_ip = ip;
             colo = c;
@@ -1083,7 +1181,18 @@ async fn run_native_pipeline(
             broadcast_speedtest(state, &live);
             continue;
         }
-        idle_rtts.push(rtt);
+        probes_sent.fetch_add(1, Ordering::Relaxed);
+        match probe_http_rtt(&mut ping_stream, host, meas_id).await {
+            Ok((rtt, _hdr)) => {
+                idle_rtts.push(rtt);
+            }
+            Err(_) => {
+                probes_failed.fetch_add(1, Ordering::Relaxed);
+                if let Ok(reconn) = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await {
+                    ping_stream = reconn;
+                }
+            }
+        }
         let cur_ping = compute_iqm(&idle_rtts);
         let cur_jit = compute_jitter(&idle_rtts);
         let mut live = state.speedtest_live.write().await;
@@ -1111,6 +1220,8 @@ async fn run_native_pipeline(
         40,
         durs.dl_secs,
         durs.warmup_secs,
+        Arc::clone(&probes_sent),
+        Arc::clone(&probes_failed),
         cancel_rx.clone(),
     )
     .await?;
@@ -1133,6 +1244,8 @@ async fn run_native_pipeline(
         38,
         durs.ul_secs,
         durs.warmup_secs,
+        Arc::clone(&probes_sent),
+        Arc::clone(&probes_failed),
         cancel_rx.clone(),
     )
     .await?;
@@ -1142,6 +1255,10 @@ async fn run_native_pipeline(
 
     // --- Phase 4: Finalize & Persist ---
     let grade = compute_bufferbloat_grade(idle_ping, dl_iqm, ul_iqm);
+    let packet_loss = compute_probe_loss_pct(
+        probes_sent.load(Ordering::Relaxed),
+        probes_failed.load(Ordering::Relaxed),
+    );
     let server_name = Some("Cloudflare Edge (Native Rust)".to_string());
     let server_loc = colo.map(|c| format!("PoP {c}")).or_else(|| Some("Anycast Edge".into()));
     let ts = now_secs();
@@ -1158,7 +1275,7 @@ async fn run_native_pipeline(
         live.dl_latency_iqm = dl_iqm;
         live.ul_latency_iqm = ul_iqm;
         live.bufferbloat_grade = Some(grade.clone());
-        live.packet_loss = Some(0.0);
+        live.packet_loss = packet_loss;
         live.server_name = server_name.clone();
         live.server_location = server_loc.clone();
         live.external_ip = ext_ip.clone();
@@ -1174,7 +1291,7 @@ async fn run_native_pipeline(
         upload_mbps: ul_mbps,
         ping_ms: idle_ping.unwrap_or(0.0),
         jitter_ms: idle_jitter.unwrap_or(0.0),
-        packet_loss: Some(0.0),
+        packet_loss,
         dl_latency_iqm: dl_iqm,
         ul_latency_iqm: ul_iqm,
         bufferbloat_grade: grade,
@@ -1187,10 +1304,13 @@ async fn run_native_pipeline(
         engine: Some("native".into()),
     };
 
-    let mut hist = state.speedtest_history.write().await;
-    hist.insert(0, run);
-    hist.truncate(50);
-    let _ = save_json_atomic(hist_path, &*hist, 0o600);
+    let hist_snap = {
+        let mut hist = state.speedtest_history.write().await;
+        hist.insert(0, run);
+        hist.truncate(50);
+        hist.clone()
+    };
+    let _ = save_json_atomic_async(hist_path, hist_snap, 0o600).await;
     Ok(())
 }
 
@@ -1206,6 +1326,8 @@ async fn run_native_transfer_phase(
     prog_span: u8,
     duration_secs: u64,
     warmup_secs: f64,
+    probes_sent: Arc<AtomicU64>,
+    probes_failed: Arc<AtomicU64>,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(f64, Option<f64>), String> {
     let (phase_stop_tx, phase_stop_rx) = watch::channel(false);
@@ -1235,6 +1357,8 @@ async fn run_native_transfer_phase(
         meas_id,
         bypass_dev,
         Arc::clone(&rtt_samples),
+        probes_sent,
+        probes_failed,
         phase_stop_rx,
     )));
 
@@ -1351,6 +1475,9 @@ pub async fn stop_speedtest(state: &AppState) -> Result<(), String> {
 }
 
 fn broadcast_speedtest(state: &AppState, live: &SpeedtestLiveState) {
+    if state.ws_tx.receiver_count() == 0 {
+        return;
+    }
     if let Ok(payload) = serde_json::to_value(live) {
         let mut obj = payload;
         if let Some(map) = obj.as_object_mut() {
