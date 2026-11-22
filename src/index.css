@@ -597,13 +597,13 @@
 [data-skin="brutal"] .qm-subcard {
   border: 2px solid var(--qm-hard);
 }
-[data-skin="brutal"] button.rounded-full,
-[data-skin="brutal"] button.rounded-2xl {
+[data-skin="brutal"] button.rounded-full:not([role="switch"]):not([role="tab"]),
+[data-skin="brutal"] button.rounded-2xl:not([role="switch"]):not([role="tab"]) {
   border: 2px solid var(--qm-hard) !important;
   box-shadow: 3px 3px 0 0 var(--qm-hard);
 }
-[data-skin="brutal"] button.rounded-full:active,
-[data-skin="brutal"] button.rounded-2xl:active {
+[data-skin="brutal"] button.rounded-full:not([role="switch"]):not([role="tab"]):active,
+[data-skin="brutal"] button.rounded-2xl:not([role="switch"]):not([role="tab"]):active {
   box-shadow: none;
   transform: translate(3px, 3px);
 }

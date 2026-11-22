@@ -7,6 +7,7 @@ import { cn } from "../../lib/utils";
 import { useToastStore } from "../../stores/toast-store";
 import type { SmsMessage } from "../../types/cellcore";
 import { Button, Card, CopyButton, Input, Modal, Skeleton } from "../../components/ui";
+import { LoadError } from "../admin/shared";
 import { errMsg, useDiagSession, type HeaderFn } from "./shared";
 
 interface Thread {
@@ -188,7 +189,16 @@ export function SmsView({ header }: { header: HeaderFn }) {
                   ))}
                 </div>
               )}
-              {!smsInboxQuery.isLoading && threads.length === 0 && (
+              {smsInboxQuery.isError && !smsInboxQuery.data && (
+                <div className="p-3">
+                  <LoadError
+                    title="Could not load SMS inbox"
+                    error={smsInboxQuery.error}
+                    onRetry={() => void smsInboxQuery.refetch()}
+                  />
+                </div>
+              )}
+              {!smsInboxQuery.isLoading && !smsInboxQuery.isError && threads.length === 0 && (
                 <div className="flex flex-col items-center justify-center gap-2 px-6 py-14 text-center">
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-sunk text-muted">
                     <Inbox className="h-5 w-5" />
@@ -319,7 +329,13 @@ export function SmsView({ header }: { header: HeaderFn }) {
                   </div>
                   <button
                     type="button"
-                    onClick={() => deleteSms(m.indices)}
+                    onClick={() =>
+                      setConfirm({
+                        indices: m.indices,
+                        title: "Delete this message?",
+                        body: `This permanently deletes this message from ${active.sender} on the SIM / modem.`,
+                      })
+                    }
                     disabled={busy === "sms-del"}
                     aria-label="Delete message"
                     title="Delete message"

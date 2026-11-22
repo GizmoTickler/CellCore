@@ -205,6 +205,9 @@ export function OtaView({ ctl }: { ctl: SystemController }) {
           <Row label="Last checked">
             <span>{relativeTime(d?.lastChecked, now)}</span>
           </Row>
+          <Row label="Active boot slot">
+            <span className="font-mono">Slot {ctl.internals?.bootSlot || "_a"}</span>
+          </Row>
         </dl>
         <Button variant="secondary" className="mt-4 w-full" onClick={ctl.checkOtaFeed} disabled={checking || installing}>
           <RefreshCw className={cn("h-4 w-4", checking && "animate-spin")} />

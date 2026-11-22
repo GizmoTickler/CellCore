@@ -27,6 +27,18 @@ export function MaintenanceView({ ctl }: { ctl: SystemController }) {
   const smtpOk = Boolean(data?.alerts?.smtpConfigured);
   const [showPw, setShowPw] = useState(false);
 
+  const toggleDay = (dayId: string) => {
+    ctl.setRebDays((prev) => {
+      const lower = prev.map((d) => d.toLowerCase());
+      if (lower.includes(dayId)) {
+        const next = lower.filter((d) => d !== dayId);
+        // Keep at least one day selected so the schedule stays valid.
+        return next.length > 0 ? next : lower;
+      }
+      return WEEK.map((w) => w.id).filter((id) => id === dayId || lower.includes(id));
+    });
+  };
+
   return (
     <div className="grid gap-5 lg:grid-cols-12">
       {/* Scheduled reboot */}
@@ -35,6 +47,7 @@ export function MaintenanceView({ ctl }: { ctl: SystemController }) {
           title="Scheduled reboot"
           subtitle="A weekly restart run by cellcored's wall clock"
           icon={<Power className="h-4 w-4" />}
+          action={ctl.rebDirty ? <Badge variant="warning">Unsaved</Badge> : undefined}
         />
         {ctl.maintQuery.isError && !data ? (
           <LoadError title="Could not load the reboot schedule" error={ctl.maintQuery.error} onRetry={() => void ctl.maintQuery.refetch()} />
@@ -66,19 +79,27 @@ export function MaintenanceView({ ctl }: { ctl: SystemController }) {
                   disabled={ctl.busy === "reb"}
                 />
               </div>
-              <div className="mt-4 grid grid-cols-7 gap-1" aria-label={`Scheduled days: ${dayText}`}>
+              <div className="mt-4 grid grid-cols-7 gap-1" role="group" aria-label={`Scheduled days: ${dayText}`}>
                 {WEEK.map((d) => {
                   const on = days.includes(d.id);
                   return (
-                    <div
+                    <button
                       key={d.id}
+                      type="button"
+                      aria-pressed={on}
+                      disabled={ctl.busy === "reb"}
+                      onClick={() => toggleDay(d.id)}
                       className={cn(
-                        "rounded-lg py-1.5 text-center text-[11px] font-semibold",
-                        on ? (enabled ? "bg-ember text-on-ember" : "bg-sunk text-ink ring-1 ring-line-strong") : "text-muted"
+                        "rounded-lg py-1.5 text-center text-[11px] font-semibold transition cursor-pointer disabled:opacity-50",
+                        on
+                          ? enabled
+                            ? "bg-ember text-on-ember shadow-sm"
+                            : "bg-raised text-ink ring-1 ring-ember/60"
+                          : "text-muted hover:bg-surface hover:text-ink"
                       )}
                     >
                       {d.short}
-                    </div>
+                    </button>
                   );
                 })}
               </div>
@@ -95,13 +116,13 @@ export function MaintenanceView({ ctl }: { ctl: SystemController }) {
                 />
               </Field>
               <Button
-                variant="secondary"
+                variant={ctl.rebDirty ? "primary" : "secondary"}
                 className="h-10"
                 onClick={() => ctl.saveScheduledReboot(Boolean(data?.scheduledReboot?.enabled))}
                 disabled={ctl.busy === "reb"}
               >
                 <CalendarClock className="h-4 w-4" />
-                Save time
+                Save schedule
               </Button>
             </div>
             <p className="text-[11.5px] text-muted leading-snug">

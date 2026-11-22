@@ -1,5 +1,16 @@
 import { useState } from "react";
-import { CalendarClock, Crosshair, Lock, LockOpen, Radio, ShieldCheck, Unlock } from "lucide-react";
+import {
+  AlertTriangle,
+  CalendarClock,
+  Crosshair,
+  Lock,
+  LockOpen,
+  Radio,
+  RotateCcw,
+  ShieldAlert,
+  ShieldCheck,
+  Unlock,
+} from "lucide-react";
 import { Badge, Button, Card, CardHeader, Input, Select, Skeleton, Switch } from "../../components/ui";
 import { cn } from "../../lib/utils";
 import type { ServingCellInfo } from "../../types/cellcore";
@@ -13,11 +24,21 @@ export interface LockStatus {
   nrPersist: boolean;
 }
 
+const DEADMAN_PRESETS = [
+  { secs: 60, label: "1 minute (60 s)" },
+  { secs: 120, label: "2 minutes (120 s)" },
+  { secs: 180, label: "3 minutes (180 s)" },
+  { secs: 300, label: "5 minutes (300 s)" },
+  { secs: 600, label: "10 minutes (600 s)" },
+  { secs: 900, label: "15 minutes (900 s)" },
+];
+
 function StatusTile({
   title,
   term,
   locked,
   persist,
+  bypassed,
   raw,
   loading,
   onRelease,
@@ -27,6 +48,7 @@ function StatusTile({
   term: string;
   locked: boolean;
   persist: boolean;
+  bypassed: boolean;
   raw?: string;
   loading: boolean;
   onRelease: () => void;
@@ -40,7 +62,11 @@ function StatusTile({
     <div
       className={cn(
         "relative min-w-0 overflow-hidden rounded-2xl border p-3.5 sm:p-5",
-        locked ? "border-saffron/50 bg-saffron-soft" : "border-line bg-raised"
+        bypassed && locked
+          ? "border-crimson/50 bg-crimson-soft"
+          : locked
+            ? "border-saffron/50 bg-saffron-soft"
+            : "border-line bg-raised"
       )}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -51,13 +77,28 @@ function StatusTile({
           {loading ? (
             <Skeleton className="mt-2 h-8 w-32" />
           ) : (
-            <div className={cn("mt-1 flex items-center gap-2 qm-display text-[1.6rem] font-semibold leading-tight", locked ? "text-saffron-ink" : "text-jade-ink")}>
-              {locked ? <Lock className="h-5 w-5" /> : <LockOpen className="h-5 w-5" />}
-              {locked ? "Pinned" : "Free"}
+            <div
+              className={cn(
+                "mt-1 flex items-center gap-2 qm-display text-[1.6rem] font-semibold leading-tight",
+                bypassed && locked ? "text-crimson-ink" : locked ? "text-saffron-ink" : "text-jade-ink"
+              )}
+            >
+              {bypassed && locked ? (
+                <ShieldAlert className="h-5 w-5" />
+              ) : locked ? (
+                <Lock className="h-5 w-5" />
+              ) : (
+                <LockOpen className="h-5 w-5" />
+              )}
+              {bypassed && locked ? "Bypassed" : locked ? "Pinned" : "Free"}
             </div>
           )}
           <div className="mt-1 hidden sm:block text-[12.5px] text-ink-2">
-            {locked ? "Stays on one cell, even if a better one appears." : "Picks the best cell on its own."}
+            {bypassed && locked
+              ? "Temporarily released by Dead-Man's Switch."
+              : locked
+                ? "Stays on one cell, even if a better one appears."
+                : "Picks the best cell on its own."}
           </div>
         </div>
         {locked && (
@@ -82,11 +123,26 @@ export function LockView({
   status,
   lteRaw,
   nrRaw,
+  bypassed,
+  deadmanEnabled,
+  deadmanSecs,
+  deadmanDirty,
+  setDeadmanEnabled,
+  setDeadmanSecs,
+  onSaveDeadman,
+  onRearmBypassed,
+  canRearm,
+  nrPersistDraft,
+  setNrPersistDraft,
+  ltePersistDraft,
+  setLtePersistDraft,
   schedule,
   schedStart,
   schedEnd,
+  schedDirty,
   setSchedStart,
   setSchedEnd,
+  onSaveSchedule,
   serving,
   busy,
   onPrefill,
@@ -99,11 +155,26 @@ export function LockView({
   status: LockStatus;
   lteRaw?: string;
   nrRaw?: string;
-  schedule?: { enabled: boolean } | null;
+  bypassed: boolean;
+  deadmanEnabled: boolean;
+  deadmanSecs: number;
+  deadmanDirty: boolean;
+  setDeadmanEnabled: (v: boolean) => void;
+  setDeadmanSecs: (v: number) => void;
+  onSaveDeadman: () => void;
+  onRearmBypassed: () => void;
+  canRearm: boolean;
+  nrPersistDraft: boolean;
+  setNrPersistDraft: (v: boolean) => void;
+  ltePersistDraft: boolean;
+  setLtePersistDraft: (v: boolean) => void;
+  schedule?: { enabled: boolean; lteLock?: string; nr5gLock?: string } | null;
   schedStart: string;
   schedEnd: string;
+  schedDirty: boolean;
   setSchedStart: (v: string) => void;
   setSchedEnd: (v: string) => void;
+  onSaveSchedule: () => void;
   serving: ServingCellInfo | null;
   busy: string | null;
   onPrefill: () => void;
@@ -117,8 +188,56 @@ export function LockView({
   const anyLocked = status.lteLocked || status.nrLocked;
   const servingIsNr = Boolean(serving?.rat.includes("NR5G"));
 
+  const deadmanOptions = DEADMAN_PRESETS.some((p) => p.secs === deadmanSecs)
+    ? DEADMAN_PRESETS
+    : [...DEADMAN_PRESETS, { secs: deadmanSecs, label: `${deadmanSecs} seconds (custom)` }].sort(
+        (a, b) => a.secs - b.secs
+      );
+
   return (
     <div className="space-y-5">
+      {/* Dead-Man's Switch bypass warning banner */}
+      {bypassed && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-crimson/50 bg-crimson-soft px-4 py-3.5 text-crimson-ink"
+        >
+          <div className="flex items-start gap-3 min-w-0">
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+            <div className="min-w-0">
+              <div className="text-[14px] font-bold leading-snug">
+                Cell lock temporarily bypassed by Dead-Man&apos;s Switch
+              </div>
+              <p className="mt-0.5 text-[12.5px] opacity-90 leading-snug">
+                The pinned cell lost registration or reachability, so CellCore temporarily released the lock to restore connectivity. Re-arm your saved lock once the tower is back, or release it permanently.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {canRearm && (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={onRearmBypassed}
+                disabled={busy === "rearm"}
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                {busy === "rearm" ? "Re-arming…" : "Re-arm Lock"}
+              </Button>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void onClear("all")}
+              disabled={busy === "clear-all"}
+            >
+              <Unlock className="h-3.5 w-3.5" />
+              Release Lock
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Answer first: is anything pinned? */}
       <div className="grid grid-cols-2 gap-3 sm:gap-4">
         <StatusTile
@@ -126,6 +245,7 @@ export function LockView({
           term="NR5G"
           locked={status.nrLocked}
           persist={status.nrPersist}
+          bypassed={bypassed}
           raw={nrRaw}
           loading={loading}
           onRelease={() => void onClear("nr5g")}
@@ -136,6 +256,7 @@ export function LockView({
           term="LTE"
           locked={status.lteLocked}
           persist={status.ltePersist}
+          bypassed={bypassed}
           raw={lteRaw}
           loading={loading}
           onRelease={() => void onClear("lte")}
@@ -161,6 +282,11 @@ export function LockView({
                       <span className="text-[13px] text-ink-2 qm-tabular">
                         Cell <strong className="font-mono">{serving.pci ?? "—"}</strong> · channel{" "}
                         <strong className="font-mono">{serving.arfcn ?? "—"}</strong>
+                        {serving.scsKhz != null && (
+                          <>
+                            {" "}· <strong className="font-mono">{serving.scsKhz} kHz</strong>
+                          </>
+                        )}
                       </span>
                       <span className={cn("text-[13px] font-semibold qm-tabular", TONE_TEXT[rsrpTone(serving.rsrp)])}>
                         {serving.rsrp ?? "—"} dBm
@@ -200,6 +326,14 @@ export function LockView({
                   </Select>
                 </Field>
               </div>
+              <div className="mt-3.5 rounded-xl border border-line bg-sunk px-3 py-2.5">
+                <Switch
+                  label="Survives reboot"
+                  description="Write lock to NVRAM save_ctrl"
+                  checked={nrPersistDraft}
+                  onChange={setNrPersistDraft}
+                />
+              </div>
               <Button variant="primary" className="mt-4 w-full" onClick={onLockNr} disabled={busy === "nr-lock"}>
                 <Lock className="h-3.5 w-3.5" />
                 {busy === "nr-lock" ? "Pinning…" : "Lock to this 5G cell"}
@@ -216,6 +350,14 @@ export function LockView({
                   <Input id="lte-earfcn" inputMode="numeric" value={f.lteEarfcn} onChange={(e) => f.set({ lteEarfcn: e.target.value })} placeholder="66786" className="font-mono" />
                 </Field>
               </div>
+              <div className="mt-3.5 rounded-xl border border-line bg-sunk px-3 py-2.5">
+                <Switch
+                  label="Survives reboot"
+                  description="Write lock to NVRAM save_ctrl"
+                  checked={ltePersistDraft}
+                  onChange={setLtePersistDraft}
+                />
+              </div>
               <Button variant="primary" className="mt-4 w-full" onClick={onLockLte} disabled={busy === "lte-lock"}>
                 <Lock className="h-3.5 w-3.5" />
                 {busy === "lte-lock" ? "Pinning…" : "Lock to this LTE cell"}
@@ -224,13 +366,63 @@ export function LockView({
           </div>
         </div>
 
-        {/* Supporting: schedule + release */}
+        {/* Supporting: dead-man's switch + schedule + release */}
         <div className="lg:col-span-4 min-w-0 space-y-5">
+          <Card>
+            <CardHeader
+              title="Dead-Man's Switch"
+              subtitle="Auto-bypass a stuck cell lock if registration drops."
+              icon={<ShieldAlert className="h-4 w-4" />}
+              action={
+                deadmanDirty ? (
+                  <Badge variant="warning">Unsaved</Badge>
+                ) : (
+                  <Badge variant={deadmanEnabled ? "success" : "neutral"} dot>
+                    {deadmanEnabled ? "Armed" : "Off"}
+                  </Badge>
+                )
+              }
+            />
+            <div className="space-y-3.5">
+              <Switch
+                label="Auto-bypass on outage"
+                description="Releases the lock temporarily if the pinned tower goes offline"
+                checked={deadmanEnabled}
+                onChange={setDeadmanEnabled}
+                disabled={busy === "deadman"}
+              />
+              <Field label="Bypass after" htmlFor="deadman-secs">
+                <Select
+                  id="deadman-secs"
+                  value={String(deadmanSecs)}
+                  onChange={(e) => setDeadmanSecs(Number(e.target.value))}
+                  disabled={!deadmanEnabled || busy === "deadman"}
+                >
+                  {deadmanOptions.map((opt) => (
+                    <option key={opt.secs} value={String(opt.secs)}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Button
+                variant={deadmanDirty ? "primary" : "secondary"}
+                size="sm"
+                className="w-full"
+                onClick={onSaveDeadman}
+                disabled={busy === "deadman" || !deadmanDirty}
+              >
+                {busy === "deadman" ? "Saving…" : "Save dead-man settings"}
+              </Button>
+            </div>
+          </Card>
+
           <Card>
             <CardHeader
               title="Lock on a schedule"
               subtitle="Pin during these hours, roam freely outside them."
               icon={<CalendarClock className="h-4 w-4" />}
+              action={schedDirty ? <Badge variant="warning">Unsaved</Badge> : undefined}
             />
             <div className="space-y-4">
               <Switch
@@ -247,7 +439,15 @@ export function LockView({
                   <Input id="sched-end" type="time" value={schedEnd} onChange={(e) => setSchedEnd(e.target.value)} className="qm-tabular" />
                 </Field>
               </div>
-              <p className="text-[12px] text-muted">Times apply when you switch the schedule on.</p>
+              <Button
+                variant={schedDirty ? "primary" : "secondary"}
+                size="sm"
+                className="w-full"
+                onClick={onSaveSchedule}
+                disabled={busy === "sched" || !schedDirty}
+              >
+                {busy === "sched" ? "Saving…" : "Save schedule"}
+              </Button>
             </div>
           </Card>
 

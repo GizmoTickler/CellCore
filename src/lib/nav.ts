@@ -37,7 +37,8 @@ export const NAV: NavSection[] = [
     subs: [
       { id: "profiles", label: "Profiles & MBN", hint: "APN profiles and carrier firmware", keywords: "apn sim iccid mbn carrier firmware" },
       { id: "bands", label: "Band Lock", hint: "Restrict LTE / NR bands and network mode", keywords: "band lock mode nr5g lte sa nsa" },
-      { id: "lock", label: "Cell Lock", hint: "Pin a tower by PCI and ARFCN", keywords: "cell lock pci earfcn arfcn tower" },
+      { id: "tuning", label: "PHY & Tuning", hint: "5G PHY/QoS/SSB telemetry, CA/MIMO & Dual-SIM", keywords: "sim phy mcs pathloss hpue sar cdrx a3 cipher 5qi ambr ssb tuning radio baseband mimo ca" },
+      { id: "lock", label: "Cell Lock", hint: "Pin a tower by PCI and ARFCN", keywords: "cell lock pci earfcn arfcn tower deadman bypass" },
       { id: "align", label: "Antenna Aim", hint: "Peak-hold RX0–RX3 while you point", keywords: "antenna alignment aim mimo rsrp peak" },
       { id: "scan", label: "Cell Scan", hint: "Neighbours and full cell survey", keywords: "neighbor neighbour scan survey qscan" },
     ],

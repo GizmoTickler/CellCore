@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Cpu, Edit3, Eye, EyeOff, ShieldCheck, Thermometer, TriangleAlert } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, CopyButton, Input, Modal, Switch } from "../../components/ui";
+import { FailoverWarning } from "../../components/obs";
 import { validateImeiLuhn, type SystemController } from "./useSystemController";
 import {
   Field,
@@ -397,6 +398,8 @@ function ImeiModal({ ctl }: { ctl: SystemController }) {
             onChange={ctl.setImeiApplyNow}
           />
         </div>
+
+        {ctl.imeiApplyNow && <FailoverWarning action="Writing IMEI and restarting the radio" />}
 
         <div className="flex flex-wrap justify-end gap-2 pt-1">
           <Button variant="secondary" onClick={ctl.closeImeiModal}>

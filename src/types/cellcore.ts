@@ -408,6 +408,8 @@ export interface SystemInternals {
   mwan3Running: boolean;
   keepAliveEnabled: boolean;
   ethSpeed: string;
+  cloudflaredHaConnections?: number | null;
+  cloudflaredRunning?: boolean;
   lastReconcile?: ReconcileReport | null;
 }
 
@@ -434,6 +436,8 @@ export interface DaemonSettings {
   quecwatchMaxRetries: number;
   quecwatchConnectionRefresh: boolean;
   quecwatchAutoSimFailover: boolean;
+  preferredSimSlot?: number;
+  simFailbackMins?: number;
   quecwatchHighLatency: boolean;
   quecwatchLatencyCeiling: number;
   cellLockSchedEnabled: boolean;
@@ -443,6 +447,8 @@ export interface DaemonSettings {
   cellLockNr5g: string;
   cellLockLtePersist: boolean;
   cellLockNr5gPersist: boolean;
+  cellLockDeadmanEnabled?: boolean;
+  cellLockDeadmanSecs?: number;
   antennaLabels?: string[];
 }
 
@@ -543,4 +549,6 @@ export interface WsStoreState {
   setDataUsage: (usage: DataUsageState) => void;
   setSettings: (settings: DaemonSettings) => void;
   resetSpeedtest: () => void;
+  dismissAlert: (index: number) => void;
+  clearAlerts: () => void;
 }

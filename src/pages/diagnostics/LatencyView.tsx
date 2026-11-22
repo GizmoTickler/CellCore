@@ -51,14 +51,17 @@ export function LatencyView({ header }: { header: HeaderFn }) {
   }, [latWindow, pingHistory, latencyQuery.data]);
 
   const latencySummary = useMemo(() => {
-    const pts = displayedPingPoints.filter((p) => Number.isFinite(p.latency));
-    if (pts.length === 0) return { min: "--", avg: "--", max: "--", loss: "--" };
-    const vals = pts.map((p) => p.latency);
-    const losses = pts.map((p) => Number(p.packetLoss ?? p.packet_loss ?? 0));
+    if (displayedPingPoints.length === 0) return { min: "--", avg: "--", max: "--", loss: "--" };
+    const okVals = displayedPingPoints
+      .filter((p) => p.ok && Number.isFinite(p.latency))
+      .map((p) => p.latency);
+    const losses = displayedPingPoints.map((p) =>
+      p.ok ? Number(p.packetLoss ?? p.packet_loss ?? 0) : 100
+    );
     return {
-      min: `${Math.round(Math.min(...vals))}`,
-      avg: `${Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)}`,
-      max: `${Math.round(Math.max(...vals))}`,
+      min: okVals.length > 0 ? `${Math.round(Math.min(...okVals))}` : "--",
+      avg: okVals.length > 0 ? `${Math.round(okVals.reduce((a, b) => a + b, 0) / okVals.length)}` : "--",
+      max: okVals.length > 0 ? `${Math.round(Math.max(...okVals))}` : "--",
       loss: `${Math.round((losses.reduce((a, b) => a + b, 0) / losses.length) * 10) / 10}`,
     };
   }, [displayedPingPoints]);

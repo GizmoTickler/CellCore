@@ -4,6 +4,7 @@ import { Badge, Button, Card, CardHeader, Input, Skeleton, Switch } from "../../
 import { cn, maskSecretId } from "../../lib/utils";
 import type { MbnProfile, QuecProfileItem } from "../../types/cellcore";
 import { ConfirmModal, EmptyState } from "./shared";
+import { FailoverWarning } from "../../components/obs";
 
 function isPaused(p: QuecProfileItem) {
   return String(p.paused) === "1" || p.paused === true;
@@ -295,6 +296,7 @@ export function ProfilesView({
         title={activeMbn?.name === confirmMbn ? "Re-apply carrier profile?" : "Switch carrier profile?"}
         body={
           <div className="space-y-2">
+            <FailoverWarning action="Switching carrier profile" />
             <p>
               The modem will load <strong className="text-ink">{confirmMbn}</strong> and re-register with the network.
             </p>

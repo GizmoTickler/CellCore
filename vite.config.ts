@@ -34,9 +34,19 @@ export default defineConfig({
     minify: "esbuild",
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ["react", "react-dom", "zustand", "@tanstack/react-query"],
-          icons: ["lucide-react"],
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("lucide-react")) return "icons";
+          if (
+            id.includes("/react/") ||
+            id.includes("/react-dom/") ||
+            id.includes("/scheduler/") ||
+            id.includes("/zustand/") ||
+            id.includes("/@tanstack/react-query") ||
+            id.includes("/@tanstack/query-core")
+          ) {
+            return "vendor";
+          }
         },
       },
     },

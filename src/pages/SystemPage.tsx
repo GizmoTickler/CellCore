@@ -2,6 +2,7 @@ import React from "react";
 import { RefreshCw } from "lucide-react";
 import { cn } from "../lib/utils";
 import { useSubRoute } from "../stores/route-store";
+import { useLiveness } from "../stores/ws-store";
 import { Button, LiveDot, PageHeader } from "../components/ui";
 import { SYS_TABS, type SysTab, useSystemController } from "./system/useSystemController";
 import { HardwareView } from "./system/HardwareView";
@@ -17,12 +18,13 @@ export { validateImeiLuhn } from "./system/useSystemController";
 export function SystemPage() {
   const [tab, setTab] = useSubRoute<SysTab>("/system", SYS_TABS, "hardware");
   const ctl = useSystemController(tab);
+  const liveness = useLiveness();
 
   let actions: React.ReactNode = null;
   if (tab === "internals") {
     actions = (
       <span className="inline-flex items-center gap-2 rounded-full border border-line bg-surface px-3 py-1.5 text-[12px] font-semibold text-ink-2">
-        <LiveDot tone="jade" /> Live · every 5 s
+        <LiveDot tone={liveness.tone} /> {liveness.live ? "Live · every 5 s" : liveness.label.split(" ·")[0]}
       </span>
     );
   } else if (tab === "ota") {

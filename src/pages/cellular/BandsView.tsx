@@ -152,7 +152,6 @@ export function BandsView({
   setNrDisable,
   savedModePref,
   savedNrDisable,
-  bandsDirty,
   busy,
   serving,
   carriers,
@@ -169,7 +168,6 @@ export function BandsView({
   setNrDisable: (v: string) => void;
   savedModePref?: string;
   savedNrDisable?: string;
-  bandsDirty: boolean;
   busy: string | null;
   serving: ServingCellInfo | null;
   carriers: CarrierComponent[];
@@ -191,7 +189,6 @@ export function BandsView({
 
   const modeChanged = savedModePref != null && savedModePref !== modePref;
   const nrChanged = savedNrDisable != null && savedNrDisable !== nrDisable;
-  const pending = bandsDirty || modeChanged || nrChanged;
 
   const diffs = groups.map((g) => ({
     g,
@@ -199,13 +196,14 @@ export function BandsView({
     removed: g.saved.filter((b) => !g.selected.includes(b)),
   }));
   const changeCount = diffs.reduce((n, d) => n + d.added.length + d.removed.length, 0) + (modeChanged ? 1 : 0) + (nrChanged ? 1 : 0);
+  const pending = changeCount > 0;
   const droppingLive = groups.some((g) => g.saved.some((b) => inUse(g.id, b) && !g.selected.includes(b)));
   const emptyGroup = groups.find((g) => g.selected.length === 0);
 
   const modeLabel = MODES.find((m) => m.value === modePref)?.label ?? modePref;
 
   return (
-    <div className="space-y-5 pb-24">
+    <div className="space-y-5 pb-6">
       {/* Answer first: what the modem is allowed to use right now */}
       <Card className="qm-grain overflow-hidden">
         <div className="relative z-[1] grid gap-5 lg:grid-cols-12 lg:items-center">
@@ -372,7 +370,7 @@ export function BandsView({
 
       {/* Review & apply bar */}
       {pending && (
-        <div className="fixed inset-x-0 bottom-[4.5rem] lg:bottom-5 z-40 flex justify-center px-3 lg:pl-[264px] pointer-events-none">
+        <div className="sticky bottom-[4.5rem] lg:bottom-5 z-40 flex justify-center pointer-events-none">
           <div className="qm-card qm-rise pointer-events-auto flex w-full max-w-3xl flex-wrap items-center gap-3 px-4 py-3 shadow-[var(--qm-shadow-pop)]">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 text-[13.5px] font-semibold text-ink">

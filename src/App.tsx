@@ -80,13 +80,23 @@ function RouterView() {
     if (authenticated) {
       void hydrateBootstrap();
       connectWs();
-      if (route === "/login") {
-        window.location.hash = "#/";
-      }
     } else {
       disconnectWs();
     }
-  }, [authenticated, route, hydrateBootstrap, connectWs, disconnectWs]);
+    return () => {
+      disconnectWs();
+    };
+  }, [authenticated, hydrateBootstrap, connectWs, disconnectWs]);
+
+  useEffect(() => {
+    if (authenticated && route === "/login") {
+      window.location.hash = "#/";
+    }
+  }, [authenticated, route]);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, [route]);
 
   if (checking) {
     return (

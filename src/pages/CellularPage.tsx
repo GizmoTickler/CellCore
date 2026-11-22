@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "../lib/api";
 import { disruptiveFetch, isCancelled } from "../lib/disruptive";
+import { describeChannel } from "../lib/rf";
 import { cn } from "../lib/utils";
 import { useWsStore } from "../stores/ws-store";
 import { useSubRoute } from "../stores/route-store";
@@ -13,19 +14,20 @@ import type {
   NeighborCellInfo,
   QuecProfileItem,
 } from "../types/cellcore";
-import { Button, Input, LiveDot, Modal, PageHeader, Select, signalQuality } from "../components/ui";
+import { Button, Input, LiveDot, Modal, PageHeader, Select, Skeleton, signalQuality } from "../components/ui";
 import { ConfirmModal, Field, TONE_TEXT, rsrpTone } from "./cellular/shared";
 import { FailoverWarning } from "../components/obs";
 import { useDraft } from "../lib/draft";
 import { useLockForm } from "./cellular/lock-form";
 import { ProfilesView } from "./cellular/ProfilesView";
 import { BandsView, type BandGroup, type BandGroupId } from "./cellular/BandsView";
-import { RadioTuningCard } from "./cellular/RadioTuningCard";
 import { LockView } from "./cellular/LockView";
-import { AlignView } from "./cellular/AlignView";
 import { ScanView, type QscanEntry } from "./cellular/ScanView";
 
-const CELL_TABS = ["profiles", "bands", "lock", "align", "scan"] as const;
+const RadioTuningCard = lazy(() => import("./cellular/RadioTuningCard").then((m) => ({ default: m.RadioTuningCard })));
+const AlignView = lazy(() => import("./cellular/AlignView").then((m) => ({ default: m.AlignView })));
+
+const CELL_TABS = ["profiles", "bands", "tuning", "lock", "align", "scan"] as const;
 type CellTab = (typeof CELL_TABS)[number];
 
 const NO_BANDS: string[] = [];
@@ -125,6 +127,9 @@ export function CellularPage() {
         lteRaw?: string;
         nr5gRaw?: string;
         saveCtrlRaw?: string;
+        bypassed?: boolean;
+        cellLockDeadmanEnabled?: boolean;
+        cellLockDeadmanSecs?: number;
         schedule?: {
           enabled: boolean;
           startTime: string;
@@ -133,6 +138,9 @@ export function CellularPage() {
           nr5gLock: string;
           ltePersist: boolean;
           nr5gPersist: boolean;
+          deadmanEnabled?: boolean;
+          deadmanSecs?: number;
+          bypassed?: boolean;
         };
       }>("/api/v1/cellular/cell-lock"),
     enabled: tab === "lock",
@@ -166,12 +174,24 @@ export function CellularPage() {
   const [selLte, setSelLte, lteD] = useDraft(bandsQuery.data ? bandsQuery.data.lteBands ?? NO_BANDS : null, NO_BANDS);
   const [selSa, setSelSa, saD] = useDraft(bandsQuery.data ? bandsQuery.data.nr5gBands ?? NO_BANDS : null, NO_BANDS);
   const [selNsa, setSelNsa, nsaD] = useDraft(bandsQuery.data ? bandsQuery.data.nsaNr5gBands ?? NO_BANDS : null, NO_BANDS);
-  const bandsDirty = lteD.dirty || saD.dirty || nsaD.dirty;
   const modeChanged = modeQuery.data?.modePref != null && modeQuery.data.modePref !== modePref;
   const resetBandDrafts = () => [modeD, nrD, lteD, saD, nsaD].forEach((x) => x.reset());
   const sched0 = cellLockQuery.data?.schedule;
   const [schedStart, setSchedStart, schedStartD] = useDraft(sched0?.startTime || null, "08:00");
   const [schedEnd, setSchedEnd, schedEndD] = useDraft(sched0?.endTime || null, "22:00");
+  const serverDeadmanEnabled =
+    cellLockQuery.data?.cellLockDeadmanEnabled ?? sched0?.deadmanEnabled ?? null;
+  const serverDeadmanSecs =
+    cellLockQuery.data?.cellLockDeadmanSecs ?? sched0?.deadmanSecs ?? null;
+  const [deadmanEnabled, setDeadmanEnabled, deadmanEnD] = useDraft(serverDeadmanEnabled, true);
+  const [deadmanSecs, setDeadmanSecs, deadmanSecsD] = useDraft(serverDeadmanSecs, 180);
+  const cellLockBypassed = Boolean(cellLockQuery.data?.bypassed ?? sched0?.bypassed);
+  const deadmanDirty =
+    (serverDeadmanEnabled != null && deadmanEnabled !== serverDeadmanEnabled) ||
+    (serverDeadmanSecs != null && deadmanSecs !== serverDeadmanSecs);
+  const schedDirty =
+    (sched0?.startTime != null && schedStart !== sched0.startTime) ||
+    (sched0?.endTime != null && schedEnd !== sched0.endTime);
 
   const [resetSeq, setResetSeq] = useState(0);
   const keepAwake = Boolean(antennaAlign?.keepAwake);
@@ -237,6 +257,15 @@ export function CellularPage() {
     };
   }, [cellLockQuery.data]);
 
+  const [nrPersistDraft, setNrPersistDraft, nrPersistD] = useDraft<boolean>(
+    cellLockQuery.data ? activeLocks.nrPersist : null,
+    false
+  );
+  const [ltePersistDraft, setLtePersistDraft, ltePersistD] = useDraft<boolean>(
+    cellLockQuery.data ? activeLocks.ltePersist : null,
+    false
+  );
+
   async function toggleMbnAutoSel(next: boolean) {
     setBusy("autosel");
     try {
@@ -256,14 +285,36 @@ export function CellularPage() {
   async function selectMbn(name: string) {
     setBusy(`mbn-${name}`);
     try {
-      await disruptiveFetch("MBN change", "/api/v1/cellular/mbn", {
-        method: "POST",
-        body: JSON.stringify({ action: "select", profileName: name }),
-      });
+      await disruptiveFetch(
+        "MBN change",
+        "/api/v1/cellular/mbn",
+        {
+          method: "POST",
+          body: JSON.stringify({ action: "select", profileName: name }),
+        },
+        { confirmed: true }
+      );
       await qc.invalidateQueries({ queryKey: ["cellular-profiles"] });
       notify("ok", `Carrier profile ${name} activated`);
     } catch (e) {
       if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Failed to select MBN");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function fillCurrentSimIccid() {
+    setBusy("fill-iccid");
+    try {
+      const s = await apiFetch<{ iccid?: string }>("/api/v1/modem/secrets");
+      if (s.iccid) {
+        setProfileModal((cur) => (cur ? { ...cur, iccid: s.iccid ?? cur.iccid } : cur));
+        notify("ok", "Filled in current SIM ICCID");
+      } else {
+        notify("err", "SIM ICCID is not available");
+      }
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Could not read SIM ICCID");
     } finally {
       setBusy(null);
     }
@@ -403,11 +454,18 @@ export function CellularPage() {
       return;
     }
     if (serving.rat.includes("NR5G")) {
+      const bandNum = serving.band.replace(/^n/i, "");
+      const scs =
+        serving.scsKhz != null
+          ? String(serving.scsKhz)
+          : bandNum === "41" || bandNum === "77" || bandNum === "78"
+            ? "30"
+            : "15";
       setLockForm({
         nrPci: serving.pci != null ? String(serving.pci) : "",
         nrArfcn: serving.arfcn != null ? String(serving.arfcn) : "",
-        nrBand: serving.band.replace(/^n/i, ""),
-        nrScs: serving.band === "n41" || serving.band === "n77" ? "30" : "15",
+        nrBand: bandNum,
+        nrScs: scs,
       });
       notify("ok", `Filled in 5G cell ${serving.pci} · ARFCN ${serving.arfcn}`);
     } else {
@@ -449,12 +507,13 @@ export function CellularPage() {
             arfcn: Number(nrArfcn),
             scs: Number(nrScs),
             band: Number(nrBand),
-            persist: activeLocks.nrPersist,
+            persist: nrPersistDraft,
           }),
         },
         { confirmed: true }
       );
       await qc.invalidateQueries({ queryKey: ["cell-lock-state"] });
+      nrPersistD.reset();
       notify("ok", `5G pinned to cell ${nrPci} on ARFCN ${nrArfcn}`);
     } catch (e) {
       if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Failed locking NR5G");
@@ -475,15 +534,84 @@ export function CellularPage() {
             rat: "lte",
             pci: Number(ltePci),
             arfcn: Number(lteEarfcn),
-            persist: activeLocks.ltePersist,
+            persist: ltePersistDraft,
           }),
         },
         { confirmed: true }
       );
       await qc.invalidateQueries({ queryKey: ["cell-lock-state"] });
+      ltePersistD.reset();
       notify("ok", `LTE pinned to cell ${ltePci} on EARFCN ${lteEarfcn}`);
     } catch (e) {
       if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Failed locking LTE");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveDeadman() {
+    setBusy("deadman");
+    try {
+      await apiFetch("/api/v1/cellular/cell-lock", {
+        method: "POST",
+        body: JSON.stringify({
+          deadmanEnabled,
+          deadmanSecs,
+        }),
+      });
+      await qc.invalidateQueries({ queryKey: ["cell-lock-state"] });
+      deadmanEnD.reset();
+      deadmanSecsD.reset();
+      notify("ok", deadmanEnabled ? `Dead-Man's Switch armed (${deadmanSecs}s)` : "Dead-Man's Switch disabled");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Failed saving dead-man settings");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const canRearmBypassed = Boolean(sched0?.nr5gLock || sched0?.lteLock);
+
+  async function rearmBypassedLock() {
+    setBusy("rearm");
+    try {
+      let applied = false;
+      const nrParts = (sched0?.nr5gLock ?? "").split(",").map((x) => Number(x.trim()));
+      if (nrParts.length >= 4 && nrParts.every((n) => Number.isFinite(n))) {
+        await disruptiveFetch("re-arm 5G cell lock", "/api/v1/cellular/cell-lock", {
+          method: "POST",
+          body: JSON.stringify({
+            rat: "nr5g",
+            pci: nrParts[0],
+            arfcn: nrParts[1],
+            scs: nrParts[2],
+            band: nrParts[3],
+            persist: activeLocks.nrPersist,
+          }),
+        });
+        applied = true;
+      }
+      const lteParts = (sched0?.lteLock ?? "").split(",").map((x) => Number(x.trim()));
+      if (lteParts.length >= 3 && lteParts.every((n) => Number.isFinite(n))) {
+        await disruptiveFetch("re-arm LTE cell lock", "/api/v1/cellular/cell-lock", {
+          method: "POST",
+          body: JSON.stringify({
+            rat: "lte",
+            arfcn: lteParts[1],
+            pci: lteParts[2],
+            persist: activeLocks.ltePersist,
+          }),
+        });
+        applied = true;
+      }
+      if (!applied) {
+        notify("err", "No saved cell lock parameters available to re-arm");
+        return;
+      }
+      await qc.invalidateQueries({ queryKey: ["cell-lock-state"] });
+      notify("ok", "Cell lock re-armed");
+    } catch (e) {
+      if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Failed re-arming cell lock");
     } finally {
       setBusy(null);
     }
@@ -502,7 +630,7 @@ export function CellularPage() {
     }
   }
 
-  async function toggleSchedule(enabled: boolean) {
+  async function saveSchedule(enabled: boolean, message?: string) {
     setBusy("sched");
     try {
       await apiFetch("/api/v1/cellular/cell-lock", {
@@ -516,12 +644,16 @@ export function CellularPage() {
       await qc.invalidateQueries({ queryKey: ["cell-lock-state"] });
       schedStartD.reset();
       schedEndD.reset();
-      notify("ok", `Lock schedule ${enabled ? "on" : "off"}`);
+      notify("ok", message ?? `Lock schedule ${enabled ? "on" : "off"}`);
     } catch (e) {
       notify("err", e instanceof Error ? e.message : "Schedule update failed");
     } finally {
       setBusy(null);
     }
+  }
+
+  function toggleSchedule(enabled: boolean) {
+    void saveSchedule(enabled);
   }
 
   async function resetAlignPeaks() {
@@ -754,27 +886,29 @@ export function CellularPage() {
       )}
 
       {tab === "bands" && (
-        <div className="space-y-5 pb-24">
-          <BandsView
-            loading={bandsQuery.isLoading}
-            groups={bandGroups}
-            modePref={modePref}
-            setModePref={setModePref}
-            nrDisable={nrDisable}
-            setNrDisable={setNrDisable}
-            savedModePref={modeQuery.data?.modePref}
-            savedNrDisable={modeQuery.data?.nr5gDisableMode != null ? String(modeQuery.data.nr5gDisableMode) : undefined}
-            bandsDirty={bandsDirty}
-            busy={busy}
-            serving={serving}
-            carriers={modem?.carriers ?? []}
-            onToggle={(g, b) => toggleBand(groupSetter[g], b)}
-            onSetGroup={setBandGroup}
-            onReload={reloadBands}
-            onApply={() => setConfirmLink("bands")}
-          />
+        <BandsView
+          loading={bandsQuery.isLoading}
+          groups={bandGroups}
+          modePref={modePref}
+          setModePref={setModePref}
+          nrDisable={nrDisable}
+          setNrDisable={setNrDisable}
+          savedModePref={modeQuery.data?.modePref}
+          savedNrDisable={modeQuery.data?.nr5gDisableMode != null ? String(modeQuery.data.nr5gDisableMode) : undefined}
+          busy={busy}
+          serving={serving}
+          carriers={modem?.carriers ?? []}
+          onToggle={(g, b) => toggleBand(groupSetter[g], b)}
+          onSetGroup={setBandGroup}
+          onReload={reloadBands}
+          onApply={() => setConfirmLink("bands")}
+        />
+      )}
+
+      {tab === "tuning" && (
+        <Suspense fallback={<Skeleton className="h-64" />}>
           <RadioTuningCard />
-        </div>
+        </Suspense>
       )}
 
       {tab === "lock" && (
@@ -783,11 +917,26 @@ export function CellularPage() {
           status={activeLocks}
           lteRaw={cellLockQuery.data?.lteRaw}
           nrRaw={cellLockQuery.data?.nr5gRaw}
+          bypassed={cellLockBypassed}
+          deadmanEnabled={deadmanEnabled}
+          deadmanSecs={deadmanSecs}
+          deadmanDirty={deadmanDirty}
+          setDeadmanEnabled={setDeadmanEnabled}
+          setDeadmanSecs={setDeadmanSecs}
+          onSaveDeadman={() => void saveDeadman()}
+          onRearmBypassed={() => void rearmBypassedLock()}
+          canRearm={canRearmBypassed}
+          nrPersistDraft={nrPersistDraft}
+          setNrPersistDraft={setNrPersistDraft}
+          ltePersistDraft={ltePersistDraft}
+          setLtePersistDraft={setLtePersistDraft}
           schedule={cellLockQuery.data?.schedule}
           schedStart={schedStart}
           schedEnd={schedEnd}
+          schedDirty={schedDirty}
           setSchedStart={setSchedStart}
           setSchedEnd={setSchedEnd}
+          onSaveSchedule={() => void saveSchedule(Boolean(cellLockQuery.data?.schedule?.enabled), "Lock schedule times saved")}
           serving={serving}
           busy={busy}
           onPrefill={prefillFromServingCell}
@@ -799,25 +948,27 @@ export function CellularPage() {
       )}
 
       {tab === "align" && (
-        <AlignView
-          active={Boolean(alignData?.active)}
-          samples={alignData?.samples ?? 0}
-          rsrp={liveAlignRsrp}
-          sinr={liveAlignSinr}
-          rsrq={liveAlignRsrq}
-          peakRsrp={peakRsrp}
-          peakSinr={peakSinr}
-          summary={alignSummary}
-          align={alignData}
-          resetSeq={resetSeq}
-          keepAwake={keepAwake}
-          onToggleKeepAwake={(next) => void toggleAlignKeepAwake(next)}
-          busy={busy}
-          onResetPeaks={() => void resetAlignPeaks()}
-          onResetChainPeak={(idx) => void resetAlignChainPeak(idx)}
-          antennaLabels={settings?.antennaLabels}
-          onSaveAntennaLabels={(labels) => void saveAntennaLabels(labels)}
-        />
+        <Suspense fallback={<Skeleton className="h-64" />}>
+          <AlignView
+            active={Boolean(alignData?.active)}
+            samples={alignData?.samples ?? 0}
+            rsrp={liveAlignRsrp}
+            sinr={liveAlignSinr}
+            rsrq={liveAlignRsrq}
+            peakRsrp={peakRsrp}
+            peakSinr={peakSinr}
+            summary={alignSummary}
+            align={alignData}
+            resetSeq={resetSeq}
+            keepAwake={keepAwake}
+            onToggleKeepAwake={(next) => void toggleAlignKeepAwake(next)}
+            busy={busy}
+            onResetPeaks={() => void resetAlignPeaks()}
+            onResetChainPeak={(idx) => void resetAlignChainPeak(idx)}
+            antennaLabels={settings?.antennaLabels}
+            onSaveAntennaLabels={(labels) => void saveAntennaLabels(labels)}
+          />
+        </Suspense>
       )}
 
       {tab === "scan" && (
@@ -832,10 +983,27 @@ export function CellularPage() {
           onRefresh={() => void scanQuery.refetch()}
           onStartScan={startFullQscan}
           onClearScan={clearScanResult}
-          onUseNeighbor={(n) => (n.rat === "NR5G" ? goLockNr(n.pci, n.arfcn) : goLockLte(n.pci, n.arfcn))}
-          onUseScan={(c) =>
-            c.rat.includes("NR") ? goLockNr(c.pci, c.arfcn, { band: c.band, scs: c.scs }) : goLockLte(c.pci, c.arfcn)
-          }
+          onUseNeighbor={(n) => {
+            if (n.rat.toUpperCase().includes("NR")) {
+              const ch = describeChannel(n.rat, n.arfcn ?? 0, n.band);
+              const bandNum = ch.band.replace(/^n/i, "");
+              const scs = bandNum === "41" || bandNum === "77" || bandNum === "78" ? "30" : "15";
+              goLockNr(n.pci, n.arfcn, { band: /^\d+$/.test(bandNum) ? bandNum : "", scs });
+            } else {
+              goLockLte(n.pci, n.arfcn);
+            }
+          }}
+          onUseScan={(c) => {
+            if (c.rat.toUpperCase().includes("NR")) {
+              const ch = describeChannel(c.rat, c.arfcn, c.band);
+              const bandNum = ch.band.replace(/^n/i, "");
+              const scsClean = c.scs?.replace(/\D/g, "");
+              const scs = scsClean || (bandNum === "41" || bandNum === "77" || bandNum === "78" ? "30" : "15");
+              goLockNr(c.pci, c.arfcn, { band: /^\d+$/.test(bandNum) ? bandNum : "", scs });
+            } else {
+              goLockLte(c.pci, c.arfcn);
+            }
+          }}
         />
       )}
 
@@ -902,13 +1070,26 @@ export function CellularPage() {
                 />
               </Field>
               <Field label="SIM number" term="ICCID" htmlFor="pf-iccid">
-                <Input
-                  id="pf-iccid"
-                  value={profileModal.iccid}
-                  onChange={(e) => setProfileModal({ ...profileModal, iccid: e.target.value })}
-                  className="font-mono"
-                  required
-                />
+                <div className="flex gap-1.5">
+                  <Input
+                    id="pf-iccid"
+                    value={profileModal.iccid}
+                    onChange={(e) => setProfileModal({ ...profileModal, iccid: e.target.value })}
+                    className="font-mono"
+                    required
+                  />
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="h-10 shrink-0 rounded-xl px-2.5 text-[11.5px]"
+                    onClick={() => void fillCurrentSimIccid()}
+                    disabled={busy === "fill-iccid"}
+                    title="Read the inserted SIM's full ICCID from the modem"
+                  >
+                    {busy === "fill-iccid" ? "…" : "Use current SIM"}
+                  </Button>
+                </div>
               </Field>
               <Field label="Access point" term="APN" htmlFor="pf-apn" className="sm:col-span-2">
                 <Input

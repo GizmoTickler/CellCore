@@ -6,10 +6,12 @@ import { useObsStore } from "./obs-store";
 import type { FailoverStatus, ObsEvent } from "../types/obs";
 import type {
   AntennaAlignState,
+  AuthStateResponse,
   BootstrapPayload,
   DataUsageState,
   ModemSnapshot,
   PingPoint,
+  SignalHistoryPoint,
   SpeedtestLiveState,
   SpeedtestRun,
   TrafficInterfaceStats,
@@ -36,6 +38,44 @@ let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let hydrating = false;
 let watchdog: number | null = null;
+let everOpened = false;
+let consecutiveFailures = 0;
+
+const SIGNAL_BUCKET_MS = 60_000;
+const SIGNAL_HISTORY_CAP = 180;
+const BACKOFF_STEPS_MS = [1_000, 2_000, 4_000, 10_000];
+
+function buildLiveSignalPoint(
+  chains: (number | null)[] | undefined,
+  fallback: number | null | undefined,
+  now: number,
+  label: string
+): SignalHistoryPoint | null {
+  const valid = (chains ?? []).filter((v): v is number => v != null && Number.isFinite(v));
+  if (valid.length > 0) {
+    const avg = Math.round((valid.reduce((a, b) => a + b, 0) / valid.length) * 10) / 10;
+    return { ts: now, label, value: avg, chains: chains ?? [] };
+  }
+  if (fallback != null && Number.isFinite(fallback)) {
+    return { ts: now, label, value: Math.round(fallback * 10) / 10, chains: chains ?? [fallback] };
+  }
+  return null;
+}
+
+function appendSignalBucket(
+  prev: SignalHistoryPoint[],
+  point: SignalHistoryPoint | null
+): SignalHistoryPoint[] {
+  if (!point) return prev;
+  const last = prev[prev.length - 1];
+  if (last) {
+    const lastMs = last.ts < 1e12 ? last.ts * 1000 : last.ts;
+    if (point.ts - lastMs < SIGNAL_BUCKET_MS) {
+      return prev;
+    }
+  }
+  return [...prev, point].slice(-SIGNAL_HISTORY_CAP);
+}
 
 /**
  * The daemon pushes traffic frames every second. A frozen or unreachable gateway does not close
@@ -157,6 +197,8 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
   setInternals: (internals) => set({ internals }),
   setDataUsage: (dataUsage) => set({ dataUsage }),
   setSettings: (settings) => set({ settings }),
+  dismissAlert: (index) => set((s) => ({ alerts: s.alerts.filter((_, i) => i !== index) })),
+  clearAlerts: () => set({ alerts: [] }),
 
   sendWsCommand: (payload) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -247,9 +289,15 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
       ws.onopen = () => {
         if (socket !== ws) return;
+        const isReconnect = everOpened;
+        everOpened = true;
+        consecutiveFailures = 0;
         set({ status: "connected", lastFrameAt: Date.now(), stale: false });
-        // Catch up on events / failover state missed while disconnected.
+        // Catch up on events / failover state and full telemetry missed while disconnected.
         void useObsStore.getState().load();
+        if (isReconnect) {
+          void get().hydrateBootstrap();
+        }
       };
 
       ws.onmessage = (ev) => {
@@ -263,16 +311,31 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
         const now = Date.now();
         const ch = String(msg?.channel ?? msg?.type ?? "");
-        // Any frame proves the gateway is alive.
-        if (get().stale || get().lastFrameAt == null || now - (get().lastFrameAt ?? 0) > 1_000) set({ lastFrameAt: now, stale: false });
 
         if (ch === "rf_snapshot" && msg.modem) {
-          set({ lastFrameAt: now, modem: msg.modem as ModemSnapshot });
+          const nextModem = msg.modem as ModemSnapshot;
+          const label = new Date(now).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+          const rsrpPt = buildLiveSignalPoint(nextModem.mimo?.rsrp, nextModem.serving?.rsrp, now, label);
+          const sinrPt = buildLiveSignalPoint(nextModem.mimo?.sinr, nextModem.serving?.sinr, now, label);
+          const rsrqPt = buildLiveSignalPoint(nextModem.mimo?.rsrq, nextModem.serving?.rsrq, now, label);
+          set((s) => {
+            const nextRsrp = appendSignalBucket(s.signalHistory.rsrp, rsrpPt);
+            const nextSinr = appendSignalBucket(s.signalHistory.sinr, sinrPt);
+            const nextRsrq = appendSignalBucket(s.rsrqHistory, rsrqPt);
+            const sigChanged = nextRsrp !== s.signalHistory.rsrp || nextSinr !== s.signalHistory.sinr;
+            return {
+              lastFrameAt: now,
+              stale: false,
+              modem: nextModem,
+              signalHistory: sigChanged ? { rsrp: nextRsrp, sinr: nextSinr } : s.signalHistory,
+              rsrqHistory: nextRsrq,
+            };
+          });
           return;
         }
 
         if (ch === "antenna_align" && msg.align) {
-          set({ lastFrameAt: now, antennaAlign: msg.align as AntennaAlignState });
+          set({ lastFrameAt: now, stale: false, antennaAlign: msg.align as AntennaAlignState });
           return;
         }
 
@@ -287,6 +350,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
             ].slice(-120);
             return {
               lastFrameAt: now,
+              stale: false,
               traffic: { ...nextTraffic, history },
               dataUsage: s.dataUsage && usageSum ? { ...s.dataUsage, usageSummary: usageSum } : s.dataUsage,
             };
@@ -298,6 +362,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
           const point = normalizePing(msg as unknown as Partial<PingPoint>, now);
           set((s) => ({
             lastFrameAt: now,
+            stale: false,
             ping: point,
             pingHistory: [...s.pingHistory, point].slice(-180),
           }));
@@ -312,6 +377,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
           const percent = msg.percent != null ? Number(msg.percent) : computed;
           set({
             lastFrameAt: now,
+            stale: false,
             memory: {
               total,
               used,
@@ -325,19 +391,21 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
         if (ch === "uptime") {
           const norm = normalizeUptime(msg as unknown as UptimeTelemetry);
-          if (norm) set({ lastFrameAt: now, sessionUptime: norm });
+          if (norm) set({ lastFrameAt: now, stale: false, sessionUptime: norm });
+          else if (get().stale) set({ lastFrameAt: now, stale: false });
           return;
         }
 
         if (ch === "device-uptime" || ch === "device_uptime") {
           const norm = normalizeUptime(msg as unknown as UptimeTelemetry);
-          if (norm) set({ lastFrameAt: now, deviceUptime: norm });
+          if (norm) set({ lastFrameAt: now, stale: false, deviceUptime: norm });
+          else if (get().stale) set({ lastFrameAt: now, stale: false });
           return;
         }
 
         if (ch === "speedtest") {
           const live = msg as unknown as SpeedtestLiveState;
-          set({ lastFrameAt: now, speedtest: live });
+          set({ lastFrameAt: now, stale: false, speedtest: live });
           if (!live.running && live.phase === "complete") {
             void get().refreshSpeedtestHistory();
           }
@@ -345,11 +413,17 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
         }
 
         if (ch === "event" && msg.event) {
+          if (get().stale || get().lastFrameAt == null || now - (get().lastFrameAt ?? 0) > 1_000) {
+            set({ lastFrameAt: now, stale: false });
+          }
           useObsStore.getState().pushEvent(msg.event as ObsEvent);
           return;
         }
 
         if (ch === "failover" && msg.failover) {
+          if (get().stale || get().lastFrameAt == null || now - (get().lastFrameAt ?? 0) > 1_000) {
+            set({ lastFrameAt: now, stale: false });
+          }
           useObsStore.getState().setFailover(msg.failover as FailoverStatus);
           return;
         }
@@ -357,6 +431,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
         if (ch === "cell-lock-alert" || ch === "alert" || ch === "quecwatch") {
           set((s) => ({
             lastFrameAt: now,
+            stale: false,
             alerts: [
               {
                 type: ch,
@@ -366,6 +441,12 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
               ...s.alerts,
             ].slice(0, 20),
           }));
+          return;
+        }
+
+        // Any unrecognized frame still proves the gateway is alive.
+        if (get().stale || get().lastFrameAt == null || now - (get().lastFrameAt ?? 0) > 1_000) {
+          set({ lastFrameAt: now, stale: false });
         }
       };
 
@@ -377,12 +458,42 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
       ws.onclose = () => {
         if (socket !== ws) return;
         socket = null;
+        consecutiveFailures += 1;
         set({ status: "disconnected" });
-        if (reconnectTimer == null && useAuthStore.getState().authenticated) {
+
+        const scheduleReconnect = () => {
+          if (reconnectTimer != null || !useAuthStore.getState().authenticated) return;
+          const step = BACKOFF_STEPS_MS[Math.min(consecutiveFailures - 1, BACKOFF_STEPS_MS.length - 1)];
+          const jitter = Math.round(step * (0.8 + Math.random() * 0.4));
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = null;
-            get().connect();
-          }, 3000);
+            if (useAuthStore.getState().authenticated) get().connect();
+          }, jitter);
+        };
+
+        if (!useAuthStore.getState().authenticated) return;
+
+        // After 3 consecutive failures, verify the session is still valid so expired cookies don't spin forever.
+        if (consecutiveFailures >= 3) {
+          void apiFetch<AuthStateResponse>("/api/v1/auth/status", { skipAuthRedirect: true })
+            .then((res) => {
+              const ok = Boolean(res?.authenticated || res?.state === "valid");
+              if (!ok) {
+                get().disconnect();
+                useAuthStore.getState().clearAuth();
+                if (window.location.hash !== "#/login") {
+                  window.location.hash = "#/login";
+                }
+              } else {
+                scheduleReconnect();
+              }
+            })
+            .catch(() => {
+              // Network/gateway unreachable (not a 401): keep backing off and retrying.
+              scheduleReconnect();
+            });
+        } else {
+          scheduleReconnect();
         }
       };
     } catch {
@@ -391,6 +502,8 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
   },
 
   disconnect: () => {
+    everOpened = false;
+    consecutiveFailures = 0;
     if (watchdog != null) {
       window.clearInterval(watchdog);
       watchdog = null;
