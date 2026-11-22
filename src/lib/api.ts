@@ -55,7 +55,13 @@ export async function apiFetch<T = unknown>(
       if (parsed?.error) msg = parsed.error;
       else if (parsed?.message) msg = parsed.message;
     } catch {
-      // keep raw text
+      // Never dump raw HTML fallback pages (e.g. SPA 404 or proxy gateway pages) into UI toasts.
+      const trimmed = text.trimStart();
+      if (/^<!doctype\s+html|^<html\b/i.test(trimmed)) {
+        msg = `HTTP ${res.status} (${path})`;
+      } else if (trimmed.length > 240) {
+        msg = `${trimmed.slice(0, 240)}…`;
+      }
     }
     throw new ApiError(res.status, msg, data);
   }

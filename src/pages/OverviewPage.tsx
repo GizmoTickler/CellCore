@@ -356,7 +356,7 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
   const warpQ = useQuery({
     queryKey: ["overview-warp"],
     queryFn: () =>
-      apiFetch<{ policy?: { mode?: string; usable?: boolean }; interface?: { up?: boolean } }>("/api/v1/vpn/warp/status"),
+      apiFetch<{ policy?: { mode?: string; usable?: boolean }; interface?: { up?: boolean } }>("/api/v1/vpn/warp"),
     staleTime: 30_000,
     refetchInterval: 60_000,
     retry: false,
@@ -365,7 +365,7 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
   const tsQ = useQuery({
     queryKey: ["overview-tailscale"],
     queryFn: () =>
-      apiFetch<{ service?: { running?: boolean }; status?: { backendState?: string } }>("/api/v1/vpn/tailscale/status"),
+      apiFetch<{ service?: { running?: boolean }; status?: { backendState?: string } }>("/api/v1/vpn/tailscale"),
     staleTime: 30_000,
     refetchInterval: 60_000,
     retry: false,
