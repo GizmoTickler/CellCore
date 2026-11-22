@@ -3,6 +3,7 @@ import { ArrowRight, Download, FileJson, RadioTower, Upload } from "lucide-react
 import { ApiError, apiFetch } from "../../lib/api";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, Switch } from "../../components/ui";
+import { useFailoverActive } from "../../components/obs";
 import { useToastStore } from "../../stores/toast-store";
 import { Mono, Notice, errText, useGuarded } from "../admin/shared";
 
@@ -92,6 +93,7 @@ function ItemRow({ item, checked, onToggle }: { item: ItemPreview; checked: bool
 export function ConfigBackupView() {
   const toast = useToastStore((s) => s.push);
   const guard = useGuarded();
+  const failoverLive = useFailoverActive();
   const fileRef = useRef<HTMLInputElement>(null);
   const [identifiers, setIdentifiers] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -109,7 +111,7 @@ export function ConfigBackupView() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `quecmanager-config-${b.createdAt}.json`;
+      a.download = `cellcore-config-${b.createdAt}.json`;
       a.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 5000);
       toast("Configuration exported", "success", b.radio ? "Includes the current radio preferences." : "The modem did not answer; radio preferences are not included.");
@@ -245,7 +247,7 @@ export function ConfigBackupView() {
                   {preview.bundle.includesIdentifiers ? " with SIM identifiers" : " without SIM identifiers"}
                   {preview.bundle.hasRadio ? ", radio preferences included." : ", no radio preferences."}
                 </Notice>
-                {preview.failoverActive && (
+                {(failoverLive || preview.failoverActive) && (
                   <Notice tone="danger" title="WAN is failed over to this modem">
                     Restores are refused while traffic depends on the cellular link. Try again after it fails back.
                   </Notice>
@@ -279,7 +281,7 @@ export function ConfigBackupView() {
                   <Button
                     variant={chosenRadio.length ? "danger" : "primary"}
                     onClick={apply}
-                    disabled={guard.busy || chosen.length === 0 || preview.failoverActive}
+                    disabled={guard.busy || chosen.length === 0 || failoverLive || preview.failoverActive}
                   >
                     Restore {chosen.length || ""} item{chosen.length === 1 ? "" : "s"}…
                   </Button>

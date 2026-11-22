@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Cpu, Gauge, Network, RefreshCw, Server, ShieldCheck } from "lucide-react";
 import { apiFetch } from "../../lib/api";
-import { isCancelled } from "../../lib/disruptive";
+import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
+import { resetAll, useDraft } from "../../lib/draft";
 import { cn, formatBytes } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, Input, LiveDot, Select, Skeleton, Switch } from "../../components/ui";
+import { FailoverWarning } from "../../components/obs";
 import { useToastStore } from "../../stores/toast-store";
 import { LoadError, Notice, errText, useGuarded } from "../admin/shared";
 import { Fact } from "./VpnParts";
@@ -235,13 +237,6 @@ export function DataPlaneView() {
   const guard = useGuarded();
   const [busy, setBusy] = useState<string | null>(null);
   const [showVendorSvcs, setShowVendorSvcs] = useState(false);
-  const [ifaceDraft, setIfaceDraft] = useState("rmnet_data0");
-  const [manageDnsDraft, setManageDnsDraft] = useState(true);
-  const [v6ShareDraft, setV6ShareDraft] = useState(true);
-  const [ipptDraft, setIpptDraft] = useState(false);
-  const [ipptMacDraft, setIpptMacDraft] = useState("");
-  const [ipptDevDraft, setIpptDevDraft] = useState("eth0");
-  const [ipptSkipNatDraft, setIpptSkipNatDraft] = useState(true);
 
   const q = useQuery({
     queryKey: KEY_STATUS,
@@ -249,25 +244,14 @@ export function DataPlaneView() {
     refetchInterval: 15000,
   });
 
-  useEffect(() => {
-    const c = q.data?.config;
-    if (!c) return;
-    setIfaceDraft(c.iface);
-    setManageDnsDraft(c.manageDns);
-    setV6ShareDraft(c.ipv6PrefixSharing);
-    setIpptDraft(c.ippt);
-    setIpptMacDraft(c.ipptMac ?? "");
-    setIpptDevDraft(c.ipptDevType || "eth0");
-    setIpptSkipNatDraft(c.ipptSkipNat);
-  }, [
-    q.data?.config.iface,
-    q.data?.config.manageDns,
-    q.data?.config.ipv6PrefixSharing,
-    q.data?.config.ippt,
-    q.data?.config.ipptMac,
-    q.data?.config.ipptDevType,
-    q.data?.config.ipptSkipNat,
-  ]);
+  const cfg = q.data?.config;
+  const [ifaceDraft, setIfaceDraft, ifaceD] = useDraft(cfg?.iface ?? null, "rmnet_data0");
+  const [manageDnsDraft, setManageDnsDraft, manageDnsD] = useDraft(cfg?.manageDns ?? null, true);
+  const [v6ShareDraft, setV6ShareDraft, v6ShareD] = useDraft(cfg?.ipv6PrefixSharing ?? null, true);
+  const [ipptDraft, setIpptDraft, ipptD] = useDraft(cfg?.ippt ?? null, false);
+  const [ipptMacDraft, setIpptMacDraft, ipptMacD] = useDraft(cfg ? cfg.ipptMac ?? "" : null, "");
+  const [ipptDevDraft, setIpptDevDraft, ipptDevD] = useDraft(cfg?.ipptDevType || null, "eth0");
+  const [ipptSkipNatDraft, setIpptSkipNatDraft, ipptSkipNatD] = useDraft(cfg?.ipptSkipNat ?? null, true);
 
   const pq = useQuery({
     queryKey: KEY_PROFILES,
@@ -294,6 +278,7 @@ export function DataPlaneView() {
           ipptSkipNat: ipptSkipNatDraft,
         }),
       });
+      resetAll(ifaceD, manageDnsD, v6ShareD, ipptD, ipptMacD, ipptDevD, ipptSkipNatD);
       toast("Bearer & IPPT settings saved", "success");
       await refresh();
     } catch (e) {
@@ -306,8 +291,13 @@ export function DataPlaneView() {
   async function triggerReconnect() {
     setBusy("reconnect");
     try {
-      await apiFetch("/api/v1/dataplane/reconnect", { method: "POST", body: "{}" });
-      toast("Data plane probe triggered", "success");
+      const isNative = q.data?.config.mode === "native";
+      if (isNative) {
+        await disruptiveFetch("data plane reconnect", "/api/v1/dataplane/reconnect", { method: "POST", body: "{}" });
+      } else {
+        await apiFetch("/api/v1/dataplane/reconnect", { method: "POST", body: "{}" });
+      }
+      toast(isNative ? "Data plane reconnect triggered" : "Data plane probe triggered", "success");
       await refresh();
     } catch (e) {
       if (!isCancelled(e)) toast("Probe failed", "error", errText(e));
@@ -323,19 +313,28 @@ export function DataPlaneView() {
       title: isNative ? "Switch to Native Rust Data Plane?" : "Return to Coexist Mode?",
       body: isNative ? (
         <div className="space-y-2 text-[13px] text-ink-2">
+          <FailoverWarning action="Switching to Native mode" />
           <p>cellcored will stop QCMAP / netmgrd and manage dual-stack QMI WDS bearers + RTNETLINK directly.</p>
           <p>Qualcomm IPA hardware offload (ipacm / rmnet_ipa0) remains active.</p>
         </div>
       ) : (
-        <p className="text-[13px] text-ink-2">Restores vendor QCMAP / netmgrd control and keeps Rust QRTR/QMI in read-only observation mode.</p>
+        <div className="space-y-2 text-[13px] text-ink-2">
+          <FailoverWarning action="Switching back to Coexist mode" />
+          <p>Restores vendor QCMAP / netmgrd control and keeps Rust QRTR/QMI in read-only observation mode.</p>
+        </div>
       ),
       tone: isNative ? "danger" : "primary",
       confirmLabel: isNative ? "Enable Native Mode" : "Switch to Coexist",
       action: (confirm) =>
-        apiFetch("/api/v1/dataplane/config", {
-          method: "POST",
-          body: JSON.stringify(confirm ? { mode: nextMode, confirm } : { mode: nextMode }),
-        }),
+        disruptiveFetch(
+          "data plane mode switch",
+          "/api/v1/dataplane/config",
+          {
+            method: "POST",
+            body: JSON.stringify(confirm ? { mode: nextMode, confirm } : { mode: nextMode }),
+          },
+          { confirmed: true }
+        ),
       onDone: () => void refresh(),
       success: `Data plane mode: ${nextMode}`,
     });
@@ -370,7 +369,7 @@ export function DataPlaneView() {
   async function toggleSfeFastpath(next: boolean) {
     setBusy("sfe");
     try {
-      await apiFetch("/api/v1/dataplane/config", {
+      await disruptiveFetch("SFE fastpath toggle", "/api/v1/dataplane/config", {
         method: "POST",
         body: JSON.stringify({ sfeFastpath: next }),
       });
@@ -546,8 +545,8 @@ export function DataPlaneView() {
                   aria-checked={on}
                   onClick={() => applyMode(opt.id)}
                   className={cn(
-                    "w-full rounded-2xl border p-3.5 text-left transition-colors",
-                    on ? "border-accent bg-accent-soft/40" : "border-line bg-sunk hover:border-line-strong"
+                    "w-full rounded-2xl border p-3.5 text-left transition-colors cursor-pointer",
+                    on ? "border-ember bg-ember-soft" : "border-line bg-sunk hover:border-line-strong"
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -673,6 +672,15 @@ export function DataPlaneView() {
 
         <Card className="space-y-4">
           <CardHeader title="Kernel Offload & Socket Tuning" subtitle="Reversible TCP buffer, qdisc, and RPS/XPS profile" icon={<Gauge className="h-4 w-4" />} />
+          {k.tuningWarnings.length > 0 && (
+            <div className="space-y-2">
+              {k.tuningWarnings.map((w) => (
+                <Notice key={w} tone="warn">
+                  {w}
+                </Notice>
+              ))}
+            </div>
+          )}
           <dl className="grid gap-3 sm:grid-cols-2">
             <Fact label="TCP CC / qdisc">
               {k.tcpCongestionControl || "--"} · {k.defaultQdisc || "--"}

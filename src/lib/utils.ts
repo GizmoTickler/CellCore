@@ -55,23 +55,20 @@ export function maskSecretId(value: string | null | undefined, keepTail = 4): st
 }
 
 export function signalColorClass(kind: "rsrp" | "rsrq" | "sinr", value: number | null): string {
-  if (value == null) return "text-stone-500 dark:text-stone-400";
+  if (value == null) return "text-muted";
   if (kind === "rsrp") {
-    if (value >= -85) return "text-[#1f5f3b] dark:text-[#74c69d]";
-    if (value >= -100) return "text-[#2d7a53] dark:text-[#95d5b2]";
-    if (value >= -112) return "text-[#a05326] dark:text-[#e08e5a]";
-    return "text-[#8c2f4b] dark:text-[#e58ca6]";
+    if (value >= -100) return "text-jade-ink";
+    if (value >= -112) return "text-saffron-ink";
+    return "text-crimson-ink";
   }
   if (kind === "rsrq") {
-    if (value >= -10) return "text-[#1f5f3b] dark:text-[#74c69d]";
-    if (value >= -15) return "text-[#2d7a53] dark:text-[#95d5b2]";
-    if (value >= -20) return "text-[#a05326] dark:text-[#e08e5a]";
-    return "text-[#8c2f4b] dark:text-[#e58ca6]";
+    if (value >= -15) return "text-jade-ink";
+    if (value >= -20) return "text-saffron-ink";
+    return "text-crimson-ink";
   }
-  if (value >= 15) return "text-[#1f5f3b] dark:text-[#74c69d]";
-  if (value >= 5) return "text-[#2d7a53] dark:text-[#95d5b2]";
-  if (value >= 0) return "text-[#a05326] dark:text-[#e08e5a]";
-  return "text-[#8c2f4b] dark:text-[#e58ca6]";
+  if (value >= 5) return "text-jade-ink";
+  if (value >= 0) return "text-saffron-ink";
+  return "text-crimson-ink";
 }
 
 export function signalPercent(kind: "rsrp" | "rsrq" | "sinr", value: number | null): number {

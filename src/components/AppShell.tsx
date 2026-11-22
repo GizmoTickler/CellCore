@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, Copy, Gauge, LogOut, Moon, Palette, Power, RefreshCw, Search, ShieldAlert, Sun, Terminal } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, Copy, Gauge, LogOut, Moon, MoreVertical, Palette, Power, RefreshCw, Search, ShieldAlert, Sun, Terminal, X } from "lucide-react";
 import { apiFetch } from "../lib/api";
 import { disruptiveFetch, isCancelled } from "../lib/disruptive";
 import { NAV, sectionFor } from "../lib/nav";
@@ -262,13 +262,79 @@ function AppearanceDialog({ open, onClose }: { open: boolean; onClose: () => voi
   );
 }
 
+/* ───────────────────────── Live WS Alerts Strip ───────────────────────── */
+
+function AlertsStrip() {
+  const alerts = useWsStore((s) => s.alerts);
+  const dismissAlert = useWsStore((s) => s.dismissAlert);
+  const clearAlerts = useWsStore((s) => s.clearAlerts);
+
+  if (alerts.length === 0) return null;
+
+  return (
+    <div className="space-y-2" role="region" aria-label="Live gateway alerts">
+      {alerts.slice(0, 3).map((a, idx) => {
+        const isCritical = a.type === "cell-lock-alert" || /bypass|fail|down|error|critical|ssr/i.test(a.message);
+        return (
+          <div
+            key={`${a.type}-${a.timestamp}-${idx}`}
+            role="alert"
+            className={cn(
+              "flex items-start gap-2.5 rounded-2xl border px-3.5 py-2.5 text-[12.5px] leading-snug qm-rise",
+              isCritical
+                ? "border-crimson/45 bg-crimson-soft text-crimson-ink"
+                : "border-saffron/45 bg-saffron-soft text-saffron-ink"
+            )}
+          >
+            {isCritical ? (
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            ) : (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            )}
+            <div className="min-w-0 flex-1">
+              <span className="font-bold uppercase tracking-wide text-[10.5px] mr-2 opacity-85">
+                {a.type.replace(/-/g, " ")}
+              </span>
+              <span className="font-medium break-words">{a.message}</span>
+              {a.timestamp && (
+                <span className="ml-2 text-[11px] opacity-75 qm-tabular">{a.timestamp}</span>
+              )}
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {idx === 0 && alerts.length > 1 && (
+                <button
+                  type="button"
+                  onClick={clearAlerts}
+                  className="rounded-full px-2 py-0.5 text-[11px] font-semibold hover:bg-black/10 dark:hover:bg-white/10 cursor-pointer"
+                >
+                  Clear all ({alerts.length})
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => dismissAlert(idx)}
+                aria-label="Dismiss alert"
+                className="rounded-full p-1 hover:bg-black/10 dark:hover:bg-white/10 cursor-pointer"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ───────────────────────── Shell ───────────────────────── */
 
 export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r: NavRoute) => void; children: React.ReactNode }) {
   const [rebootModal, setRebootModal] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [appearanceOpen, setAppearanceOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [rebooting, setRebooting] = useState(false);
+  const mobileMenuRef = useRef<HTMLDivElement>(null);
 
   const theme = useThemeStore((s) => s.theme);
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
@@ -282,21 +348,32 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
   const sub = useRouteStore((s) => s.sub);
   const toast = useToastStore((s) => s.push);
 
-  const modem = useWsStore((s) => s.modem);
-  const connect = useWsStore((s) => s.connect);
+  const publicIp = useWsStore((s) => s.modem?.publicIp ?? null);
+  const modelName = useWsStore((s) => s.modem?.identity?.model || "RM551E-GL");
+  const hydrateBootstrap = useWsStore((s) => s.hydrateBootstrap);
 
   // Failover state + recent events (the WebSocket keeps them fresh after this).
   useEffect(() => {
     void useObsStore.getState().load();
   }, []);
-  const disconnect = useWsStore((s) => s.disconnect);
-  const hydrateBootstrap = useWsStore((s) => s.hydrateBootstrap);
 
   useEffect(() => {
-    void hydrateBootstrap();
-    connect();
-    return () => disconnect();
-  }, [connect, disconnect, hydrateBootstrap]);
+    if (!mobileMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (mobileMenuRef.current && !mobileMenuRef.current.contains(e.target as Node)) {
+        setMobileMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [mobileMenuOpen]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -378,11 +455,11 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       {
         id: "copy-ip",
         label: "Copy public IP",
-        hint: modem?.publicIp ?? "Not known yet",
+        hint: publicIp ?? "Not known yet",
         keywords: "address wan",
         icon: <Copy className="h-4 w-4" />,
         run: () => {
-          if (modem?.publicIp) void copyToClipboard(modem.publicIp).then(() => toast("Public IP copied", "success", modem.publicIp ?? undefined));
+          if (publicIp) void copyToClipboard(publicIp).then(() => toast("Public IP copied", "success", publicIp));
         },
       },
       {
@@ -409,13 +486,17 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
         icon: <Palette className="h-4 w-4" />,
         run: () => setLayoutPref(l.id),
       })),
-      {
-        id: "theme",
-        label: theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
-        keywords: "theme dark light mode",
-        icon: theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />,
-        run: toggleTheme,
-      },
+      ...(!darkOnly
+        ? [
+            {
+              id: "theme",
+              label: theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+              keywords: "theme dark light mode",
+              icon: theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />,
+              run: toggleTheme,
+            },
+          ]
+        : []),
       {
         id: "reboot",
         label: "Reboot gateway…",
@@ -427,7 +508,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       },
       { id: "logout", label: "Sign out", keywords: "logout", icon: <LogOut className="h-4 w-4" />, run: () => void onLogout() },
     ],
-    [hydrateBootstrap, layoutPref, modem?.publicIp, onLogout, setLayoutPref, setSkin, skin, theme, toast, toggleTheme]
+    [darkOnly, hydrateBootstrap, layoutPref, onLogout, publicIp, setLayoutPref, setSkin, skin, theme, toast, toggleTheme]
   );
 
   const activeSection = sectionFor(route as Section);
@@ -449,7 +530,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
   const rail = (
     <aside className="hidden lg:flex lg:w-[264px] shrink-0 flex-col gap-4 sticky top-0 h-screen px-4 py-5 border-r border-line/70">
       <a href="#/" className="px-1">
-        <BrandLogo subtitle={modem?.identity?.model || "RM551E-GL"} />
+        <BrandLogo subtitle={modelName} />
       </a>
       <LinkCapsule />
       <button
@@ -520,7 +601,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       {/* Budgeted so the row never overflows at >= 1024 px (lg) with every section (Admin included) and a
           long link readout: below xl the brand collapses to its mark; only the active section shows its
           label (every item keeps aria-label/title); the link pill and the nav may shrink, never the buttons. */}
-      <div className="mx-auto flex h-16 max-w-[1360px] items-center gap-4 px-6 xl:gap-6 xl:px-8">
+      <div className="mx-auto flex h-16 max-w-[1360px] items-center gap-3 px-5 xl:gap-5 xl:px-8">
         <a href="#/" className="shrink-0" aria-label="CellCore" title="CellCore">
           <span className="xl:hidden">
             <BrandLogo compact />
@@ -540,12 +621,13 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
                 aria-label={sec.label}
                 title={sec.label}
                 className={cn(
-                  "flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full px-3 py-2 text-[13.5px] font-bold transition xl:px-3.5",
+                  "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-2 text-[13px] font-bold transition xl:gap-2 xl:px-3.5 xl:text-[13.5px]",
                   active ? "bg-ink text-paper" : "text-ink-2 hover:bg-sunk hover:text-ink"
                 )}
               >
-                <NavIcon name={sec.icon} className="h-4 w-4" />
-                {active && <span className="hidden xl:inline">{sec.label}</span>}
+                <NavIcon name={sec.icon} className="h-4 w-4 shrink-0" />
+                <span className="xl:hidden">{sec.short}</span>
+                <span className="hidden xl:inline">{sec.label}</span>
               </a>
             );
           })}
@@ -662,15 +744,88 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
           <Button variant="ghost" size="sm" className="px-2" onClick={() => setPaletteOpen(true)} aria-label="Search">
             <Search className="h-4 w-4" />
           </Button>
-          <AppearanceButton compact onClick={() => setAppearanceOpen(true)} />
+          <div ref={mobileMenuRef} className="relative">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="px-2"
+              onClick={() => setMobileMenuOpen((v) => !v)}
+              aria-label="Quick actions"
+              aria-expanded={mobileMenuOpen}
+              aria-haspopup="menu"
+            >
+              <MoreVertical className="h-4 w-4" />
+            </Button>
+            {mobileMenuOpen && (
+              <div
+                role="menu"
+                className="qm-card qm-dialog qm-rise absolute right-0 top-full mt-2 w-52 p-1.5 shadow-[var(--qm-shadow-pop)] z-50"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setAppearanceOpen(true);
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] font-semibold text-ink hover:bg-sunk cursor-pointer"
+                >
+                  <Palette className="h-4 w-4 text-muted" />
+                  Appearance…
+                </button>
+                {!darkOnly && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      toggleTheme();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] font-semibold text-ink hover:bg-sunk cursor-pointer"
+                  >
+                    {theme === "dark" ? <Sun className="h-4 w-4 text-saffron" /> : <Moon className="h-4 w-4 text-muted" />}
+                    {theme === "dark" ? "Light mode" : "Dark mode"}
+                  </button>
+                )}
+                <div className="my-1 border-t border-line" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setRebootModal(true);
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] font-semibold text-crimson-ink hover:bg-crimson-soft cursor-pointer"
+                >
+                  <Power className="h-4 w-4" />
+                  Reboot gateway…
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    void onLogout();
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] font-semibold text-ink-2 hover:bg-sunk hover:text-ink cursor-pointer"
+                >
+                  <LogOut className="h-4 w-4" />
+                  Sign out
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
       <main className="min-w-0 flex-1">
         {layout === "dock" && <StatusLine onSearch={() => setPaletteOpen(true)} />}
         <div className={cn("px-4 sm:px-6 lg:px-10 pt-5 pb-28 lg:pb-12", layout === "rail" ? "lg:pt-9" : "lg:pt-8")}>
-          <div key={route} className={cn("mx-auto w-full space-y-6 qm-rise", layout === "rail" ? "max-w-[1240px]" : "max-w-[1320px]")}>
-            {children}
+          <div className={cn("mx-auto w-full space-y-6", layout === "rail" ? "max-w-[1240px]" : "max-w-[1320px]")}>
+            <AlertsStrip />
+            <div key={route} className="space-y-6 qm-rise">
+              {children}
+            </div>
           </div>
         </div>
       </main>

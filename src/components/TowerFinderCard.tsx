@@ -15,7 +15,8 @@ import {
 import { Badge, Button, Card, Input } from "./ui";
 import { apiFetch } from "@/lib/api";
 import { angularDiffDeg, cardinalFromDeg, parseLatLonInput } from "@/lib/rf";
-import { cn } from "@/lib/utils";
+import { cn, copyToClipboard } from "@/lib/utils";
+import { useWsStore } from "@/stores/ws-store";
 import { TONE_TEXT, rsrpPct, rsrpTone } from "@/pages/cellular/shared";
 
 interface HomeLocation {
@@ -108,8 +109,13 @@ function binColor(rsrp: number): string {
   return "var(--qm-crimson)";
 }
 
-function fmtDist(meters: number): string {
-  if (meters >= 1000) return `${(meters / 1000).toFixed(2)} km (${(meters / 1609.34).toFixed(2)} mi)`;
+function fmtDist(meters: number, unit: "mi" | "km"): string {
+  if (unit === "mi") {
+    const miles = meters / 1609.344;
+    if (miles >= 0.25) return `${miles.toFixed(2)} mi`;
+    return `${Math.round(meters * 3.28084)} ft`;
+  }
+  if (meters >= 1000) return `${(meters / 1000).toFixed(2)} km`;
   return `${Math.round(meters)} m`;
 }
 
@@ -336,19 +342,21 @@ function SightlineMap({
   home,
   target,
   taMeters,
+  unit,
 }: {
   home: HomeLocation | null;
   target: ActiveTowerTarget | null;
   taMeters: number | null;
+  unit: "mi" | "km";
 }) {
-  const [tilesFailed, setTilesFailed] = useState(false);
+  const [failedTileKeys, setFailedTileKeys] = useState<Set<string>>(() => new Set());
   const [mapStyle, setMapStyle] = useState<"street" | "satellite">("street");
   const boxRef = useRef<HTMLDivElement | null>(null);
   const [boxSize, setBoxSize] = useState<{ w: number; h: number }>({ w: 520, h: 240 });
 
   useEffect(() => {
-    setTilesFailed(false);
-  }, [mapStyle]);
+    setFailedTileKeys(new Set());
+  }, [mapStyle, home?.lat, home?.lon, target?.tower.lat, target?.tower.lon]);
 
   useEffect(() => {
     const el = boxRef.current;
@@ -426,31 +434,43 @@ function SightlineMap({
   }
 
   const isSat = mapStyle === "satellite";
-  const labelFill = isSat ? "#ffffff" : "#0f172a";
-  const labelStroke = isSat ? "#0f172a" : "#ffffff";
+  const allTilesFailed = geom.tiles.length > 0 && failedTileKeys.size >= geom.tiles.length;
+  const labelFill = isSat || allTilesFailed ? "#ffffff" : "#0f172a";
+  const labelStroke = isSat || allTilesFailed ? "#0f172a" : "#ffffff";
 
   return (
     <div ref={boxRef} className="relative h-[240px] w-full overflow-hidden rounded-2xl border border-line bg-[#0f172a]">
-      {!tilesFailed && (
+      {!allTilesFailed && (
         <div className="pointer-events-none absolute inset-0">
-          {geom.tiles.map((t) => (
-            <img
-              key={`${mapStyle}-${geom.zoom}-${t.x}-${t.y}`}
-              src={t.url}
-              alt=""
-              width={256}
-              height={256}
-              onError={() => setTilesFailed(true)}
-              style={{
-                position: "absolute",
-                left: `${t.left}px`,
-                top: `${t.top}px`,
-                width: "256px",
-                height: "256px",
-                maxWidth: "none",
-              }}
-            />
-          ))}
+          {geom.tiles.map((t) => {
+            const tileKey = `${mapStyle}-${geom.zoom}-${t.x}-${t.y}`;
+            if (failedTileKeys.has(tileKey)) return null;
+            return (
+              <img
+                key={tileKey}
+                src={t.url}
+                alt=""
+                width={256}
+                height={256}
+                onError={() =>
+                  setFailedTileKeys((prev) => {
+                    if (prev.has(tileKey)) return prev;
+                    const next = new Set(prev);
+                    next.add(tileKey);
+                    return next;
+                  })
+                }
+                style={{
+                  position: "absolute",
+                  left: `${t.left}px`,
+                  top: `${t.top}px`,
+                  width: "256px",
+                  height: "256px",
+                  maxWidth: "none",
+                }}
+              />
+            );
+          })}
         </div>
       )}
       <svg
@@ -460,7 +480,7 @@ function SightlineMap({
         className="relative z-[1] h-full w-full"
       >
         {/* Subtle scrim for crisp overlay legibility */}
-        <rect x="0" y="0" width={geom.W} height={geom.H} fill="#0b1220" fillOpacity={tilesFailed ? 0.95 : isSat ? 0.22 : 0.08} />
+        <rect x="0" y="0" width={geom.W} height={geom.H} fill="#0b1220" fillOpacity={allTilesFailed ? 0.95 : isSat ? 0.22 : 0.08} />
 
         {/* Timing Advance distance ring around Home */}
         {geom.taRadiusPx != null && (
@@ -525,12 +545,12 @@ function SightlineMap({
       <div className="pointer-events-none absolute top-2 left-2 z-[2] flex flex-wrap gap-1.5">
         {target && (
           <span className="rounded-full bg-black/75 px-2.5 py-0.5 text-[11px] font-bold text-emerald-300 backdrop-blur qm-tabular">
-            {target.bearingDeg}° {target.cardinal} · {fmtDist(target.distanceMeters)}
+            {target.bearingDeg}° {target.cardinal} · {fmtDist(target.distanceMeters, unit)}
           </span>
         )}
         {taMeters != null && taMeters > 0 && (
           <span className="rounded-full bg-black/75 px-2.5 py-0.5 text-[10.5px] font-semibold text-amber-300 backdrop-blur qm-tabular">
-            TA ring ~{(taMeters / 1000).toFixed(2)} km
+            TA ring ~{fmtDist(taMeters, unit)}
           </span>
         )}
       </div>
@@ -559,7 +579,7 @@ function SightlineMap({
         </button>
       </div>
 
-      {!tilesFailed && (
+      {!allTilesFailed && (
         <span className="pointer-events-none absolute bottom-1 right-2 z-[2] rounded bg-black/60 px-1.5 py-0.5 text-[9px] text-white/85">
           © Esri
         </span>
@@ -577,6 +597,7 @@ export function TowerFinderCard({
   meanSinr: number | null;
   haptics: boolean;
 }) {
+  const distUnit: "mi" | "km" = useWsStore((s) => (s.settings?.measurementUnit === "km" ? "km" : "mi"));
   const [data, setData] = useState<TowerFinderResponse | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ tone: "ok" | "warn" | "err"; text: string } | null>(null);
@@ -612,10 +633,13 @@ export function TowerFinderCard({
     void load();
   }, [load]);
 
-  // Phone Magnetometer listener (iOS webkitCompassHeading + Android alpha)
+  // Phone Magnetometer listener: prefer deviceorientationabsolute over simultaneous deviceorientation to prevent Android jitter
   useEffect(() => {
     if (!compassActive) return;
-    const onOrient = (ev: DeviceOrientationEvent) => {
+    let sawAbsolute = false;
+    const applyEvent = (ev: DeviceOrientationEvent, isAbsoluteEvent: boolean) => {
+      if (isAbsoluteEvent) sawAbsolute = true;
+      else if (sawAbsolute) return;
       const iosHeading = (ev as DeviceOrientationEvent & { webkitCompassHeading?: number }).webkitCompassHeading;
       let deg: number | null = null;
       if (typeof iosHeading === "number" && Number.isFinite(iosHeading)) {
@@ -628,11 +652,13 @@ export function TowerFinderCard({
         setHeading(rounded);
       }
     };
-    window.addEventListener("deviceorientationabsolute", onOrient as EventListener, true);
-    window.addEventListener("deviceorientation", onOrient as EventListener, true);
+    const onAbs = (ev: Event) => applyEvent(ev as DeviceOrientationEvent, true);
+    const onRel = (ev: Event) => applyEvent(ev as DeviceOrientationEvent, false);
+    window.addEventListener("deviceorientationabsolute", onAbs, true);
+    window.addEventListener("deviceorientation", onRel, true);
     return () => {
-      window.removeEventListener("deviceorientationabsolute", onOrient as EventListener, true);
-      window.removeEventListener("deviceorientation", onOrient as EventListener, true);
+      window.removeEventListener("deviceorientationabsolute", onAbs, true);
+      window.removeEventListener("deviceorientation", onRel, true);
     };
   }, [compassActive]);
 
@@ -899,12 +925,9 @@ export function TowerFinderCard({
   const copyGnb = async () => {
     const val = serving?.gnbId != null ? String(serving.gnbId) : serving?.enbId != null ? String(serving.enbId) : "";
     if (!val) return;
-    try {
-      await navigator.clipboard.writeText(val);
+    if (await copyToClipboard(val)) {
       setCopiedGnb(true);
-      setTimeout(() => setCopiedGnb(false), 1800);
-    } catch {
-      // ignore
+      window.setTimeout(() => setCopiedGnb(false), 1800);
     }
   };
 
@@ -985,7 +1008,7 @@ export function TowerFinderCard({
           {serving.tacDec != null && <span className="text-muted">TAC {serving.tacDec}</span>}
           {serving.taMeters != null && serving.taMeters > 0 && (
             <span className="ml-auto font-semibold text-ember-ink">
-              TA ~{(serving.taMeters / 1000).toFixed(2)} km
+              TA ~{fmtDist(serving.taMeters, distUnit)}
             </span>
           )}
         </div>
@@ -1075,6 +1098,7 @@ export function TowerFinderCard({
             home={data?.home ?? null}
             target={activeTarget}
             taMeters={serving?.taMeters ?? null}
+            unit={distUnit}
           />
 
           {/* TA Cross-Check callout */}
@@ -1089,7 +1113,7 @@ export function TowerFinderCard({
               <div className="qm-subcard p-2">
                 <div className="text-[10px] uppercase font-semibold text-muted">Direct Distance</div>
                 <div className="font-bold text-ink mt-0.5">
-                  {(activeTarget.distanceMeters / 1000).toFixed(2)} km
+                  {fmtDist(activeTarget.distanceMeters, distUnit)}
                 </div>
               </div>
               <div className="qm-subcard p-2">
@@ -1106,7 +1130,7 @@ export function TowerFinderCard({
                 >
                   {activeTarget.taDeltaMeters == null
                     ? "—"
-                    : `${activeTarget.taDeltaMeters >= 0 ? "+" : ""}${Math.round(activeTarget.taDeltaMeters)} m`}
+                    : `${activeTarget.taDeltaMeters >= 0 ? "+" : "-"}${fmtDist(Math.abs(activeTarget.taDeltaMeters), distUnit)}`}
                 </div>
               </div>
             </div>

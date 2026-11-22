@@ -1,11 +1,14 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Check, Cpu, Radio, RefreshCw, ShieldAlert, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
+import { resetAll, useDraft } from "../../lib/draft";
 import { cn } from "../../lib/utils";
 import { useToastStore } from "../../stores/toast-store";
 import { Badge, Button, Card, CardHeader, Input, Meter, Select, Skeleton, Switch } from "../../components/ui";
+import { FailoverWarning } from "../../components/obs";
+import { ConfirmModal } from "./shared";
 import { LoadError, errText } from "../admin/shared";
 
 interface CsiMetrics {
@@ -165,11 +168,20 @@ function parseBandText(raw: string): string[] {
     .filter(Boolean);
 }
 
-function parseArfcnText(raw: string): string[] {
-  return raw
+const ARFCN_TOKEN_RE = /^\d+(?::(?:15|30|60|120))?$/;
+
+function parseArfcnInput(raw: string): { valid: string[]; invalid: string[] } {
+  const tokens = raw
     .split(/[\s,]+/)
     .map((s) => s.trim())
-    .filter((s) => /^\d+(?::(?:15|30|60|120))?$/.test(s));
+    .filter(Boolean);
+  const valid: string[] = [];
+  const invalid: string[] = [];
+  for (const t of tokens) {
+    if (ARFCN_TOKEN_RE.test(t)) valid.push(t);
+    else invalid.push(t);
+  }
+  return { valid, invalid };
 }
 
 export function RadioTuningCard() {
@@ -181,6 +193,45 @@ export function RadioTuningCard() {
     staleTime: 15_000,
   });
 
+  const dspQ = useQuery({
+    queryKey: DSP_KEY,
+    queryFn: () => apiFetch<DspResp>("/api/v1/cellular/dsp"),
+    staleTime: 20_000,
+  });
+
+  const saved = q.data?.tuning;
+  const phy = q.data?.phy;
+  const dsp = dspQ.data?.dsp;
+
+  // Drafts: 15s polling/refetches never clobber edits in progress.
+  const [draft, setDraft, draftD] = useDraft<RadioTuningState | null>(saved ?? null, null);
+  const [ltePrioText, setLtePrioText, ltePrioD] = useDraft(
+    saved ? saved.lteBandPriority.join(":") : null,
+    ""
+  );
+  const [nrPrioText, setNrPrioText, nrPrioD] = useDraft(
+    saved ? saved.nr5gBandPriority.join(":") : null,
+    ""
+  );
+  const [prefFreqText, setPrefFreqText, prefFreqD] = useDraft(
+    saved ? (saved.nr5gPrefFreqList ?? []).join(", ") : null,
+    ""
+  );
+  const [earfcnLockText, setEarfcnLockText, earfcnLockD] = useDraft(
+    saved ? (saved.nr5gEarfcnLock ?? []).join(", ") : null,
+    ""
+  );
+  const [a3OffsetText, setA3OffsetText, a3OffsetD] = useDraft(
+    saved ? (saved.eventA3Offset != null ? String(saved.eventA3Offset) : "") : null,
+    ""
+  );
+  const [busy, setBusy] = useState(false);
+  const [confirmSimSwitch, setConfirmSimSwitch] = useState(false);
+
+  function resetDraft() {
+    resetAll(draftD, ltePrioD, nrPrioD, prefFreqD, earfcnLockD, a3OffsetD);
+  }
+
   async function forceReload() {
     resetDraft();
     try {
@@ -191,33 +242,10 @@ export function RadioTuningCard() {
     }
     void dspQ.refetch();
   }
-  const dspQ = useQuery({
-    queryKey: DSP_KEY,
-    queryFn: () => apiFetch<DspResp>("/api/v1/cellular/dsp"),
-    staleTime: 20_000,
-  });
 
-  const [draft, setDraft] = useState<RadioTuningState | null>(null);
-  const [ltePrioText, setLtePrioText] = useState("");
-  const [nrPrioText, setNrPrioText] = useState("");
-  const [prefFreqText, setPrefFreqText] = useState("");
-  const [earfcnLockText, setEarfcnLockText] = useState("");
-  const [a3OffsetText, setA3OffsetText] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    if (!q.data) return;
-    setDraft(q.data.tuning);
-    setLtePrioText(q.data.tuning.lteBandPriority.join(":"));
-    setNrPrioText(q.data.tuning.nr5gBandPriority.join(":"));
-    setPrefFreqText((q.data.tuning.nr5gPrefFreqList ?? []).join(", "));
-    setEarfcnLockText((q.data.tuning.nr5gEarfcnLock ?? []).join(", "));
-    setA3OffsetText(q.data.tuning.eventA3Offset != null ? String(q.data.tuning.eventA3Offset) : "");
-  }, [q.data]);
-
-  const saved = q.data?.tuning;
-  const phy = q.data?.phy;
-  const dsp = dspQ.data?.dsp;
+  const prefParsed = parseArfcnInput(prefFreqText);
+  const lockParsed = parseArfcnInput(earfcnLockText);
+  const hasInvalidArfcn = prefParsed.invalid.length > 0 || lockParsed.invalid.length > 0;
 
   function buildPatch(): Record<string, unknown> {
     if (!saved || !draft) return {};
@@ -254,13 +282,11 @@ export function RadioTuningCard() {
     if (nextNr.join(":") !== saved.nr5gBandPriority.join(":")) {
       patch.nr5gBandPriority = nextNr;
     }
-    const nextPref = parseArfcnText(prefFreqText);
-    if (nextPref.join(",") !== (saved.nr5gPrefFreqList ?? []).join(",")) {
-      patch.nr5gPrefFreqList = nextPref;
+    if (prefParsed.invalid.length === 0 && prefParsed.valid.join(",") !== (saved.nr5gPrefFreqList ?? []).join(",")) {
+      patch.nr5gPrefFreqList = prefParsed.valid;
     }
-    const nextLock = parseArfcnText(earfcnLockText);
-    if (nextLock.join(",") !== (saved.nr5gEarfcnLock ?? []).join(",")) {
-      patch.nr5gEarfcnLock = nextLock;
+    if (lockParsed.invalid.length === 0 && lockParsed.valid.join(",") !== (saved.nr5gEarfcnLock ?? []).join(",")) {
+      patch.nr5gEarfcnLock = lockParsed.valid;
     }
     const trimmedA3 = a3OffsetText.trim();
     if (trimmedA3 !== "" && Number.isInteger(Number(trimmedA3))) {
@@ -277,32 +303,38 @@ export function RadioTuningCard() {
 
   const patch = buildPatch();
   const dirty = Object.keys(patch).length > 0;
+  const simSlotChanged = patch.simSlot !== undefined;
 
-  function resetDraft() {
-    if (!saved) return;
-    setDraft(saved);
-    setLtePrioText(saved.lteBandPriority.join(":"));
-    setNrPrioText(saved.nr5gBandPriority.join(":"));
-    setPrefFreqText((saved.nr5gPrefFreqList ?? []).join(", "));
-    setEarfcnLockText((saved.nr5gEarfcnLock ?? []).join(", "));
-    setA3OffsetText(saved.eventA3Offset != null ? String(saved.eventA3Offset) : "");
-  }
-
-  async function apply() {
-    if (!dirty) return;
+  async function executeApply(confirmed = false) {
+    if (!dirty || hasInvalidArfcn) return;
     setBusy(true);
     try {
-      const res = await disruptiveFetch<{ note?: string }>("radio tuning", "/api/v1/cellular/tuning", {
-        method: "POST",
-        body: JSON.stringify(patch),
-      });
+      const res = await disruptiveFetch<{ note?: string }>(
+        simSlotChanged ? "SIM slot switch & radio tuning" : "radio tuning",
+        "/api/v1/cellular/tuning",
+        {
+          method: "POST",
+          body: JSON.stringify(patch),
+        },
+        confirmed ? { confirmed: true } : {}
+      );
       toast("Radio tuning applied", "success", res.note);
       await qc.invalidateQueries({ queryKey: KEY });
+      resetDraft();
     } catch (e) {
       if (!isCancelled(e)) toast("Radio tuning failed", "error", errText(e));
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleApplyClick() {
+    if (!dirty || hasInvalidArfcn) return;
+    if (simSlotChanged) {
+      setConfirmSimSwitch(true);
+      return;
+    }
+    void executeApply(false);
   }
 
   async function lockSarZero() {
@@ -694,21 +726,31 @@ export function RadioTuningCard() {
                 <div className="text-[13px] font-semibold text-ink">Preferred 5G NR-ARFCN list</div>
                 <div className="text-[12px] text-muted mt-0.5 mb-2">Up to 32 preferred ARFCN:SCS pairs (e.g. 501390:30; SCS auto-defaults if omitted)</div>
                 <Input
-                  className="font-mono"
+                  className={cn("font-mono", prefParsed.invalid.length > 0 && "border-crimson focus:border-crimson")}
                   placeholder="501390:30, 521310:30"
                   value={prefFreqText}
                   onChange={(e) => setPrefFreqText(e.target.value)}
                 />
+                {prefParsed.invalid.length > 0 && (
+                  <p className="mt-1.5 text-[11.5px] font-medium text-crimson-ink">
+                    Invalid ARFCN entry: <span className="font-mono">{prefParsed.invalid.join(", ")}</span>. Use digits or ARFCN:SCS (15/30/60/120).
+                  </p>
+                )}
               </label>
               <label className="qm-subcard p-3.5 min-w-0 block">
                 <div className="text-[13px] font-semibold text-ink">Multi-ARFCN 5G frequency lock</div>
                 <div className="text-[12px] text-muted mt-0.5 mb-2">Lock PCC attach to ARFCN:SCS pairs (still aggregates SCCs); leave blank to unlock</div>
                 <Input
-                  className="font-mono"
+                  className={cn("font-mono", lockParsed.invalid.length > 0 && "border-crimson focus:border-crimson")}
                   placeholder="501390:30"
                   value={earfcnLockText}
                   onChange={(e) => setEarfcnLockText(e.target.value)}
                 />
+                {lockParsed.invalid.length > 0 && (
+                  <p className="mt-1.5 text-[11.5px] font-medium text-crimson-ink">
+                    Invalid ARFCN entry: <span className="font-mono">{lockParsed.invalid.join(", ")}</span>. Use digits or ARFCN:SCS (15/30/60/120).
+                  </p>
+                )}
               </label>
               {draft.eventA3Enabled !== null && (
                 <div className="qm-subcard p-3.5 min-w-0 md:col-span-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -744,14 +786,35 @@ export function RadioTuningCard() {
                   Discard
                 </Button>
               )}
-              <Button size="sm" variant="primary" disabled={!dirty || busy} onClick={() => void apply()}>
+              <Button size="sm" variant="primary" disabled={!dirty || hasInvalidArfcn || busy} onClick={handleApplyClick}>
                 <Check className="h-3.5 w-3.5" />
-                {busy ? "Applying…" : "Apply Radio Tuning"}
+                {busy ? "Applying…" : simSlotChanged ? `Switch to SIM ${draft.simSlot} & Apply` : "Apply Radio Tuning"}
               </Button>
             </div>
           </div>
         </div>
       )}
+
+      <ConfirmModal
+        open={confirmSimSwitch}
+        title={`Switch active SIM to Slot ${draft?.simSlot ?? ""}?`}
+        body={
+          <div className="space-y-2">
+            <FailoverWarning action="Switching SIM slots" />
+            <p>
+              Changing the hardware USIM slot (<code className="font-mono">AT+QUIMSLOT</code>) drops the active cellular session and re-registers on the new SIM. Make sure a valid SIM is installed in Slot {draft?.simSlot}.
+            </p>
+          </div>
+        }
+        confirmLabel={`Switch to SIM ${draft?.simSlot ?? ""}`}
+        tone="primary"
+        busy={busy}
+        onClose={() => setConfirmSimSwitch(false)}
+        onConfirm={() => {
+          setConfirmSimSwitch(false);
+          void executeApply(true);
+        }}
+      />
     </Card>
   );
 }

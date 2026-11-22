@@ -74,10 +74,28 @@ function store(key: string, value: string) {
   }
 }
 
+function syncThemeColorMeta() {
+  if (typeof document === "undefined" || typeof window === "undefined") return;
+  const apply = () => {
+    const paper = window.getComputedStyle(document.documentElement).getPropertyValue("--qm-paper").trim();
+    if (!paper) return;
+    let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (!meta) {
+      meta = document.createElement("meta");
+      meta.name = "theme-color";
+      document.head.appendChild(meta);
+    }
+    meta.content = paper;
+  };
+  apply();
+  window.requestAnimationFrame(apply);
+}
+
 function applyDomTheme(theme: Theme) {
   if (typeof document === "undefined") return;
   document.documentElement.classList.toggle("dark", theme === "dark");
   store(THEME_STORAGE_KEY, theme);
+  syncThemeColorMeta();
 }
 
 function applyDomSkin(skin: Skin, pref: LayoutPref) {
@@ -88,6 +106,7 @@ function applyDomSkin(skin: Skin, pref: LayoutPref) {
   root.dataset.density = skinMeta(skin).density;
   store(SKIN_STORAGE_KEY, skin);
   store(LAYOUT_STORAGE_KEY, pref);
+  syncThemeColorMeta();
 }
 
 const initialTheme: Theme = (() => {
@@ -116,7 +135,11 @@ const initialLayoutPref: LayoutPref = (() => {
   }
 })();
 
+applyDomTheme(initialTheme);
 applyDomSkin(initialSkin, initialLayoutPref);
+if (typeof window !== "undefined") {
+  window.addEventListener("load", syncThemeColorMeta, { once: true });
+}
 
 export const useThemeStore = create<ThemeState>((set, get) => ({
   theme: initialTheme,

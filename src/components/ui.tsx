@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, Copy, X } from "lucide-react";
 import { cn, copyToClipboard } from "../lib/utils";
@@ -384,20 +384,37 @@ export function SegmentedTabs<T extends string>({
   onChange: (id: T) => void;
   className?: string;
 }) {
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   return (
     <div
       role="tablist"
       className={cn("inline-flex flex-wrap items-center gap-0.5 rounded-full border border-line bg-sunk p-1 max-w-full", className)}
     >
-      {options.map((opt) => {
+      {options.map((opt, idx) => {
         const active = opt.id === value;
         return (
           <button
             key={opt.id}
+            ref={(el) => {
+              tabRefs.current[idx] = el;
+            }}
             role="tab"
             type="button"
             aria-selected={active}
+            tabIndex={active ? 0 : -1}
             onClick={() => onChange(opt.id)}
+            onKeyDown={(e) => {
+              let nextIdx = -1;
+              if (e.key === "ArrowRight") nextIdx = (idx + 1) % options.length;
+              else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + options.length) % options.length;
+              else if (e.key === "Home") nextIdx = 0;
+              else if (e.key === "End") nextIdx = options.length - 1;
+              if (nextIdx >= 0) {
+                e.preventDefault();
+                onChange(options[nextIdx].id);
+                tabRefs.current[nextIdx]?.focus();
+              }
+            }}
             className={cn(
               "inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[12.5px] font-semibold transition-all cursor-pointer whitespace-nowrap",
               active ? "bg-raised text-ink shadow-[0_2px_8px_-3px_rgba(0,0,0,0.3)]" : "text-muted hover:text-ink"
@@ -532,8 +549,7 @@ export function SignalDial({
   onDark?: boolean;
 }) {
   const gid = useId().replace(/:/g, "");
-  const [shown, setShown] = useState<number | null>(value);
-  useEffect(() => setShown(value), [value]);
+  const shown = value;
   const sweep = 260;
   const start = 90 + (360 - sweep) / 2; // degrees, SVG 0° = east, clockwise
   const r = 84;
@@ -632,6 +648,8 @@ export function SignalGauge({ rsrp, sinr, rat }: { rsrp: number | null; sinr: nu
 
 /* ───────────────────────── Overlays ───────────────────────── */
 
+const modalStack: string[] = [];
+
 export function Modal({
   open,
   onClose,
@@ -645,12 +663,51 @@ export function Modal({
   zIndexClass?: string;
   children: React.ReactNode;
 }) {
+  const modalId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    modalStack.push(modalId);
+    const prevActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const prevOverflow = document.body.style.overflow;
+    if (modalStack.length === 1) {
+      document.body.style.overflow = "hidden";
+    }
+
+    const focusTimer = window.requestAnimationFrame(() => {
+      const container = dialogRef.current;
+      if (!container) return;
+      if (container.contains(document.activeElement)) return;
+      const focusable = container.querySelector<HTMLElement>(
+        'input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      (focusable ?? container).focus();
+    });
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && modalStack[modalStack.length - 1] === modalId) {
+        e.stopPropagation();
+        onCloseRef.current();
+      }
+    };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+    return () => {
+      window.cancelAnimationFrame(focusTimer);
+      window.removeEventListener("keydown", onKey);
+      const idx = modalStack.lastIndexOf(modalId);
+      if (idx >= 0) modalStack.splice(idx, 1);
+      if (modalStack.length === 0) {
+        document.body.style.overflow = prevOverflow;
+      }
+      if (prevActive && prevActive.isConnected) {
+        prevActive.focus();
+      }
+    };
+  }, [open, modalId]);
+
   if (!open) return null;
   const dialog = (
     <div
@@ -660,7 +717,12 @@ export function Modal({
       aria-modal="true"
       aria-label={title}
     >
-      <div className="qm-card qm-dialog qm-rise w-full max-w-md p-6 shadow-[var(--qm-shadow-pop)]" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        className="qm-card qm-dialog qm-rise w-full max-w-md max-h-[90vh] overflow-y-auto p-6 shadow-[var(--qm-shadow-pop)] focus:outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-start justify-between gap-2">
           <h4 className="qm-display text-[1.25rem] font-semibold text-ink">{title}</h4>
           <button
@@ -682,6 +744,8 @@ export function Modal({
 export function ToastViewport() {
   const toasts = useToastStore((s) => s.toasts);
   const dismiss = useToastStore((s) => s.dismiss);
+  const pause = useToastStore((s) => s.pause);
+  const resume = useToastStore((s) => s.resume);
   if (toasts.length === 0) return null;
   return (
     <div className="fixed bottom-20 lg:bottom-5 right-0 lg:right-5 z-[70] flex flex-col gap-2 max-w-sm w-full pointer-events-none px-4 lg:px-0">
@@ -689,6 +753,8 @@ export function ToastViewport() {
         <div
           key={t.id}
           role="status"
+          onMouseEnter={() => pause(t.id)}
+          onMouseLeave={() => resume(t.id)}
           className="pointer-events-auto qm-card qm-rise pl-4 pr-2.5 py-3 flex items-start justify-between gap-3 text-[13px] shadow-[var(--qm-shadow-pop)]"
         >
           <span

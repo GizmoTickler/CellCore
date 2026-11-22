@@ -80,7 +80,7 @@ export interface SeriesConfig {
   unit?: string;
 }
 
-export function InteractiveAreaChart({
+export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
   series,
   labels,
   height = 175,
@@ -205,7 +205,7 @@ export function InteractiveAreaChart({
     <div ref={containerRef} className="relative select-none">
       <svg
         viewBox={`0 0 ${width} ${height}`}
-        className="w-full overflow-visible touch-none"
+        className="w-full overflow-visible touch-pan-y"
         style={{ height }}
         onPointerMove={handlePointerMove}
         onPointerLeave={() => setHoverIdx(null)}
@@ -281,6 +281,7 @@ export function InteractiveAreaChart({
             {(() => {
               const pillW = Math.max(46, peakPoint.text.length * 6.2 + 14);
               const px = Math.max(padL + pillW / 2, Math.min(padL + plotW - pillW / 2, peakPoint.x));
+              const tipX = Math.max(px - pillW / 2 + 6, Math.min(px + pillW / 2 - 6, peakPoint.x));
               const py = Math.max(16, peakPoint.y - 12);
               return (
                 <>
@@ -293,7 +294,7 @@ export function InteractiveAreaChart({
                     style={{ fill: "var(--qm-ink)" }}
                   />
                   <polygon
-                    points={`${peakPoint.x - 4},${py + 2} ${peakPoint.x + 4},${py + 2} ${peakPoint.x},${py + 6}`}
+                    points={`${tipX - 4},${py + 2} ${tipX + 4},${py + 2} ${tipX},${py + 6}`}
                     style={{ fill: "var(--qm-ink)" }}
                   />
                   <text
@@ -419,7 +420,7 @@ export function InteractiveAreaChart({
       )}
     </div>
   );
-}
+});
 
 export function SmoothAreaChart({
   values,

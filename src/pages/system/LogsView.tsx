@@ -98,6 +98,7 @@ function Highlight({ text, term }: { text: string; term: string }) {
 export function LogsView({ ctl }: { ctl: SystemController }) {
   const [level, setLevel] = useState<"all" | Level>("all");
   const scroller = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const q = ctl.logsQuery;
   const raw = q.data?.logs;
 
@@ -109,11 +110,21 @@ export function LogsView({ ctl }: { ctl: SystemController }) {
   }, [lines]);
   const shown = level === "all" ? lines : lines.filter((l) => l.level === level);
 
-  // Keep the newest lines in view as the buffer refreshes.
+  // Only auto-scroll on Live updates when user is within ~40px of the bottom.
   useEffect(() => {
     const el = scroller.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [raw, level]);
+    if (!el) return;
+    if (!ctl.logAutoRefresh || stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [raw, level, ctl.logAutoRefresh]);
+
+  const onLogScroll = () => {
+    const el = scroller.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= 40;
+  };
 
   const levelOptions = [
     { id: "all" as const, label: "All", badge: lines.length },
@@ -197,6 +208,7 @@ export function LogsView({ ctl }: { ctl: SystemController }) {
       {/* Viewer */}
       <div
         ref={scroller}
+        onScroll={onLogScroll}
         className="relative max-h-[62vh] min-h-[240px] overflow-auto bg-sunk font-mono text-[12px] leading-[1.55]"
         role="log"
         aria-live="off"
@@ -260,7 +272,10 @@ export function LogsView({ ctl }: { ctl: SystemController }) {
         </span>
         <button
           type="button"
-          onClick={() => scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" })}
+          onClick={() => {
+            stickToBottomRef.current = true;
+            scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
+          }}
           className="inline-flex items-center gap-1 rounded-full px-2 py-1 font-semibold hover:bg-sunk hover:text-ink cursor-pointer"
         >
           <ArrowDownToLine className="h-3.5 w-3.5" /> Newest

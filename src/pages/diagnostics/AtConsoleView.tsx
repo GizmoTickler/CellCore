@@ -3,6 +3,7 @@ import { CornerDownLeft, Eraser, ShieldAlert, Terminal } from "lucide-react";
 import { ApiError, classifyAtCommand, sendAtCommand, type AtClass, type AtClassification } from "../../lib/api";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Card, CopyButton, Input, Kbd, LiveDot, Modal } from "../../components/ui";
+import { useLiveness } from "../../stores/ws-store";
 import { useDiagSession, type HeaderFn } from "./shared";
 
 const AT_PRESETS: Array<{ group: string; items: Array<{ label: string; cmd: string }> }> = [
@@ -77,6 +78,7 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
   const setAtInput = useDiagSession((s) => s.setAtDraft);
   const addAt = useDiagSession((s) => s.addAt);
   const clearAt = useDiagSession((s) => s.clearAt);
+  const liveness = useLiveness();
 
   const [running, setRunning] = useState<string | null>(null);
   const [recallIdx, setRecallIdx] = useState(-1);
@@ -242,7 +244,16 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
               <div className="flex items-center gap-2 min-w-0 font-mono text-[12px] text-ink-2">
                 <Terminal className="h-3.5 w-3.5 shrink-0 text-muted" />
                 <span className="truncate">cellcored ▸ /dev/smd11</span>
-                {running ? <LiveDot tone="ember" /> : <span className="h-2 w-2 rounded-full bg-jade" title="Ready" />}
+                {running ? (
+                  <LiveDot tone="ember" />
+                ) : (
+                  <LiveDot tone={liveness.tone} />
+                )}
+                {!liveness.live && (
+                  <span className="text-[11px] font-sans font-semibold text-saffron-ink">
+                    {liveness.label.split(" ·")[0]}
+                  </span>
+                )}
               </div>
               {entries.length > 0 && <CopyButton value={transcript} label="Copy all" />}
             </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDownRight,
@@ -22,11 +22,14 @@ import {
   VolumeX,
   Zap,
 } from "lucide-react";
-import { Badge, Button, Card, Input, LiveDot } from "../../components/ui";
-import { TowerFinderCard } from "../../components/TowerFinderCard";
-import { cn } from "../../lib/utils";
+import { Badge, Button, Card, Input, LiveDot, Skeleton } from "../../components/ui";
+import { cn, copyToClipboard } from "../../lib/utils";
 import type { AntennaAlignState } from "../../types/cellcore";
 import { TONE_BG, TONE_TEXT, rsrpPct, rsrpTone, rsrpWord } from "./shared";
+
+const TowerFinderCard = lazy(() =>
+  import("../../components/TowerFinderCard").then((m) => ({ default: m.TowerFinderCard }))
+);
 
 type Vec = (number | null)[];
 type AudioMode = "off" | "voice" | "tone" | "geiger";
@@ -396,6 +399,10 @@ export function AlignView({
   const [volume, setVolume] = useState<number>(loadSavedVolume);
   const [wakeEnabled, setWakeEnabled] = useState(false);
   const [wakeActive, setWakeActive] = useState(false);
+  const wakeSupported =
+    typeof navigator !== "undefined" &&
+    "wakeLock" in navigator &&
+    (typeof window === "undefined" || window.isSecureContext);
   const [haptics, setHaptics] = useState(true);
   const [showOutdoorTools, setShowOutdoorTools] = useState(false);
 
@@ -422,6 +429,7 @@ export function AlignView({
   const lastSampleKeyRef = useRef<string>("");
   const prevFocusPeakRef = useRef<number | null>(null);
   const baseCellRef = useRef<{ pci: number | null; band: string } | null>(null);
+  const lastObservedCellRef = useRef<{ pci: number | null; band: string } | null>(null);
 
   // Voice synthesis throttling refs
   const lastSpokenAtRef = useRef<number>(0);
@@ -486,12 +494,16 @@ export function AlignView({
     volume,
   };
 
-  // Auto-enable 4x4 RX keep-awake whenever user solos RX2/RX3 or opens port identifier
-  useEffect(() => {
-    if ((focus === 2 || focus === 3 || detectStep != null) && !keepAwake) {
-      onToggleKeepAwake(true);
-    }
-  }, [focus, detectStep, keepAwake, onToggleKeepAwake]);
+  // Auto-enable 4x4 RX keep-awake only when user explicitly enters RX2/RX3 (never fights clicking OFF)
+  const selectFocus = useCallback(
+    (next: FocusTarget) => {
+      setFocus(next);
+      if ((next === 2 || next === 3) && !keepAwake) {
+        onToggleKeepAwake(true);
+      }
+    },
+    [keepAwake, onToggleKeepAwake]
+  );
 
   const stopToneNodes = useCallback(() => {
     for (const ref of [oscMainRef, oscHarmRef]) {
@@ -753,6 +765,7 @@ export function AlignView({
       align?.servingPci != null || align?.servingBand
         ? { pci: align?.servingPci ?? null, band: align?.servingBand ?? "" }
         : null;
+    lastObservedCellRef.current = baseCellRef.current;
   }, [resetSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset peak tracker when user switches between antennas
@@ -891,18 +904,24 @@ export function AlignView({
       }
     }
 
-    // Serving cell handover check
+    // Serving cell handover check: chime only on cell transitions, never every 400 ms
     const curPci = align?.servingPci ?? null;
     const curBand = align?.servingBand ?? "";
     if (curPci != null || curBand) {
       if (!baseCellRef.current) {
         baseCellRef.current = { pci: curPci, band: curBand };
-      } else if (baseCellRef.current.pci !== curPci || baseCellRef.current.band !== curBand) {
-        setHandover({
-          from: `${baseCellRef.current.band || "?"} PCI ${baseCellRef.current.pci ?? "?"}`,
-          to: `${curBand || "?"} PCI ${curPci ?? "?"}`,
-        });
-        playChime("handover");
+        lastObservedCellRef.current = { pci: curPci, band: curBand };
+      } else {
+        const prevObs = lastObservedCellRef.current;
+        const transitioned = !prevObs || prevObs.pci !== curPci || prevObs.band !== curBand;
+        lastObservedCellRef.current = { pci: curPci, band: curBand };
+        if (transitioned && (baseCellRef.current.pci !== curPci || baseCellRef.current.band !== curBand)) {
+          setHandover({
+            from: `${baseCellRef.current.band || "?"} PCI ${baseCellRef.current.pci ?? "?"}`,
+            to: `${curBand || "?"} PCI ${curPci ?? "?"}`,
+          });
+          playChime("handover");
+        }
       }
     }
   }, [
@@ -974,13 +993,13 @@ export function AlignView({
       const curPos = seq.indexOf(focus);
       const nextPos = (curPos + dir + seq.length) % seq.length;
       const nextTarget = seq[nextPos];
-      setFocus(nextTarget);
+      selectFocus(nextTarget);
       if (audioMode === "voice") {
         const name = nextTarget === "all" ? "All four antennas" : `${CHAINS[nextTarget].id} ${normLabels[nextTarget]}`;
         speakText(name, volume);
       }
     },
-    [audioMode, focus, normLabels, orderedChains, volume]
+    [audioMode, focus, normLabels, orderedChains, selectFocus, volume]
   );
 
   const handleResetActivePeak = useCallback(() => {
@@ -1005,13 +1024,14 @@ export function AlignView({
   // Laptop keyboard shortcuts (0 = All, 1-4 = ordered antennas, N = Next, R = Reset Peak, M = Audio)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (document.querySelector('[role="dialog"]')) return;
       const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
       if (tag === "input" || tag === "textarea" || tag === "select" || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "0") {
-        setFocus("all");
+        selectFocus("all");
       } else if (e.key >= "1" && e.key <= "4") {
         const ch = orderedChains[Number(e.key) - 1];
-        if (ch) setFocus(ch.idx);
+        if (ch) selectFocus(ch.idx);
       } else if (e.key === "n" || e.key === "N") {
         stepFocus(1);
       } else if (e.key === "r" || e.key === "R") {
@@ -1023,7 +1043,7 @@ export function AlignView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [audioMode, handleResetActivePeak, orderedChains, selectAudioMode, stepFocus]);
+  }, [audioMode, handleResetActivePeak, orderedChains, selectAudioMode, selectFocus, stepFocus]);
 
   const startAutoDetect = () => {
     ensureAudioGraph();
@@ -1086,7 +1106,8 @@ export function AlignView({
       (b) =>
         `${b.label}\t${b.meanRsrp ?? "—"}\t${b.peakMeanRsrp ?? "—"}\t${b.meanSinr ?? "—"}\t${b.spread ?? "—"}\t${b.band || "?"} PCI ${b.pci ?? "?"}\t${b.beam ?? "—"}\t${b.ts}`
     );
-    void navigator.clipboard?.writeText([header, ...rows].join("\n")).then(() => {
+    void copyToClipboard([header, ...rows].join("\n")).then((ok) => {
+      if (!ok) return;
       setCopiedBookmarks(true);
       window.setTimeout(() => setCopiedBookmarks(false), 1800);
     });
@@ -1140,7 +1161,7 @@ export function AlignView({
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 qm-tabular">
           <button
             type="button"
-            onClick={() => setFocus("all")}
+            onClick={() => selectFocus("all")}
             className={cn(
               "flex flex-col justify-between rounded-2xl border p-3 text-left transition-all cursor-pointer min-h-[68px]",
               focus === "all"
@@ -1170,7 +1191,7 @@ export function AlignView({
               <button
                 key={c.id}
                 type="button"
-                onClick={() => setFocus(isSel ? "all" : c.idx)}
+                onClick={() => selectFocus(isSel ? "all" : c.idx)}
                 title={`Shortcut key: ${posIdx + 1}`}
                 className={cn(
                   "flex flex-col justify-between rounded-2xl border p-3 text-left transition-all cursor-pointer min-h-[68px]",
@@ -1281,11 +1302,18 @@ export function AlignView({
             <Button
               size="sm"
               variant={wakeEnabled ? "primary" : "ghost"}
-              onClick={() => setWakeEnabled((v) => !v)}
-              title="Keep screen from dimming while aiming"
+              disabled={!wakeSupported}
+              onClick={() => wakeSupported && setWakeEnabled((v) => !v)}
+              title={wakeSupported ? "Keep screen from dimming while aiming" : "Screen Wake Lock requires HTTPS"}
             >
               <Sun className="h-3.5 w-3.5" />
-              {wakeEnabled ? (wakeActive ? "Screen Awake" : "Wake…") : "Wake Lock"}
+              {!wakeSupported
+                ? "HTTPS required"
+                : wakeEnabled
+                  ? wakeActive
+                    ? "Screen Awake"
+                    : "Wake…"
+                  : "Wake Lock"}
             </Button>
           </div>
         </div>
@@ -1444,7 +1472,15 @@ export function AlignView({
             >
               Accept &amp; reset peaks
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setHandover(null)}>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                baseCellRef.current = { pci: align?.servingPci ?? null, band: align?.servingBand ?? "" };
+                lastObservedCellRef.current = baseCellRef.current;
+                setHandover(null);
+              }}
+            >
               Dismiss
             </Button>
           </div>
@@ -1653,7 +1689,7 @@ export function AlignView({
               rsrq={rsrq[c.idx] ?? null}
               focused={focus === c.idx}
               dimmed={focus !== "all" && focus !== c.idx}
-              onSelect={() => setFocus(focus === c.idx ? "all" : c.idx)}
+              onSelect={() => selectFocus(focus === c.idx ? "all" : c.idx)}
             />
           ))}
         </div>
@@ -1767,7 +1803,9 @@ export function AlignView({
 
       {showOutdoorTools && (
         <>
-          <TowerFinderCard meanRsrp={summary.meanCur} meanSinr={summary.meanSinr} haptics={haptics} />
+          <Suspense fallback={<Skeleton className="h-64" />}>
+            <TowerFinderCard meanRsrp={summary.meanCur} meanSinr={summary.meanSinr} haptics={haptics} />
+          </Suspense>
 
           <Card>
             <div className="flex flex-wrap items-start justify-between gap-3 mb-3">

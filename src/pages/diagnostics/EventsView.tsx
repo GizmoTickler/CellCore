@@ -4,6 +4,7 @@ import { Activity, ChevronDown, RefreshCw } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { cn, formatBitrate, formatBytes, formatDuration } from "../../lib/utils";
 import { useObsStore } from "../../stores/obs-store";
+import { useLiveness } from "../../stores/ws-store";
 import type { EventType, EventsResponse, ObsEvent } from "../../types/obs";
 import { Badge, Button, Card, CardHeader, LiveDot, SegmentedTabs, Skeleton } from "../../components/ui";
 import { EVENT_GROUPS, EVENT_META, clockTime, eventLabel, eventTone, severityLabel, type EventGroup } from "../../components/obs";
@@ -134,6 +135,7 @@ export function EventsView({ header }: { header: HeaderFn }) {
   const [groups, setGroups] = useState<EventGroup[]>([]);
   const eventSeq = useObsStore((s) => s.eventSeq);
   const failover = useObsStore((s) => s.failover);
+  const liveness = useLiveness();
 
   const typeParam = groups.length ? typesFor(groups).join(",") : "";
   const sinceSecs = RANGE_SECS[range];
@@ -182,7 +184,7 @@ export function EventsView({ header }: { header: HeaderFn }) {
       {header(
         <>
           <span className="inline-flex items-center gap-2 rounded-full border border-line bg-surface px-3 py-1.5 text-[12px] font-semibold text-ink-2">
-            <LiveDot tone="jade" /> Live
+            <LiveDot tone={liveness.tone} /> {liveness.live ? "Live" : liveness.label.split(" ·")[0]}
           </span>
           <Button variant="secondary" size="sm" onClick={() => void q.refetch()} disabled={q.isFetching}>
             <RefreshCw className={cn("h-3.5 w-3.5", q.isFetching && "animate-spin")} /> Refresh

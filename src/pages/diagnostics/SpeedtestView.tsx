@@ -96,7 +96,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
 
   async function startSpeedtestRun() {
     setBusy("speedtest");
-    resetSpeedtest();
     try {
       const serverId = engine === "auto" && selectedServerId ? Number(selectedServerId) : undefined;
       const payload: Record<string, unknown> = { engine };
@@ -105,6 +104,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      resetSpeedtest();
     } catch (e) {
       if (!isCancelled(e)) push("Couldn't start the speedtest", "error", errMsg(e, "Failed to start speedtest"));
     } finally {

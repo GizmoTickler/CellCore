@@ -35,13 +35,15 @@ export function NetworkPage() {
   const lanQuery = useQuery({
     queryKey: ["network-lan"],
     queryFn: () => apiFetch<NetworkLanResponse>("/api/v1/network/lan"),
-    refetchInterval: 20000,
+    enabled: tab === "lan" || tab === "policy",
+    refetchInterval: tab === "lan" || tab === "policy" ? 20000 : false,
   });
 
   const usageQuery = useQuery({
     queryKey: ["network-data-usage"],
     queryFn: () => apiFetch<DataUsageState>("/api/v1/network/data-usage"),
-    refetchInterval: 30000,
+    enabled: tab === "usage",
+    refetchInterval: tab === "usage" ? 30000 : false,
   });
 
   const effectiveUsage = wsUsage ?? usageQuery.data ?? null;

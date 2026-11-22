@@ -2,6 +2,7 @@ import React, { useCallback, useState } from "react";
 import { useQuery, type UseQueryOptions } from "@tanstack/react-query";
 import { AlertTriangle, Info, ShieldAlert } from "lucide-react";
 import { ApiError, apiFetch } from "../../lib/api";
+import { isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
 import { Button, Input, Modal } from "../../components/ui";
 import { useToastStore } from "../../stores/toast-store";
@@ -75,6 +76,10 @@ export function useGuarded() {
       if (state.spec.success) toast(state.spec.success, "success");
       state.spec.onDone?.(res);
     } catch (e) {
+      if (isCancelled(e)) {
+        setState(null);
+        return;
+      }
       if (e instanceof ApiError && e.status === 428 && typeof e.data?.confirm === "string") {
         setTyped("");
         setState({ ...state, phrase: e.data.confirm as string, serverMsg: e.message });

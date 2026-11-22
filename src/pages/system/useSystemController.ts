@@ -98,7 +98,13 @@ export function useSystemController(tab: SysTab) {
   const [logSource, setLogSource] = useState<"quecmanager" | "system">("system");
   const [logLines, setLogLines] = useState("100");
   const [logSearch, setLogSearch] = useState("");
+  const [debouncedLogSearch, setDebouncedLogSearch] = useState("");
   const [logAutoRefresh, setLogAutoRefresh] = useState(false);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedLogSearch(logSearch), 300);
+    return () => window.clearTimeout(t);
+  }, [logSearch]);
 
 
   const [smtpSender, setSmtpSender] = useState("");
@@ -164,10 +170,10 @@ export function useSystemController(tab: SysTab) {
   });
 
   const logsQuery = useQuery({
-    queryKey: ["sys-logs", logSource, logLines, logSearch],
+    queryKey: ["sys-logs", logSource, logLines, debouncedLogSearch],
     queryFn: () =>
       apiFetch<{ logs?: string[]; source?: string }>(
-        `/api/v1/system/logs?source=${logSource}&lines=${encodeURIComponent(logLines)}&search=${encodeURIComponent(logSearch)}`
+        `/api/v1/system/logs?source=${logSource}&lines=${encodeURIComponent(logLines)}&search=${encodeURIComponent(debouncedLogSearch)}`
       ),
     enabled: tab === "logs",
     refetchInterval: tab === "logs" && logAutoRefresh ? 5000 : false,
@@ -176,10 +182,11 @@ export function useSystemController(tab: SysTab) {
   // Drafts: a refetch never overwrites a schedule or recipient being edited.
   const sr = maintQuery.data?.scheduledReboot;
   const [rebTime, setRebTime, rebTimeD] = useDraft(sr?.time || null, "04:00");
-  const [rebDays, , rebDaysD] = useDraft<string[]>(
+  const [rebDays, setRebDays, rebDaysD] = useDraft<string[]>(
     Array.isArray(sr?.days) && sr.days.length > 0 ? sr.days : null,
     DEFAULT_REB_DAYS
   );
+  const rebDirty = rebTimeD.dirty || rebDaysD.dirty;
   const [smtpRecipient, setSmtpRecipient, recipientD] = useDraft(maintQuery.data?.alerts?.recipient || null, "");
 
   async function loadSecrets(revealAfter = true) {
@@ -230,20 +237,28 @@ export function useSystemController(tab: SysTab) {
     }
     setBusy("imei-save");
     try {
-      const res = await apiFetch<{ message?: string }>("/api/v1/modem/imei", {
-        method: "POST",
-        body: JSON.stringify({
-          imei: clean,
-          password: imeiPasswordInput,
-          applyNow: imeiApplyNow,
-        }),
+      const payload = JSON.stringify({
+        imei: clean,
+        password: imeiPasswordInput,
+        applyNow: imeiApplyNow,
       });
+      const res = imeiApplyNow
+        ? await disruptiveFetch<{ message?: string }>(
+            "IMEI update & radio restart",
+            "/api/v1/modem/imei",
+            { method: "POST", body: payload },
+            { confirmed: true }
+          )
+        : await apiFetch<{ message?: string }>("/api/v1/modem/imei", {
+            method: "POST",
+            body: payload,
+          });
       setImeiPasswordInput("");
       setImeiModalOpen(false);
       await hydrateBootstrap();
       notify("ok", res.message || "Modem IMEI updated");
     } catch (err) {
-      notify("err", err instanceof Error ? err.message : "IMEI update failed");
+      if (!isCancelled(err)) notify("err", err instanceof Error ? err.message : "IMEI update failed");
     } finally {
       setBusy(null);
     }
@@ -497,6 +512,8 @@ export function useSystemController(tab: SysTab) {
     rebTime,
     setRebTime,
     rebDays,
+    setRebDays,
+    rebDirty,
     saveScheduledReboot,
     smtpSender,
     setSmtpSender,

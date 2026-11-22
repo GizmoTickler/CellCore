@@ -223,9 +223,12 @@ export function NotificationsCard({ smtpConfigured }: { smtpConfigured: boolean 
           subtitle="Push events to your phone, inbox or monitoring"
           icon={<BellRing className="h-4 w-4" />}
           action={
-            <Badge variant={!d.enabled ? "neutral" : failedTotal > 0 && st?.lastError ? "warning" : "success"} dot>
-              {!d.enabled ? "Off" : `${sentTotal} sent${failedTotal ? ` · ${failedTotal} failed` : ""}`}
-            </Badge>
+            <div className="flex items-center gap-1.5">
+              {draft.dirty && <Badge variant="warning">Unsaved</Badge>}
+              <Badge variant={!d.enabled ? "neutral" : failedTotal > 0 && st?.lastError ? "warning" : "success"} dot>
+                {!d.enabled ? "Off" : `${sentTotal} sent${failedTotal ? ` · ${failedTotal} failed` : ""}`}
+              </Badge>
+            </div>
           }
         />
         <div className="space-y-4">
@@ -246,9 +249,9 @@ export function NotificationsCard({ smtpConfigured }: { smtpConfigured: boolean 
             title="Email"
             hint={
               smtpConfigured || st?.emailReady ? (
-                <Verdict tone="jade">Uses the email account below</Verdict>
+                <Verdict tone="jade">Uses the email account above</Verdict>
               ) : (
-                <Verdict tone="saffron">Set up the email account below first</Verdict>
+                <Verdict tone="saffron">Set up the email account above first</Verdict>
               )
             }
             on={d.email}
@@ -380,7 +383,12 @@ export function NotificationsCard({ smtpConfigured }: { smtpConfigured: boolean 
       </Card>
 
       <Card className="lg:col-span-5 min-w-0">
-        <CardHeader title="What to send" subtitle="Per event type, with quiet hours and limits" icon={<ShieldAlert className="h-4 w-4" />} />
+        <CardHeader
+          title="What to send"
+          subtitle="Per event type, with quiet hours and limits"
+          icon={<ShieldAlert className="h-4 w-4" />}
+          action={draft.dirty ? <Badge variant="warning">Unsaved</Badge> : undefined}
+        />
         <div className="space-y-5">
           {grouped.map((g) => (
             <div key={g.id}>
@@ -442,6 +450,17 @@ export function NotificationsCard({ smtpConfigured }: { smtpConfigured: boolean 
               This is the only feature here that talks to the modem: each check reads the SIM inbox (a few light AT commands). Everything else uses data the
               daemon already has.
             </p>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line pt-4">
+            {draft.dirty && (
+              <Button variant="ghost" size="sm" onClick={() => draft.reset()} disabled={busy != null}>
+                Discard
+              </Button>
+            )}
+            <Button variant="primary" size="sm" onClick={() => void save()} disabled={busy != null || !draft.dirty}>
+              {busy === "save" ? "Saving…" : "Save changes"}
+            </Button>
           </div>
         </div>
       </Card>
