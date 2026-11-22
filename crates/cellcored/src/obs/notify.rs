@@ -414,7 +414,8 @@ fn local_minute() -> u16 {
 pub async fn run_notifier(mut rx: mpsc::Receiver<Event>) {
     while let Some(ev) = rx.recv().await {
         let cfg = lock(&obs().config).notify.clone();
-        let verdict = lock(&obs().notify).gate.decide(&cfg, ev.kind, ev.severity, &ev.title, now_secs(), local_minute());
+        let mono_secs = crate::state::mono_ms() / 1000;
+        let verdict = lock(&obs().notify).gate.decide(&cfg, ev.kind, ev.severity, &ev.title, mono_secs, local_minute());
         match verdict {
             Err(why) => {
                 *lock(&obs().notify).suppressed.entry(why.as_str()).or_insert(0) += 1;

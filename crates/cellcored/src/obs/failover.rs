@@ -173,15 +173,31 @@ pub struct FailoverRuntime {
     pub source: Option<Source>,
     /// When the current state (active or standby) began (unix seconds).
     pub since: u64,
+    /// Monotonic timestamp (`mono_ms()`) when the current state began.
+    pub since_mono_ms: u64,
     pub hint: Option<(Role, Instant)>,
     pub episode: Option<Episode>,
-    episode_started_mono: Option<Instant>,
+    pub(crate) episode_started_mono: Option<Instant>,
     pub last_episode: Option<EpisodeSummary>,
+    /// Monotonic timestamp (`mono_ms()`) when a scheduled reboot was deferred.
+    pub deferred_reboot_mono_ms: Option<u64>,
     /// Work already reported as deferred in this episode (one event each).
     pub deferred_noted: Vec<&'static str>,
 }
 
 impl FailoverRuntime {
+    /// Monotonic elapsed seconds of the current episode (falling back to wall clock only on resumed episodes).
+    pub fn episode_elapsed_secs(&self, now_wall: u64) -> u64 {
+        if let Some(mono) = self.episode_started_mono {
+            mono.elapsed().as_secs()
+        } else {
+            self.episode
+                .as_ref()
+                .map(|e| now_wall.saturating_sub(e.started_at))
+                .unwrap_or(0)
+        }
+    }
+
     /// Continue an episode that was running when the daemon restarted. The
     /// throughput side starts "on", so the episode ends only after
     /// `release_secs` of low traffic (or a standby hint), not on the first tick.
@@ -190,6 +206,7 @@ impl FailoverRuntime {
         self.throughput.active = true;
         self.source = Some(ep.source);
         self.since = ep.started_at;
+        self.since_mono_ms = crate::state::mono_ms();
         self.episode = Some(ep);
         self.episode_started_mono = None;
         ACTIVE.store(true, Ordering::Relaxed);
@@ -228,6 +245,7 @@ impl FailoverRuntime {
         }
         self.active = want;
         let prev_since = std::mem::replace(&mut self.since, now);
+        self.since_mono_ms = crate::state::mono_ms();
         self.deferred_noted.clear();
         if want {
             let ep = Episode { started_at: now, bytes: 0, source: source.unwrap_or(Source::Throughput) };
@@ -372,6 +390,9 @@ pub fn status_json() -> serde_json::Value {
 }
 
 pub fn broadcast_status() {
+    if !obs().has_ws_clients() {
+        return;
+    }
     obs().broadcast(&serde_json::json!({ "channel": "failover", "failover": status_json() }));
 }
 
@@ -403,6 +424,7 @@ pub fn defer_scheduled_reboot(now: u64) {
         first
     };
     if first {
+        lock(&obs().failover).deferred_reboot_mono_ms = Some(crate::state::mono_ms());
         work_deferred("scheduled reboot", "runs after 10 min back in standby, or is dropped after 6 h");
     }
 }
@@ -428,14 +450,24 @@ pub async fn check_deferred_reboot(state: &AppState, now: u64) {
     let Some(at) = lock(&obs().persisted).deferred_reboot_at else {
         return;
     };
-    let (active, since) = {
-        let f = lock(&obs().failover);
-        (f.active, f.since)
+    let mono_now_s = crate::state::mono_ms() / 1000;
+    let (active, since_mono_s, deferred_mono_s) = {
+        let mut f = lock(&obs().failover);
+        let def_ms = *f.deferred_reboot_mono_ms.get_or_insert_with(crate::state::mono_ms);
+        let s_ms = if f.since_mono_ms == 0 {
+            f.since_mono_ms = crate::state::mono_ms();
+            f.since_mono_ms
+        } else {
+            f.since_mono_ms
+        };
+        (f.active, s_ms / 1000, def_ms / 1000)
     };
-    match deferred_reboot_action(at, now, active, since) {
+    let _ = now;
+    match deferred_reboot_action(deferred_mono_s, mono_now_s, active, since_mono_s) {
         DeferredReboot::Wait => {}
         DeferredReboot::Drop => {
             lock(&obs().persisted).deferred_reboot_at = None;
+            lock(&obs().failover).deferred_reboot_mono_ms = None;
             obs().mark_state_dirty();
             emit(
                 EventKind::ScheduledReboot,
@@ -446,6 +478,7 @@ pub async fn check_deferred_reboot(state: &AppState, now: u64) {
         }
         DeferredReboot::Run => {
             lock(&obs().persisted).deferred_reboot_at = None;
+            lock(&obs().failover).deferred_reboot_mono_ms = None;
             obs().mark_state_dirty();
             emit(
                 EventKind::ScheduledReboot,
@@ -485,6 +518,10 @@ pub fn disruptive_action(method: &Method, path: &str) -> Option<&'static str> {
         ("POST", "/api/v1/vpn/warp/connection") => Some("WARP tunnel up/down"),
         ("POST", "/api/v1/vpn/warp/remove") => Some("WARP removal"),
         ("POST", "/api/v1/vpn/tailscale/settings") => Some("Tailscale exit node change"),
+        ("POST", "/api/v1/dataplane/config") => Some("dataplane config change"),
+        ("POST", "/api/v1/dataplane/reconnect") => Some("dataplane reconnect"),
+        ("POST", "/api/v1/network/lan") => Some("network/LAN change"),
+        ("POST", "/api/v1/modem/at") => Some("raw AT command"),
         _ => None,
     }
 }
@@ -731,6 +768,20 @@ mod tests {
         let ts = disruptive_action(&Method::POST, "/api/v1/vpn/tailscale/settings");
         assert_eq!(guard_verdict(true, ts, "/api/v1/vpn/tailscale/settings", &serde_json::json!({"ssh":true}), None), GuardVerdict::Pass);
         assert_eq!(guard_verdict(true, ts, "/api/v1/vpn/tailscale/settings", &serde_json::json!({"exitNode":"nas01"}), None), GuardVerdict::Block);
+        // v1.6.0: dataplane config/reconnect, network/lan, and raw modem/at are gated while active
+        for path in [
+            "/api/v1/dataplane/config",
+            "/api/v1/dataplane/reconnect",
+            "/api/v1/network/lan",
+            "/api/v1/modem/at",
+        ] {
+            let act = disruptive_action(&Method::POST, path);
+            assert!(act.is_some(), "expected {path} to be guarded");
+            assert_eq!(guard_verdict(true, act, path, &null, None), GuardVerdict::Block, "{path}");
+            assert_eq!(guard_verdict(true, act, path, &serde_json::json!({"force":true}), None), GuardVerdict::Forced, "{path}");
+            assert_eq!(guard_verdict(false, act, path, &null, None), GuardVerdict::Pass, "{path}");
+            assert!(disruptive_action(&Method::GET, path).is_none(), "GET {path} must not be gated");
+        }
     }
 
     #[test]

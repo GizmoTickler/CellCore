@@ -168,6 +168,14 @@ pub struct RadioTuningState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RrcResidencySecs {
+    pub connected: u64,
+    pub idle: u64,
+    pub inactive: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PhyDiagnostics {
     pub nr5g_csi: Option<CsiMetrics>,
@@ -186,6 +194,14 @@ pub struct PhyDiagnostics {
     pub air_security: Option<AirSecurityInfo>,
     pub rrc_state: Option<RrcStateInfo>,
     pub rrc_time_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrc_residency: Option<RrcResidencySecs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nr5g_dl_bler: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nr5g_ul_bler: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte_dl_bler: Option<f64>,
     pub c_rnti: Option<u32>,
     pub overheat_ind: Option<bool>,
     pub sfe_enabled: Option<bool>,
@@ -634,6 +650,72 @@ pub(crate) fn parse_rrc_time_info(body: &str) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join(" | "))
 }
 
+/// Parse `+QNWCFG: "rrc_time_info",...` into numeric cumulative residency seconds
+/// (`connected`, `idle`, `inactive`) for Prometheus `cellcore_rrc_residency_seconds_total`.
+pub(crate) fn parse_rrc_residency_secs(body: &str) -> Option<RrcResidencySecs> {
+    let tails = extract_all_keyed_tails(body, "rrc_time_info");
+    if tails.is_empty() {
+        return None;
+    }
+    let mut tot = RrcResidencySecs::default();
+    let mut parsed_any = false;
+    for tail in tails {
+        let parts: Vec<&str> = tail.split(',').map(|s| s.trim().trim_matches('"')).collect();
+        if parts.is_empty() || parts[0] == "0" {
+            continue;
+        }
+        if parts.len() >= 4
+            && parts[0] == "1"
+            && parts[1].bytes().any(|b| b.is_ascii_alphabetic())
+            && let (Ok(c), Ok(i)) = (parts[2].parse::<u64>(), parts[3].parse::<u64>())
+        {
+            let inact = parts.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            tot.connected = tot.connected.saturating_add(c);
+            tot.idle = tot.idle.saturating_add(i);
+            tot.inactive = tot.inactive.saturating_add(inact);
+            parsed_any = true;
+            continue;
+        }
+        let nums: Vec<u64> = parts.iter().filter_map(|s| s.parse::<u64>().ok()).collect();
+        match nums.as_slice() {
+            [1, lte_c, lte_i, nr_c, nr_i, ..] => {
+                tot.connected = tot.connected.saturating_add(*lte_c).saturating_add(*nr_c);
+                tot.idle = tot.idle.saturating_add(*lte_i).saturating_add(*nr_i);
+                if let Some(&inact) = nums.get(5) {
+                    tot.inactive = tot.inactive.saturating_add(inact);
+                }
+                parsed_any = true;
+            }
+            [1, conn, idle, inact] => {
+                tot.connected = tot.connected.saturating_add(*conn);
+                tot.idle = tot.idle.saturating_add(*idle);
+                tot.inactive = tot.inactive.saturating_add(*inact);
+                parsed_any = true;
+            }
+            [1, conn, idle] => {
+                tot.connected = tot.connected.saturating_add(*conn);
+                tot.idle = tot.idle.saturating_add(*idle);
+                parsed_any = true;
+            }
+            _ => {}
+        }
+    }
+    parsed_any.then_some(tot)
+}
+
+/// Parse optional BLER percentage from `+QNWCFG: "<key>",1,<bler_pct>` (clamped to `0..=100`).
+pub(crate) fn parse_bler_pct(body: &str, key: &str) -> Option<f64> {
+    let tail = extract_keyed_tail(body, key)?;
+    let parts: Vec<&str> = tail.split(',').map(|s| s.trim().trim_matches('"')).collect();
+    let cand = match parts.as_slice() {
+        ["1", v, ..] => v.parse::<f64>().ok(),
+        ["0", ..] => None,
+        [v] => v.parse::<f64>().ok(),
+        _ => None,
+    }?;
+    (cand.is_finite() && (0.0..=100.0).contains(&cand)).then_some((cand * 100.0).round() / 100.0)
+}
+
 pub(crate) fn resolve_overheat_ind(dsp: &crate::qmi::dsp::DspTelemetrySnapshot) -> Option<bool> {
     if dsp.any_throttling {
         Some(true)
@@ -1070,6 +1152,10 @@ fn parse_phy_from_bodies(
         air_security: parse_used_algo(used_algo, rrc_state.as_ref()),
         rrc_state,
         rrc_time_summary: parse_rrc_time_info(rrc_time),
+        rrc_residency: parse_rrc_residency_secs(rrc_time),
+        nr5g_dl_bler: parse_bler_pct(dl_mcs, "nr5g_dl_bler"),
+        nr5g_ul_bler: parse_bler_pct(ul_mcs, "nr5g_ul_bler"),
+        lte_dl_bler: parse_bler_pct(lte_csi, "lte_dl_bler"),
         c_rnti: parse_c_rnti(c_rnti),
         overheat_ind: overheat,
         sfe_enabled: sfe,
@@ -1203,15 +1289,31 @@ pub async fn enable_phy_telemetry_counters(app: &crate::state::AppState) {
 
 /// Lightweight PHY-only poll used by the 30 s background loop to keep Prometheus
 /// metrics warm without querying all 36 tuning keys.
-/// Skips `lte_csi` on `NR5G-SA` and caches `AT+QMAP="SFE"` in `SFE_AT_CACHE`.
+/// Skips `lte_csi` on `NR5G-SA`, caches `AT+QMAP="SFE"` in `SFE_AT_CACHE`, and
+/// gates connected-only PHY commands (`nr5g_ambr`, `nr5g_qos`, `used_algo`, `c_rnti`)
+/// on `RRC=Connected` or active WebSocket subscribers.
 pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagnostics, String> {
-    let skip_lte_csi = app
-        .modem
-        .read()
-        .await
-        .serving
-        .as_ref()
-        .is_some_and(|s| s.rat == "NR5G-SA");
+    let (skip_lte_csi, rrc_connected_serving, is_registered) = {
+        let m = app.modem.read().await;
+        let skip_lte = m.serving.as_ref().is_some_and(|s| s.rat == "NR5G-SA");
+        let conn = m
+            .serving
+            .as_ref()
+            .is_some_and(|s| s.state.eq_ignore_ascii_case("CONNECT"));
+        let reg = m.identity.cfun == 1 && crate::telemetry::is_modem_registered(m.serving.as_ref());
+        (skip_lte, conn, reg)
+    };
+    let (prev_rrc_conn, prev_qos, prev_ambr_caps, prev_ambr_str) = {
+        let p = app.phy_diag.read().await;
+        (
+            p.rrc_state.as_ref().is_some_and(|r| r.state_code == 2),
+            p.qos_bearers.clone(),
+            p.ambr_caps.clone(),
+            p.nr5g_ambr.clone(),
+        )
+    };
+    let poll_connected_only =
+        rrc_connected_serving || prev_rrc_conn || app.ws_tx.receiver_count() > 0;
     let native_mode = crate::dataplane::is_native_mode();
     let cached_sfe = if native_mode {
         Some(crate::dataplane::is_sfe_loaded())
@@ -1226,6 +1328,9 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
             continue;
         }
         if idx == 6 && cached_sfe.is_some() {
+            continue;
+        }
+        if !poll_connected_only && matches!(idx, 5 | 11 | 14 | 15) {
             continue;
         }
         active_indices.push(idx);
@@ -1261,7 +1366,7 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
         let dsp = app.dsp_telemetry.read().await;
         resolve_overheat_ind(&dsp)
     };
-    let phy = parse_phy_from_bodies(
+    let mut phy = parse_phy_from_bodies(
         body(0),
         body(1),
         body(2),
@@ -1280,8 +1385,19 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
         body(14),
         body(15),
     );
+    if !poll_connected_only && is_registered {
+        if phy.qos_bearers.is_empty() {
+            phy.qos_bearers = prev_qos;
+        }
+        if phy.ambr_caps.is_empty() {
+            phy.ambr_caps = prev_ambr_caps;
+            phy.nr5g_ambr = prev_ambr_str;
+        }
+    }
     crate::obs::events::on_phy_diagnostics(&phy);
     *app.phy_diag.write().await = phy.clone();
+    app.phy_diag_updated_ms
+        .store(crate::state::mono_ms(), Ordering::Release);
     Ok(phy)
 }
 
@@ -1321,6 +1437,8 @@ pub async fn read_tuning_snapshot(app: &crate::state::AppState) -> Result<(Radio
     }
     crate::obs::events::on_phy_diagnostics(&phy);
     *app.phy_diag.write().await = phy.clone();
+    app.phy_diag_updated_ms
+        .store(crate::state::mono_ms(), Ordering::Release);
     Ok((tuning, phy))
 }
 
@@ -1757,6 +1875,23 @@ mod tests {
             parse_rrc_time_info(r#"+QNWCFG: "rrc_time_info",1,300,45"#).as_deref(),
             Some("Connected 300s · Idle 45s")
         );
+        assert_eq!(
+            parse_rrc_residency_secs(r#"+QNWCFG: "rrc_time_info",1,"NR5G",1420,85,12"#),
+            Some(RrcResidencySecs { connected: 1420, idle: 85, inactive: 12 })
+        );
+        assert_eq!(
+            parse_rrc_residency_secs(
+                "+QNWCFG: \"rrc_time_info\",1,\"LTE\",100,20,5\r\n+QNWCFG: \"rrc_time_info\",1,\"NR5G\",1420,85,12"
+            ),
+            Some(RrcResidencySecs { connected: 1520, idle: 105, inactive: 17 })
+        );
+        assert_eq!(
+            parse_rrc_residency_secs(r#"+QNWCFG: "rrc_time_info",1,300,45"#),
+            Some(RrcResidencySecs { connected: 300, idle: 45, inactive: 0 })
+        );
+        assert_eq!(parse_rrc_residency_secs(r#"+QNWCFG: "rrc_time_info",0"#), None);
+        assert_eq!(parse_bler_pct(r#"+QNWCFG: "nr5g_dl_bler",1,2.35"#, "nr5g_dl_bler"), Some(2.35));
+        assert_eq!(parse_bler_pct(r#"+QNWCFG: "nr5g_dl_bler",0,5.0"#, "nr5g_dl_bler"), None);
         let mut dsp = crate::qmi::dsp::DspTelemetrySnapshot::default();
         assert_eq!(resolve_overheat_ind(&dsp), None);
         dsp.qrtr_available = true;

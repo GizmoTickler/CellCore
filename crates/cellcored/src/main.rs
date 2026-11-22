@@ -59,7 +59,10 @@ use crate::{
         ModemSnapshot, SystemInternals, TMP_QM_DIR, TrafficRuntime, UptimeTelemetry,
         load_json_or_default, load_settings_from_uci_and_disk,
     },
-    telemetry::{flush_persistent_state, load_initial_data_usage, spawn_background_tasks, spawn_liveness_watchdog},
+    telemetry::{
+        flush_persistent_state, load_initial_cell_lock_bypass, load_initial_data_usage,
+        spawn_background_tasks, spawn_liveness_watchdog,
+    },
 };
 
 fn parse_addrs(raw: &str) -> Vec<SocketAddr> {
@@ -68,14 +71,62 @@ fn parse_addrs(raw: &str) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn format_listen_addrs(primary: Option<std::net::Ipv4Addr>, port: u16) -> Vec<SocketAddr> {
+fn format_listen_addrs_with_extra(
+    primary: Option<std::net::Ipv4Addr>,
+    extra: &[std::net::Ipv4Addr],
+    port: u16,
+) -> Vec<SocketAddr> {
     match primary {
-        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() => vec![
-            SocketAddr::from((ip, port)),
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ],
+        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            let mut out = vec![
+                SocketAddr::from((ip, port)),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ];
+            for &e in extra {
+                let sa = SocketAddr::from((e, port));
+                if !e.is_unspecified() && !out.contains(&sa) {
+                    out.push(sa);
+                }
+            }
+            out
+        }
         _ => vec![SocketAddr::from(([0, 0, 0, 0], port))],
     }
+}
+
+#[cfg(test)]
+fn format_listen_addrs(primary: Option<std::net::Ipv4Addr>, port: u16) -> Vec<SocketAddr> {
+    format_listen_addrs_with_extra(primary, &[], port)
+}
+
+fn extract_loopback_mgmt_ipv4s(
+    links: &[netlink::NetlinkLink],
+    addrs: &[netlink::NetlinkAddr],
+) -> Vec<std::net::Ipv4Addr> {
+    let Some(lo_idx) = links.iter().find(|l| l.name == "lo").map(|l| l.ifindex) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for a in addrs {
+        if a.ifindex != lo_idx || a.family != libc::AF_INET as u8 || a.prefix_len != 32 {
+            continue;
+        }
+        if let Ok(ip) = a.address.parse::<std::net::Ipv4Addr>() {
+            let [o0, o1, _, _] = ip.octets();
+            if o0 == 10 && o1 == 254 && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn detect_loopback_mgmt_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    let (Ok(links), Ok(addrs)) = (netlink::list_links(), netlink::list_addrs()) else {
+        return Vec::new();
+    };
+    extract_loopback_mgmt_ipv4s(&links, &addrs)
 }
 
 fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
@@ -85,14 +136,19 @@ fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     })
 }
 
-fn resolve_listen_addrs(env_key: &str, detected_lan: Option<std::net::Ipv4Addr>, port: u16) -> Vec<SocketAddr> {
+fn resolve_listen_addrs(
+    env_key: &str,
+    detected_lan: Option<std::net::Ipv4Addr>,
+    loopback_mgmt: &[std::net::Ipv4Addr],
+    port: u16,
+) -> Vec<SocketAddr> {
     if let Ok(raw) = env::var(env_key) {
         let parsed = parse_addrs(&raw);
         if !parsed.is_empty() {
             return parsed;
         }
     }
-    format_listen_addrs(detected_lan, port)
+    format_listen_addrs_with_extra(detected_lan, loopback_mgmt, port)
 }
 
 fn main() {
@@ -156,13 +212,16 @@ async fn async_main() {
     let _ = fs::create_dir_all(paths::p(TMP_QM_DIR));
     let _ = fs::create_dir_all(paths::p(&format!("{TMP_QM_DIR}/signal_graphs")));
 
-    let detected_lan = if env::var_os("QM_HTTPS_ADDR").is_some() && env::var_os("QM_HTTP_ADDR").is_some() {
-        None
-    } else {
-        tokio::task::spawn_blocking(detect_lan_ipv4).await.ok().flatten()
-    };
-    let https_addrs = resolve_listen_addrs("QM_HTTPS_ADDR", detected_lan, 443);
-    let http_addrs = resolve_listen_addrs("QM_HTTP_ADDR", detected_lan, 80);
+    let (detected_lan, loopback_mgmt) =
+        if env::var_os("QM_HTTPS_ADDR").is_some() && env::var_os("QM_HTTP_ADDR").is_some() {
+            (None, Vec::new())
+        } else {
+            tokio::task::spawn_blocking(|| (detect_lan_ipv4(), detect_loopback_mgmt_ipv4s()))
+                .await
+                .unwrap_or((None, Vec::new()))
+        };
+    let https_addrs = resolve_listen_addrs("QM_HTTPS_ADDR", detected_lan, &loopback_mgmt, 443);
+    let http_addrs = resolve_listen_addrs("QM_HTTP_ADDR", detected_lan, &loopback_mgmt, 80);
     let enforce_uhttpd_loopback = https_addrs.iter().any(|a| a.port() == 443);
 
     let report = tokio::task::spawn_blocking(move || run_boot_reconcile(enforce_uhttpd_loopback))
@@ -192,6 +251,8 @@ async fn async_main() {
     let data_usage = load_initial_data_usage();
     let speedtest_history = load_json_or_default(SPEEDTEST_HISTORY_PATH);
     let settings = load_settings_from_uci_and_disk();
+    let initial_https_redirect = settings.https_redirect;
+    let (init_bypassed, init_bypass_reason) = load_initial_cell_lock_bypass();
 
     let internals = SystemInternals {
         last_reconcile: Some(report),
@@ -246,9 +307,19 @@ async fn async_main() {
         tokens: tokens::TokenStore::new(Some(PathBuf::from(crate::paths::p(tokens::TOKENS_PATH)))),
         radio: Default::default(),
         radio_lock: Default::default(),
-        cell_lock_bypassed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        hb_telemetry_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        cell_lock_bypassed: Arc::new(std::sync::atomic::AtomicBool::new(init_bypassed)),
+        cell_lock_bypass_reason: Arc::new(std::sync::atomic::AtomicU8::new(init_bypass_reason.to_u8())),
+        recovery_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        https_redirect_cached: Arc::new(std::sync::atomic::AtomicBool::new(initial_https_redirect)),
+        hb_rf_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        hb_net_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        hb_linkwatch_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
         hb_http_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+        qscan_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        phy_diag_updated_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        dsp_telemetry_updated_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        process_rss_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        process_open_fds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         last_sim_slot: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -327,6 +398,87 @@ mod tests {
         assert_eq!(
             super::format_listen_addrs(Some(Ipv4Addr::new(127, 0, 0, 1)), 80),
             vec![SocketAddr::from(([0, 0, 0, 0], 80))]
+        );
+        assert_eq!(
+            super::format_listen_addrs_with_extra(
+                Some(Ipv4Addr::new(192, 168, 224, 1)),
+                &[Ipv4Addr::new(10, 254, 224, 1), Ipv4Addr::new(10, 254, 228, 1)],
+                443,
+            ),
+            vec![
+                SocketAddr::from(([192, 168, 224, 1], 443)),
+                SocketAddr::from(([127, 0, 0, 1], 443)),
+                SocketAddr::from(([10, 254, 224, 1], 443)),
+                SocketAddr::from(([10, 254, 228, 1], 443)),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_only_10_254_slash_32_loopback_mgmt_ips() {
+        use std::net::Ipv4Addr;
+        let links = vec![
+            crate::netlink::NetlinkLink {
+                ifindex: 1,
+                name: "lo".into(),
+                up: true,
+                lower_up: true,
+                mtu: 65536,
+                kind: None,
+                rmnet_mux_id: None,
+                master_index: None,
+            },
+            crate::netlink::NetlinkLink {
+                ifindex: 2,
+                name: "br-lan".into(),
+                up: true,
+                lower_up: true,
+                mtu: 1500,
+                kind: None,
+                rmnet_mux_id: None,
+                master_index: None,
+            },
+        ];
+        let addrs = vec![
+            crate::netlink::NetlinkAddr {
+                ifindex: 1,
+                family: libc::AF_INET as u8,
+                address: "127.0.0.1".into(),
+                prefix_len: 8,
+                scope: 254,
+            },
+            crate::netlink::NetlinkAddr {
+                ifindex: 1,
+                family: libc::AF_INET as u8,
+                address: "10.254.228.1".into(),
+                prefix_len: 32,
+                scope: 0,
+            },
+            crate::netlink::NetlinkAddr {
+                ifindex: 1,
+                family: libc::AF_INET as u8,
+                address: "10.254.224.1".into(),
+                prefix_len: 32,
+                scope: 0,
+            },
+            crate::netlink::NetlinkAddr {
+                ifindex: 1,
+                family: libc::AF_INET as u8,
+                address: "10.254.1.1".into(),
+                prefix_len: 24,
+                scope: 0,
+            },
+            crate::netlink::NetlinkAddr {
+                ifindex: 2,
+                family: libc::AF_INET as u8,
+                address: "10.254.99.1".into(),
+                prefix_len: 32,
+                scope: 0,
+            },
+        ];
+        assert_eq!(
+            super::extract_loopback_mgmt_ipv4s(&links, &addrs),
+            vec![Ipv4Addr::new(10, 254, 224, 1), Ipv4Addr::new(10, 254, 228, 1)]
         );
     }
 }

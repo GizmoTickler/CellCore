@@ -30,7 +30,8 @@ use crate::{
     sms::{encode_submit_pdus, parse_cmgl_response},
     speedtest::{SPEEDTEST_HISTORY_PATH, list_nearby_servers_cached, stop_speedtest},
     state::{
-        AppState, ETC_QM_DIR, format_now_hms, redact_sensitive, save_json_atomic,
+        AppState, ETC_QM_DIR, format_now_hms, redact_sensitive, save_json_atomic_async,
+        save_json_compact_atomic_async, save_json_compact_tmpfs_async,
     },
     telemetry::{
         DATA_USAGE_PATH, DATA_USAGE_TMP_PATH, icmp_ping_once, refresh_modem_snapshot,
@@ -352,10 +353,10 @@ pub async fn post_modem_imei(
 
     let current_imei = ctx.app.secrets.read().await.imei.clone();
     if !current_imei.is_empty() && validate_imei_luhn(&current_imei) && current_imei != imei {
-        ensure_uci_config_file("quecmanager").await;
+        ensure_uci_config_file("cellcore").await;
         let _ = uci_set("cellcore.imei", "imei").await;
         let _ = uci_set("cellcore.imei.previous", &current_imei).await;
-        let _ = uci_commit("quecmanager").await;
+        let _ = uci_commit("cellcore").await;
         ctx.app.secrets.write().await.previous_imei = Some(current_imei);
     }
 
@@ -1444,23 +1445,26 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
                 return err_resp(StatusCode::BAD_REQUEST, "Times must be HH:MM (24 h)");
             }
         }
-        let mut s = ctx.app.settings.write().await;
-        if let Some(en) = body.schedule_enabled {
-            s.cell_lock_sched_enabled = en;
-        }
-        if let Some(st) = body.start_time {
-            s.cell_lock_start_time = st;
-        }
-        if let Some(et) = body.end_time {
-            s.cell_lock_end_time = et;
-        }
-        if let Some(dm_en) = body.cell_lock_deadman_enabled {
-            s.cell_lock_deadman_enabled = dm_en;
-        }
-        if let Some(dm_secs) = body.cell_lock_deadman_secs {
-            s.cell_lock_deadman_secs = dm_secs;
-        }
-        if let Err(e) = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600) {
+        let (snap, dm_en, dm_secs) = {
+            let mut s = ctx.app.settings.write().await;
+            if let Some(en) = body.schedule_enabled {
+                s.cell_lock_sched_enabled = en;
+            }
+            if let Some(st) = body.start_time {
+                s.cell_lock_start_time = st;
+            }
+            if let Some(et) = body.end_time {
+                s.cell_lock_end_time = et;
+            }
+            if let Some(dm_en) = body.cell_lock_deadman_enabled {
+                s.cell_lock_deadman_enabled = dm_en;
+            }
+            if let Some(dm_secs) = body.cell_lock_deadman_secs {
+                s.cell_lock_deadman_secs = dm_secs;
+            }
+            (s.clone(), s.cell_lock_deadman_enabled, s.cell_lock_deadman_secs)
+        };
+        if let Err(e) = crate::state::save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await {
             return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save the cell-lock schedule: {e}"));
         }
         let bypassed = ctx
@@ -1470,8 +1474,8 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
         return Json(serde_json::json!({
             "status": "success",
             "bypassed": bypassed,
-            "cellLockDeadmanEnabled": s.cell_lock_deadman_enabled,
-            "cellLockDeadmanSecs": s.cell_lock_deadman_secs,
+            "cellLockDeadmanEnabled": dm_en,
+            "cellLockDeadmanSecs": dm_secs,
         }))
         .into_response();
     }
@@ -1536,9 +1540,7 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
         }
         _ => return err_resp(StatusCode::BAD_REQUEST, "rat must be nr5g or lte"),
     }
-    ctx.app
-        .cell_lock_bypassed
-        .store(false, std::sync::atomic::Ordering::Release);
+    crate::telemetry::clear_cell_lock_bypass_state(&ctx.app);
 
     // Keep the lock across modem reboots (save_ctrl), then the daemon's own
     // record of it. The lock itself is already applied: a failure in either
@@ -1557,7 +1559,7 @@ pub async fn post_cell_lock(State(ctx): State<HttpCtx>, Json(body): Json<CellLoc
             Duration::from_secs(6),
         )
         .await;
-    let saved = save_json_atomic(SETTINGS_JSON_PATH, &s, 0o600);
+    let saved = crate::state::save_json_atomic_async(SETTINGS_JSON_PATH, s.clone(), 0o600).await;
     let not_saved = saved.as_ref().err().map(|e| format!("; the lock was not saved to the settings either: {e}")).unwrap_or_default();
     match save_ctrl {
         Ok(r) if !r.ok => {
@@ -1661,15 +1663,11 @@ pub async fn delete_cell_lock(State(ctx): State<HttpCtx>, Query(q): Query<RatQue
     {
         let s = ctx.app.settings.read().await;
         if s.cell_lock_lte.is_empty() && s.cell_lock_nr5g.is_empty() {
-            ctx.app
-                .cell_lock_bypassed
-                .store(false, std::sync::atomic::Ordering::Release);
+            crate::telemetry::clear_cell_lock_bypass_state(&ctx.app);
         }
     }
-    let saved = {
-        let s = ctx.app.settings.read().await.clone();
-        save_json_atomic(SETTINGS_JSON_PATH, &s, 0o600)
-    };
+    let s_snap = ctx.app.settings.read().await.clone();
+    let saved = crate::state::save_json_atomic_async(SETTINGS_JSON_PATH, s_snap, 0o600).await;
     if !transport.is_empty() || !rejected.is_empty() {
         let status = if transport.is_empty() { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::BAD_GATEWAY };
         let mut msg: Vec<String> = transport.into_iter().chain(rejected).collect();
@@ -1741,6 +1739,9 @@ pub async fn post_cell_scan(State(ctx): State<HttpCtx>, body: axum::body::Bytes)
         return Json(serde_json::json!({ "status": "running", "message": "Cell scan already running" })).into_response();
     }
     *guard = Some(serde_json::json!({ "startedAt": now_secs(), "mode": mode_label }));
+    ctx.app
+        .qscan_started_ms
+        .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
     drop(guard);
 
     let app = ctx.app.clone();
@@ -1783,6 +1784,8 @@ pub async fn post_cell_scan(State(ctx): State<HttpCtx>, body: axum::body::Bytes)
             }
         }
         *app.qscan_running.lock().await = None;
+        app.qscan_started_ms
+            .store(0, std::sync::atomic::Ordering::Release);
     });
 
     Json(serde_json::json!({ "status": "started", "mode": mode_label })).into_response()
@@ -2307,6 +2310,68 @@ pub fn check_partner_speed_limit(ethtool_out: &str, limit: &str) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+async fn clean_live_tcpmss_rules(ifaces: &[String]) {
+    for bin in ["iptables", "ip6tables"] {
+        let Ok(rules) = run_cmd(bin, &["-t", "mangle", "-S", "FORWARD"], Duration::from_secs(3)).await else {
+            continue;
+        };
+        for line in rules.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("-A FORWARD ") || !trimmed.contains("TCPMSS") {
+                continue;
+            }
+            let matches_wan = ifaces.iter().any(|i| trimmed.contains(i))
+                || trimmed.contains("rmnet_data")
+                || trimmed.contains("wwan");
+            if !matches_wan {
+                continue;
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            if toks.len() < 3 {
+                continue;
+            }
+            let mut del_args: Vec<&str> = Vec::with_capacity(toks.len() + 2);
+            del_args.extend(["-t", "mangle", "-D"]);
+            del_args.extend(&toks[1..]);
+            let _ = run_cmd(bin, &del_args, Duration::from_secs(3)).await;
+        }
+    }
+}
+
+async fn apply_live_tcpmss_rules(ifaces: &[String], mtu_val: u32) {
+    if !(1280..1500).contains(&mtu_val) {
+        return;
+    }
+    let mss4 = (mtu_val - 40).to_string();
+    let mss6 = (mtu_val - 60).to_string();
+    for iface in ifaces {
+        let trimmed = iface.trim();
+        if !trimmed.starts_with("rmnet_data") && !trimmed.starts_with("wwan") {
+            continue;
+        }
+        for dir in ["-o", "-i"] {
+            let _ = run_cmd(
+                "iptables",
+                &[
+                    "-t", "mangle", "-A", "FORWARD", dir, trimmed, "-p", "tcp",
+                    "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss4,
+                ],
+                Duration::from_secs(3),
+            )
+            .await;
+            let _ = run_cmd(
+                "ip6tables",
+                &[
+                    "-t", "mangle", "-A", "FORWARD", dir, trimmed, "-p", "tcp",
+                    "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss6,
+                ],
+                Duration::from_secs(3),
+            )
+            .await;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3062,11 +3127,16 @@ pub async fn post_network_lan(State(ctx): State<HttpCtx>, Json(body): Json<Netwo
                 return err_resp(StatusCode::INTERNAL_SERVER_ERROR, e);
             }
             let _ = run_cmd("ethtool", &["-r", "eth0"], Duration::from_secs(3)).await;
-            ensure_uci_config_file("quecmanager").await;
+            ensure_uci_config_file("cellcore").await;
             let _ = uci_set("cellcore.eth_link", "eth_link").await;
             let _ = uci_set("cellcore.eth_link.speed_limit", &limit).await;
-            let _ = uci_commit("quecmanager").await;
-            ctx.app.settings.write().await.eth_link_speed = limit;
+            let _ = uci_commit("cellcore").await;
+            let snap = {
+                let mut s = ctx.app.settings.write().await;
+                s.eth_link_speed = limit;
+                s.clone()
+            };
+            let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
             Json(serde_json::json!({ "status": "success" })).into_response()
         }
         NetworkMutateReq::Ttl { enabled, ttl, hl } => {
@@ -3111,23 +3181,45 @@ pub async fn post_network_lan(State(ctx): State<HttpCtx>, Json(body): Json<Netwo
                 }
                 mtu
             } else {
-                let _ = fs::remove_file(crate::paths::p("/etc/firewall.user.mtu"));
+                let mapped_mtu = crate::paths::p("/etc/firewall.user.mtu");
+                let _ = tokio::task::spawn_blocking(move || fs::remove_file(&mapped_mtu)).await;
                 1500
             };
-            let ifaces = detect_wan_rmnet_ifaces_blocking();
+            let ifaces = tokio::task::spawn_blocking(detect_wan_rmnet_ifaces_blocking)
+                .await
+                .unwrap_or_default();
+            // Always clean stale TCPMSS clamp rules before applying updated ones (or disabling).
+            clean_live_tcpmss_rules(&ifaces).await;
             let val_s = val.to_string();
-            let mut lines = String::new();
             for iface in &ifaces {
                 let _ = run_cmd("ip", &["link", "set", iface, "mtu", &val_s], Duration::from_secs(3)).await;
-                if enabled {
-                    lines.push_str(&format!("ip link set {iface} mtu {val_s}\n"));
-                }
             }
             if enabled {
-                let _ = crate::state::atomic_write(Path::new("/etc/firewall.user.mtu"), lines.as_bytes(), 0o644);
-                ctx.app.settings.write().await.mtu_value = Some(val);
+                let script = crate::reconcile::build_mtu_firewall_script(&ifaces, u32::from(val));
+                if !script.is_empty() {
+                    let mapped_mtu = crate::paths::p("/etc/firewall.user.mtu");
+                    let script_bytes = script.into_bytes();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::state::atomic_write(Path::new(&mapped_mtu), &script_bytes, 0o644)
+                    })
+                    .await;
+                }
+                if (1280..1500).contains(&val) {
+                    apply_live_tcpmss_rules(&ifaces, u32::from(val)).await;
+                }
+                let snap = {
+                    let mut s = ctx.app.settings.write().await;
+                    s.mtu_value = Some(val);
+                    s.clone()
+                };
+                let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
             } else {
-                ctx.app.settings.write().await.mtu_value = None;
+                let snap = {
+                    let mut s = ctx.app.settings.write().await;
+                    s.mtu_value = None;
+                    s.clone()
+                };
+                let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
             }
             Json(serde_json::json!({ "status": "success" })).into_response()
         }
@@ -3203,26 +3295,32 @@ where
 }
 
 pub async fn post_data_usage(State(ctx): State<HttpCtx>, Json(body): Json<DataUsageConfigReq>) -> Response {
-    let mut u = ctx.app.data_usage.write().await;
-    if let Some(d) = body.billing_cycle_day {
-        // 29-31 are valid: short months start the cycle on their last day.
-        u.billing_cycle_day = d.clamp(1, 31);
-    }
-    if let Some(q) = body.quota_bytes {
-        u.quota_bytes = q;
-    }
-    let _ = save_json_atomic(DATA_USAGE_PATH, &*u, 0o600);
-    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o600);
-    Json(serde_json::json!({ "status": "success", "dataUsage": *u })).into_response()
+    let snap = {
+        let mut u = ctx.app.data_usage.write().await;
+        if let Some(d) = body.billing_cycle_day {
+            // 29-31 are valid: short months start the cycle on their last day.
+            u.billing_cycle_day = d.clamp(1, 31);
+        }
+        if let Some(q) = body.quota_bytes {
+            u.quota_bytes = q;
+        }
+        u.clone()
+    };
+    let _ = save_json_compact_atomic_async(DATA_USAGE_PATH, snap.clone(), 0o600).await;
+    let _ = save_json_compact_tmpfs_async(DATA_USAGE_TMP_PATH, snap.clone(), 0o600).await;
+    Json(serde_json::json!({ "status": "success", "dataUsage": snap })).into_response()
 }
 
 pub async fn delete_data_usage(State(ctx): State<HttpCtx>) -> Response {
-    let mut u = ctx.app.data_usage.write().await;
-    u.daily.clear();
-    u.monthly.clear();
-    let _ = save_json_atomic(DATA_USAGE_PATH, &*u, 0o600);
-    let _ = save_json_atomic(DATA_USAGE_TMP_PATH, &*u, 0o600);
-    Json(serde_json::json!({ "status": "success", "dataUsage": *u })).into_response()
+    let snap = {
+        let mut u = ctx.app.data_usage.write().await;
+        u.daily.clear();
+        u.monthly.clear();
+        u.clone()
+    };
+    let _ = save_json_compact_atomic_async(DATA_USAGE_PATH, snap.clone(), 0o600).await;
+    let _ = save_json_compact_tmpfs_async(DATA_USAGE_TMP_PATH, snap.clone(), 0o600).await;
+    Json(serde_json::json!({ "status": "success", "dataUsage": snap })).into_response()
 }
 
 pub async fn get_health(State(ctx): State<HttpCtx>) -> Response {
@@ -3324,39 +3422,42 @@ pub async fn post_quecwatch(State(ctx): State<HttpCtx>, Json(body): Json<LinkWat
     {
         return err_resp(StatusCode::BAD_REQUEST, "preferredSimSlot must be 0 (none), 1, or 2");
     }
-    let mut s = ctx.app.settings.write().await;
-    s.quecwatch_enabled = body.enabled;
-    if let Some(t) = target {
-        s.quecwatch_target = t;
-    }
-    if let Some(i) = body.ping_interval {
-        s.quecwatch_interval_sec = i.clamp(15, 3600);
-    }
-    if let Some(f) = body.ping_failures {
-        s.quecwatch_failures = f.clamp(1, 20);
-    }
-    if let Some(r) = body.max_retries {
-        s.quecwatch_max_retries = r.clamp(1, 20);
-    }
-    if let Some(v) = body.connection_refresh {
-        s.quecwatch_connection_refresh = v;
-    }
-    if let Some(v) = body.auto_sim_failover {
-        s.quecwatch_auto_sim_failover = v;
-    }
-    if let Some(slot) = body.preferred_sim_slot {
-        s.preferred_sim_slot = slot;
-    }
-    if let Some(mins) = body.sim_failback_mins {
-        s.sim_failback_mins = mins.clamp(1, 1440);
-    }
-    if let Some(v) = body.high_latency_monitoring {
-        s.quecwatch_high_latency = v;
-    }
-    if let Some(v) = body.latency_ceiling {
-        s.quecwatch_latency_ceiling = v.clamp(20, 2000);
-    }
-    let _ = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600);
+    let snap = {
+        let mut s = ctx.app.settings.write().await;
+        s.quecwatch_enabled = body.enabled;
+        if let Some(t) = target {
+            s.quecwatch_target = t;
+        }
+        if let Some(i) = body.ping_interval {
+            s.quecwatch_interval_sec = i.clamp(15, 3600);
+        }
+        if let Some(f) = body.ping_failures {
+            s.quecwatch_failures = f.clamp(1, 20);
+        }
+        if let Some(r) = body.max_retries {
+            s.quecwatch_max_retries = r.clamp(1, 20);
+        }
+        if let Some(v) = body.connection_refresh {
+            s.quecwatch_connection_refresh = v;
+        }
+        if let Some(v) = body.auto_sim_failover {
+            s.quecwatch_auto_sim_failover = v;
+        }
+        if let Some(slot) = body.preferred_sim_slot {
+            s.preferred_sim_slot = slot;
+        }
+        if let Some(mins) = body.sim_failback_mins {
+            s.sim_failback_mins = mins.clamp(1, 1440);
+        }
+        if let Some(v) = body.high_latency_monitoring {
+            s.quecwatch_high_latency = v;
+        }
+        if let Some(v) = body.latency_ceiling {
+            s.quecwatch_latency_ceiling = v.clamp(20, 2000);
+        }
+        s.clone()
+    };
+    let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
     Json(serde_json::json!({ "status": "success" })).into_response()
 }
 
@@ -3412,20 +3513,23 @@ pub async fn post_latency(State(ctx): State<HttpCtx>, Json(body): Json<LatencyCf
         Some(Err(e)) => return err_resp(StatusCode::BAD_REQUEST, e),
         None => None,
     };
-    let mut s = ctx.app.settings.write().await;
-    if let Some(v) = body.enabled {
-        s.ping_enabled = v;
-    }
-    if let Some(h) = host {
-        s.ping_host = h;
-    }
-    if let Some(i) = body.interval {
-        s.ping_interval_sec = i.clamp(2, 60);
-    }
-    if let Some(k) = body.keep_alive {
-        s.keep_alive_enabled = k;
-    }
-    let _ = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600);
+    let snap = {
+        let mut s = ctx.app.settings.write().await;
+        if let Some(v) = body.enabled {
+            s.ping_enabled = v;
+        }
+        if let Some(h) = host {
+            s.ping_host = h;
+        }
+        if let Some(i) = body.interval {
+            s.ping_interval_sec = i.clamp(2, 60);
+        }
+        if let Some(k) = body.keep_alive {
+            s.keep_alive_enabled = k;
+        }
+        s.clone()
+    };
+    let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
     Json(serde_json::json!({ "status": "success" })).into_response()
 }
 
@@ -3506,9 +3610,12 @@ pub async fn get_speedtest_history(State(ctx): State<HttpCtx>) -> Response {
 }
 
 pub async fn delete_speedtest_history(State(ctx): State<HttpCtx>) -> Response {
-    let mut hist = ctx.app.speedtest_history.write().await;
-    hist.clear();
-    let _ = save_json_atomic(SPEEDTEST_HISTORY_PATH, &*hist, 0o600);
+    let snap = {
+        let mut hist = ctx.app.speedtest_history.write().await;
+        hist.clear();
+        hist.clone()
+    };
+    let _ = save_json_atomic_async(SPEEDTEST_HISTORY_PATH, snap, 0o600).await;
     Json(serde_json::json!({ "status": "success" })).into_response()
 }
 
@@ -3718,15 +3825,18 @@ pub async fn post_maintenance(State(ctx): State<HttpCtx>, Json(body): Json<Maint
     };
 
     if let Some(en) = body.scheduled_reboot_enabled {
-        let mut s = ctx.app.settings.write().await;
-        s.scheduled_reboot_enabled = en;
-        if let Some(t) = time {
-            s.scheduled_reboot_time = t;
-        }
-        if let Some(d) = days {
-            s.scheduled_reboot_days = d;
-        }
-        let _ = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600);
+        let snap = {
+            let mut s = ctx.app.settings.write().await;
+            s.scheduled_reboot_enabled = en;
+            if let Some(t) = time {
+                s.scheduled_reboot_time = t;
+            }
+            if let Some(d) = days {
+                s.scheduled_reboot_days = d;
+            }
+            s.clone()
+        };
+        let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap, 0o600).await;
     }
     if let Some((cfg, recip)) = smtp {
         // 0600 from creation: the file holds the SMTP password.
@@ -3835,26 +3945,33 @@ pub struct SettingsReq {
 }
 
 pub async fn post_settings(State(ctx): State<HttpCtx>, Json(body): Json<SettingsReq>) -> Response {
-    let mut s = ctx.app.settings.write().await;
-    if let Some(t) = body.temperature_unit
-        && matches!(t.as_str(), "celsius" | "fahrenheit")
-    {
-        s.temperature_unit = t;
-    }
-    if let Some(m) = body.measurement_unit
-        && matches!(m.as_str(), "mi" | "km")
-    {
-        s.measurement_unit = m;
-    }
-    if let Some(r) = body.https_redirect {
-        s.https_redirect = r;
-    }
-    if let Some(labels) = body.antenna_labels {
-        s.antenna_labels = labels.map(|l| crate::state::sanitize_antenna_label(&l));
-    }
-    let _ = fs::create_dir_all(crate::paths::p(ETC_QM_DIR));
-    let _ = save_json_atomic(SETTINGS_JSON_PATH, &*s, 0o600);
-    Json(serde_json::json!({ "status": "success", "settings": *s })).into_response()
+    let snap = {
+        let mut s = ctx.app.settings.write().await;
+        if let Some(t) = body.temperature_unit
+            && matches!(t.as_str(), "celsius" | "fahrenheit")
+        {
+            s.temperature_unit = t;
+        }
+        if let Some(m) = body.measurement_unit
+            && matches!(m.as_str(), "mi" | "km")
+        {
+            s.measurement_unit = m;
+        }
+        if let Some(r) = body.https_redirect {
+            s.https_redirect = r;
+            ctx.app
+                .https_redirect_cached
+                .store(r, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(labels) = body.antenna_labels {
+            s.antenna_labels = labels.map(|l| crate::state::sanitize_antenna_label(&l));
+        }
+        s.clone()
+    };
+    let etc_dir = crate::paths::p(ETC_QM_DIR);
+    let _ = tokio::task::spawn_blocking(move || fs::create_dir_all(&etc_dir)).await;
+    let _ = save_json_atomic_async(SETTINGS_JSON_PATH, snap.clone(), 0o600).await;
+    Json(serde_json::json!({ "status": "success", "settings": snap })).into_response()
 }
 
 #[derive(Deserialize)]

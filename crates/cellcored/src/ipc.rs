@@ -539,6 +539,7 @@ async fn build_r10_status_text_async(state: &AppState) -> String {
     };
     let (res, (wan_up, wan_uptime, l3_device)) = tokio::join!(at_fut, ubus_fut);
     let modem_uptime_s = read_proc_uptime_secs();
+    let maintenance_pause = is_maintenance_pause_active(state).await;
     let get_b = |idx: usize| -> String {
         res.as_ref()
             .and_then(|v| v.get(idx))
@@ -547,7 +548,7 @@ async fn build_r10_status_text_async(state: &AppState) -> String {
             .unwrap_or_default()
     };
 
-    format_r10_status_lines(
+    let mut text = format_r10_status_lines(
         wan_up,
         wan_uptime,
         &l3_device,
@@ -556,27 +557,46 @@ async fn build_r10_status_text_async(state: &AppState) -> String {
         &get_b(1),
         &get_b(2),
         &get_b(3),
-    )
+    );
+    if maintenance_pause {
+        text.push_str("maintenance_pause=1\n");
+    }
+    text
+}
+
+pub(crate) async fn is_maintenance_pause_active(state: &AppState) -> bool {
+    if state
+        .recovery_in_progress
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return true;
+    }
+    if state.antenna_align.read().await.active {
+        return true;
+    }
+    state.quecwatch.read().await.status == "recovering"
 }
 
 pub async fn query_wan_ubus_async() -> (u8, u64, String) {
     let mut wan_up = 0u8;
     let mut wan_uptime = 0u64;
     let mut l3_device = String::from("none");
-    for iface in ["network.interface.wan", "network.interface.wan_v6"] {
-        if let Ok(out) = run_cmd("ubus", &["call", iface, "status"], Duration::from_secs(2)).await
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
-            && v.get("up").and_then(|x| x.as_bool()) == Some(true)
-        {
-            wan_up = 1;
-            if wan_uptime == 0 {
-                wan_uptime = v.get("uptime").and_then(|x| x.as_u64()).unwrap_or(0);
-            }
-            if l3_device == "none"
-                && let Some(dev) = v.get("l3_device").and_then(|x| x.as_str())
-                && !dev.is_empty()
+    if !crate::dataplane::is_native_mode() {
+        for iface in ["network.interface.wan", "network.interface.wan_v6"] {
+            if let Ok(out) = run_cmd("ubus", &["call", iface, "status"], Duration::from_secs(2)).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
+                && v.get("up").and_then(|x| x.as_bool()) == Some(true)
             {
-                l3_device = dev.to_string();
+                wan_up = 1;
+                if wan_uptime == 0 {
+                    wan_uptime = v.get("uptime").and_then(|x| x.as_u64()).unwrap_or(0);
+                }
+                if l3_device == "none"
+                    && let Some(dev) = v.get("l3_device").and_then(|x| x.as_str())
+                    && !dev.is_empty()
+                {
+                    l3_device = dev.to_string();
+                }
             }
         }
     }
@@ -974,5 +994,31 @@ lte_rsrq_db=\nnr_band=n41\nnr_rsrp_dbm=-101\nnr_sinr_db=9\nnr_rsrq_db=-11\n"
         // a reboot that never happened (wedged command) may be retried later
         *gate.started.lock().unwrap() = Some(Instant::now() - R10_ACTION_MAX_AGE - Duration::from_secs(1));
         assert!(gate.try_start().is_ok());
+    }
+
+    #[tokio::test]
+    async fn maintenance_pause_tracks_align_linkwatch_and_recovery_state() {
+        let sbx = crate::paths::TestSandbox::new("ipc-maint-pause");
+        let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+        let app = AppState::for_tests(sbx.root.clone(), auth);
+
+        assert!(!is_maintenance_pause_active(&app).await);
+
+        app.antenna_align.write().await.active = true;
+        assert!(is_maintenance_pause_active(&app).await);
+        app.antenna_align.write().await.active = false;
+        assert!(!is_maintenance_pause_active(&app).await);
+
+        app.quecwatch.write().await.status = "recovering".into();
+        assert!(is_maintenance_pause_active(&app).await);
+        app.quecwatch.write().await.status = "healthy".into();
+        assert!(!is_maintenance_pause_active(&app).await);
+
+        app.recovery_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(is_maintenance_pause_active(&app).await);
+        app.recovery_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!is_maintenance_pause_active(&app).await);
     }
 }

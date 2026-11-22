@@ -57,10 +57,39 @@ pub struct ModemSecrets {
     pub previous_imei: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellLockBypassReason {
+    #[default]
+    None,
+    Deadman,
+    LinkWatch,
+}
+
+impl CellLockBypassReason {
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Deadman => 1,
+            Self::LinkWatch => 2,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Deadman,
+            2 => Self::LinkWatch,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModemSnapshot {
     pub updated_at: u64,
+    #[serde(skip)]
+    pub updated_mono_ms: u64,
     pub operator: String,
     pub serving: Option<ServingCellInfo>,
     pub carriers: Vec<CarrierComponent>,
@@ -88,6 +117,10 @@ pub struct TrafficDirectionStats {
     pub bytes_total: u64,
     pub bps: u64,
     pub packets_per_sec: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub drops: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -504,6 +537,14 @@ pub struct SystemInternals {
     pub mwan3_running: bool,
     pub keep_alive_enabled: bool,
     pub eth_speed: String,
+    #[serde(default)]
+    pub cloudflared_present: bool,
+    #[serde(default)]
+    pub cloudflared_running: bool,
+    #[serde(default)]
+    pub cloudflared_up: bool,
+    #[serde(default)]
+    pub cloudflared_ha_connections: u64,
     pub last_reconcile: Option<ReconcileReport>,
 }
 
@@ -540,7 +581,7 @@ pub struct AppState {
     pub www_dir: PathBuf,
     pub smd: SmdClient,
     pub auth: AuthStore,
-    pub ws_tx: broadcast::Sender<String>,
+    pub ws_tx: broadcast::Sender<axum::extract::ws::Utf8Bytes>,
     #[allow(dead_code)]
     pub rf_refresh_tx: mpsc::Sender<()>,
     pub modem: Arc<RwLock<ModemSnapshot>>,
@@ -583,10 +624,30 @@ pub struct AppState {
     pub radio_lock: Arc<tokio::sync::Mutex<()>>,
     /// True while the cell-lock dead-man's-switch (or LinkWatch stage 3) has temporarily bypassed live modem locks.
     pub cell_lock_bypassed: Arc<std::sync::atomic::AtomicBool>,
-    /// Monotonic heartbeat timestamp (`mono_ms()`) of the background telemetry poller.
-    pub hb_telemetry_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Why live cell locks are bypassed (`CellLockBypassReason::to_u8`).
+    pub cell_lock_bypass_reason: Arc<std::sync::atomic::AtomicU8>,
+    /// True while LinkWatch or cell-lock deadman recovery is actively manipulating the modem.
+    pub recovery_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Lock-free cached copy of `settings.https_redirect` for hot-path HTTP/HSTS middleware.
+    pub https_redirect_cached: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic heartbeat timestamp (`mono_ms()`) of the RF snapshot loop.
+    pub hb_rf_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic heartbeat timestamp (`mono_ms()`) of the network/usage/vitals loop.
+    pub hb_net_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic heartbeat timestamp (`mono_ms()`) of the ICMP/LinkWatch loop.
+    pub hb_linkwatch_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Monotonic heartbeat timestamp (`mono_ms()`) of the HTTP/TLS watcher & request path.
     pub hb_http_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic timestamp (`mono_ms()`) when an active `AT+QSCAN` started (`0` = none).
+    pub qscan_started_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic timestamp (`mono_ms()`) of the last `phy_diag` refresh (`0` = never).
+    pub phy_diag_updated_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic timestamp (`mono_ms()`) of the last `dsp_telemetry` refresh (`0` = never).
+    pub dsp_telemetry_updated_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Sampled daemon resident memory in bytes (`/proc/self/statm`).
+    pub process_rss_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Sampled daemon open file descriptor count (`/proc/self/fd`).
+    pub process_open_fds: Arc<std::sync::atomic::AtomicU64>,
     /// Last observed active SIM slot (`0` = not yet observed, `1` or `2`).
     pub last_sim_slot: Arc<std::sync::atomic::AtomicI32>,
     /// Monotonic timestamp (`mono_ms()`) of the most recent SIM slot switch (`0` = none).
@@ -655,8 +716,20 @@ impl AppState {
             radio: Default::default(),
             radio_lock: Default::default(),
             cell_lock_bypassed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            hb_telemetry_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            cell_lock_bypass_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            recovery_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            https_redirect_cached: Arc::new(std::sync::atomic::AtomicBool::new(
+                DaemonSettings::default().https_redirect,
+            )),
+            hb_rf_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            hb_net_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            hb_linkwatch_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
             hb_http_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_hb)),
+            qscan_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            phy_diag_updated_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dsp_telemetry_updated_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            process_rss_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            process_open_fds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_sim_slot: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -690,7 +763,7 @@ impl AppState {
             return;
         }
         if let Ok(text) = serde_json::to_string(value) {
-            let _ = self.ws_tx.send(text);
+            let _ = self.ws_tx.send(axum::extract::ws::Utf8Bytes::from(text));
         }
     }
 
@@ -703,7 +776,7 @@ impl AppState {
         }
         let value = build();
         if let Ok(text) = serde_json::to_string(&value) {
-            let _ = self.ws_tx.send(text);
+            let _ = self.ws_tx.send(axum::extract::ws::Utf8Bytes::from(text));
         }
     }
 }
@@ -769,6 +842,24 @@ fn fsync_dir(dir: &Path) {
 /// (created with `mode`), fsync it, rename over `path`, then fsync the
 /// directory so the rename itself is durable.
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+    atomic_write_inner(path, data, mode, true)
+}
+
+/// Atomic rename-replace for volatile tmpfs files (`/tmp/*`): skips `fsync`
+/// (meaningless on tmpfs and avoids blocking worker threads). Falls back to
+/// full fsynced `atomic_write` if called with any persistent path.
+pub fn atomic_write_tmpfs(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+    let raw = path.to_string_lossy();
+    let is_persistent = raw.starts_with("/etc/")
+        || raw.starts_with("/root/")
+        || raw.starts_with("/overlay/")
+        || raw.contains("/etc/")
+        || raw.contains("/root/")
+        || raw.contains("/overlay/");
+    atomic_write_inner(path, data, mode, is_persistent)
+}
+
+fn atomic_write_inner(path: &Path, data: &[u8], mode: u32, sync: bool) -> Result<(), String> {
     use std::io::Write;
     let mapped = PathBuf::from(crate::paths::p(&path.to_string_lossy()));
     let path = mapped.as_path();
@@ -783,7 +874,9 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     let res = (|| -> std::io::Result<()> {
         let mut f = create_private_tmp(&tmp, mode)?;
         f.write_all(data)?;
-        f.sync_all()?;
+        if sync {
+            f.sync_all()?;
+        }
         drop(f);
         fs::rename(&tmp, path)
     })();
@@ -791,13 +884,65 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("atomic write {}: {e}", path.display()));
     }
-    fsync_dir(parent);
+    if sync {
+        fsync_dir(parent);
+    }
     Ok(())
 }
 
 pub fn save_json_atomic<T: Serialize>(path: &str, value: &T, mode: u32) -> Result<(), String> {
     let json = serde_json::to_string_pretty(value).map_err(|e| format!("serialize {path}: {e}"))?;
     atomic_write(Path::new(path), json.as_bytes(), mode)
+}
+
+/// Compact JSON atomic write (`serde_json::to_vec`) for high-churn state files
+/// (`data_usage`, `obs_state`, `events`) to minimize UBIFS write amplification.
+pub fn save_json_compact_atomic<T: Serialize>(path: &str, value: &T, mode: u32) -> Result<(), String> {
+    let json = serde_json::to_vec(value).map_err(|e| format!("serialize {path}: {e}"))?;
+    atomic_write(Path::new(path), &json, mode)
+}
+
+/// Compact JSON atomic write for volatile tmpfs snapshots (no `fsync`).
+pub fn save_json_compact_tmpfs<T: Serialize>(path: &str, value: &T, mode: u32) -> Result<(), String> {
+    let json = serde_json::to_vec(value).map_err(|e| format!("serialize {path}: {e}"))?;
+    atomic_write_tmpfs(Path::new(path), &json, mode)
+}
+
+/// Offload `save_json_atomic` onto Tokio's blocking pool while preserving
+/// task-local test sandbox path mapping.
+pub async fn save_json_atomic_async<T: Serialize + Send + 'static>(
+    path: &str,
+    value: T,
+    mode: u32,
+) -> Result<(), String> {
+    let mapped = crate::paths::p(path);
+    tokio::task::spawn_blocking(move || save_json_atomic(&mapped, &value, mode))
+        .await
+        .map_err(|e| format!("save task failed: {e}"))?
+}
+
+/// Offload compact JSON atomic write onto Tokio's blocking pool.
+pub async fn save_json_compact_atomic_async<T: Serialize + Send + 'static>(
+    path: &str,
+    value: T,
+    mode: u32,
+) -> Result<(), String> {
+    let mapped = crate::paths::p(path);
+    tokio::task::spawn_blocking(move || save_json_compact_atomic(&mapped, &value, mode))
+        .await
+        .map_err(|e| format!("save task failed: {e}"))?
+}
+
+/// Offload compact tmpfs JSON atomic write onto Tokio's blocking pool.
+pub async fn save_json_compact_tmpfs_async<T: Serialize + Send + 'static>(
+    path: &str,
+    value: T,
+    mode: u32,
+) -> Result<(), String> {
+    let mapped = crate::paths::p(path);
+    tokio::task::spawn_blocking(move || save_json_compact_tmpfs(&mapped, &value, mode))
+        .await
+        .map_err(|e| format!("save task failed: {e}"))?
 }
 
 pub fn format_now_hms() -> String {

@@ -88,11 +88,31 @@ pub async fn serve_http_and_https(
             .await;
             let (cp, kp) = resolve_tls_pair(&TLS_SOURCES);
             let cur = tls_fingerprint(&cp, &kp);
-            if cur != last
-                && let Ok(new_cfg) = load_tls_config(&cp, &kp)
-            {
-                *tls_watch.write().await = Arc::new(new_cfg);
-                last = cur;
+            if cur != last {
+                match load_tls_config(&cp, &kp) {
+                    Ok(new_cfg) => {
+                        *tls_watch.write().await = Arc::new(new_cfg);
+                        last = cur;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cellcored: TLS pair ({}, {}) invalid/mismatched ({e}); falling back to self-signed",
+                            cp.display(),
+                            kp.display()
+                        );
+                        let lan_fb = lan_ip_watch.clone();
+                        let fb_res = tokio::task::spawn_blocking(move || {
+                            ensure_self_signed_fallback(&TLS_SOURCES, lan_fb.as_deref())
+                        })
+                        .await;
+                        if let Ok(Ok((fb_c, fb_k))) = fb_res
+                            && let Ok(fb_cfg) = load_tls_config(&fb_c, &fb_k)
+                        {
+                            *tls_watch.write().await = Arc::new(fb_cfg);
+                            last = cur;
+                        }
+                    }
+                }
             }
         }
     });
@@ -137,27 +157,30 @@ pub async fn serve_http_and_https(
         }));
     }
 
+    let redirect_router = {
+        let fb = Arc::clone(&fallback_host);
+        Router::new()
+            .route("/.well-known/acme-challenge/{token}", get(acme_http01_handler))
+            .fallback(move |req: Request| {
+                let fb = Arc::clone(&fb);
+                async move { http_redirect_handler(req, &fb).await }
+            })
+    };
+
     for addr in http_addrs {
         let listener = bind_tcp_freebind(addr)?;
-        let app_http = state.clone();
+        let redir_flag = Arc::clone(&state.https_redirect_cached);
+        let r_redir = redirect_router.clone();
         let srv_fallback = router.clone();
         let slots = Arc::clone(&slots);
-        let fb = Arc::clone(&fallback_host);
         tokio::spawn(accept_loop(listener, slots, move |stream, peer, permit| {
-            let st = app_http.clone();
+            let redir_flag = Arc::clone(&redir_flag);
+            let r_redir = r_redir.clone();
             let r_fb = srv_fallback.clone();
-            let fb = Arc::clone(&fb);
             async move {
                 let _permit = permit;
-                let redir = st.settings.read().await.https_redirect;
-                if redir {
-                    let redirect_svc = Router::new()
-                        .route("/.well-known/acme-challenge/{token}", get(acme_http01_handler))
-                        .fallback(move |req: Request| {
-                            let fb = Arc::clone(&fb);
-                            async move { http_redirect_handler(req, &fb).await }
-                        });
-                    serve_connection_with(stream, redirect_svc, peer, limits, false).await;
+                if redir_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    serve_connection_with(stream, r_redir, peer, limits, false).await;
                 } else {
                     serve_connection_with(stream, r_fb, peer, limits, false).await;
                 }
@@ -437,6 +460,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .merge(protected)
         .merge(proxy_routes)
         .fallback_service(static_svc)
+        .layer(tower_http::compression::CompressionLayer::new())
         .layer(middleware::from_fn(body_deadline_middleware))
         .layer(middleware::from_fn_with_state(ctx.clone(), security_headers_middleware))
         .with_state(ctx)
@@ -447,7 +471,10 @@ async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, n
         .hb_http_ms
         .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
     let path = req.uri().path().to_string();
-    let hsts = ctx.app.settings.read().await.https_redirect;
+    let hsts = ctx
+        .app
+        .https_redirect_cached
+        .load(std::sync::atomic::Ordering::Acquire);
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert(
@@ -730,11 +757,19 @@ async fn ws_session_alive(state: &AppState, token: &str) -> bool {
     state.auth.validate_token(token, false).await.is_some()
 }
 
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+const WS_PONG_TIMEOUT: Duration = Duration::from_secs(90);
+
 async fn handle_ws_socket(state: AppState, mut socket: WebSocket, token: String) {
     let mut rx = state.ws_tx.subscribe();
     let mut revoked = state.auth.subscribe_revocations();
     let mut expiry_check = tokio::time::interval(Duration::from_secs(60));
+    expiry_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     expiry_check.tick().await;
+    let mut ping_check = tokio::time::interval(WS_PING_INTERVAL);
+    ping_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_check.tick().await;
+    let mut last_pong = std::time::Instant::now();
 
     // Send immediate initial burst so client sees live state instantly
     let init_ping = state.ping_realtime.read().await.back().cloned();
@@ -769,10 +804,19 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket, token: String)
                     break;
                 }
             }
+            _ = ping_check.tick() => {
+                if last_pong.elapsed() >= WS_PONG_TIMEOUT {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                if socket.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
             msg = rx.recv() => {
                 match msg {
                     Ok(txt) => {
-                        if socket.send(Message::Text(txt.into())).await.is_err() {
+                        if socket.send(Message::Text(txt)).await.is_err() {
                             break;
                         }
                     }
@@ -783,6 +827,7 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket, token: String)
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(Message::Text(txt))) => {
+                        last_pong = std::time::Instant::now();
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
                             && v.get("action").and_then(|a| a.as_str()) == Some("set_fast_rf")
                         {
@@ -805,10 +850,13 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket, token: String)
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
+                        last_pong = std::time::Instant::now();
                         let _ = socket.send(Message::Pong(payload)).await;
                     }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {
+                        last_pong = std::time::Instant::now();
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
                 }
             }
         }
@@ -1310,13 +1358,8 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path, lan_ip: Opti
     Ok(())
 }
 
-/// Ensure a valid, loadable TLS pair exists (auto-generating a self-signed ECDSA P-256
-/// cert under `/etc/cellcore/tls/` on factory modems that have no cert yet).
-pub fn ensure_tls_pair(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
-    let (cp, kp) = resolve_tls_pair(src);
-    if cp.exists() && kp.exists() && load_tls_config(&cp, &kp).is_ok() {
-        return Ok((cp, kp));
-    }
+/// Ensure a valid self-signed fallback pair exists and loads cleanly in rustls.
+fn ensure_self_signed_fallback(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
     let p = crate::paths::p;
     let target_c = PathBuf::from(p(if !src.self_cert.is_empty() {
         src.self_cert
@@ -1328,14 +1371,144 @@ pub fn ensure_tls_pair(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBu
     } else {
         src.fallback_key
     }));
+    if target_c.exists() && target_k.exists() && load_tls_config(&target_c, &target_k).is_ok() {
+        return Ok((target_c, target_k));
+    }
     generate_self_signed_cert(&target_c, &target_k, lan_ip)?;
     Ok((target_c, target_k))
 }
 
+/// Ensure a valid, loadable TLS pair exists (auto-generating a self-signed ECDSA P-256
+/// cert under `/etc/cellcore/tls/` on factory modems that have no cert yet, or falling
+/// back to self-signed if the ACME pair has a mismatched/corrupt key).
+pub fn ensure_tls_pair(src: &TlsSources, lan_ip: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    let (cp, kp) = resolve_tls_pair(src);
+    if cp.exists() && kp.exists() && load_tls_config(&cp, &kp).is_ok() {
+        return Ok((cp, kp));
+    }
+    ensure_self_signed_fallback(src, lan_ip)
+}
+
+fn der_read_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let &tag = input.first()?;
+    let &len_b = input.get(1)?;
+    let (len, hdr_len) = if (len_b & 0x80) == 0 {
+        (usize::from(len_b), 2usize)
+    } else {
+        let count = usize::from(len_b & 0x7f);
+        if count == 0 || count > 4 || input.len() < 2 + count {
+            return None;
+        }
+        let mut l = 0usize;
+        for &b in &input[2..2 + count] {
+            l = (l << 8) | usize::from(b);
+        }
+        (l, 2 + count)
+    };
+    let end = hdr_len.checked_add(len)?;
+    if end > input.len() {
+        return None;
+    }
+    Some((tag, &input[hdr_len..end], &input[end..]))
+}
+
+fn parse_asn1_time_unix(tag: u8, bytes: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(bytes).ok()?.trim();
+    let s = s.strip_suffix('Z')?;
+    let (year, rest) = match tag {
+        0x17 => {
+            // UTCTime: YYMMDDHHMMSSZ (RFC 5280: >=50 -> 19xx, <50 -> 20xx)
+            if s.len() < 12 {
+                return None;
+            }
+            let yy: i32 = s[0..2].parse().ok()?;
+            let yr = if yy >= 50 { 1900 + yy } else { 2000 + yy };
+            (yr, &s[2..])
+        }
+        0x18 => {
+            // GeneralizedTime: YYYYMMDDHHMMSSZ
+            if s.len() < 14 {
+                return None;
+            }
+            let yr: i32 = s[0..4].parse().ok()?;
+            (yr, &s[4..])
+        }
+        _ => return None,
+    };
+    let month: u32 = rest[0..2].parse().ok()?;
+    let day: u32 = rest[2..4].parse().ok()?;
+    let hour: i64 = rest[4..6].parse().ok()?;
+    let min: i64 = rest[6..8].parse().ok()?;
+    let sec: i64 = rest[8..10].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour >= 24 || min >= 60 || sec >= 60 {
+        return None;
+    }
+    let days = crate::obs::usage_cycle::Civil::new(year, month, day).days();
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Extract the leaf certificate's `notAfter` Unix timestamp directly in-process
+/// from PEM bytes (zero `openssl` subprocess forks).
+pub fn parse_pem_leaf_not_after_unix(pem_bytes: &[u8]) -> Result<i64, String> {
+    let mut rd = std::io::Cursor::new(pem_bytes);
+    let cert = rustls_pemfile::certs(&mut rd)
+        .next()
+        .ok_or_else(|| "no PEM certificate found".to_string())?
+        .map_err(|e| format!("invalid PEM cert: {e}"))?;
+    let (tag, cert_seq, _) = der_read_tlv(cert.as_ref()).ok_or("malformed DER cert")?;
+    if tag != 0x30 {
+        return Err("expected SEQUENCE at cert root".into());
+    }
+    let (tbs_tag, mut tbs, _) = der_read_tlv(cert_seq).ok_or("malformed TBSCertificate")?;
+    if tbs_tag != 0x30 {
+        return Err("expected SEQUENCE for TBSCertificate".into());
+    }
+    // Optional [0] EXPLICIT version
+    if tbs.first() == Some(&0xA0) {
+        let (_, _, rem) = der_read_tlv(tbs).ok_or("malformed TBS version")?;
+        tbs = rem;
+    }
+    // Skip serialNumber, signature AlgorithmIdentifier, issuer Name
+    for _ in 0..3 {
+        let (_, _, rem) = der_read_tlv(tbs).ok_or("malformed TBS prefix")?;
+        tbs = rem;
+    }
+    let (val_tag, validity, _) = der_read_tlv(tbs).ok_or("malformed TBS validity")?;
+    if val_tag != 0x30 {
+        return Err("expected SEQUENCE for validity".into());
+    }
+    // Skip notBefore, read notAfter
+    let (_, _, after_nb) = der_read_tlv(validity).ok_or("malformed notBefore")?;
+    let (na_tag, na_val, _) = der_read_tlv(after_nb).ok_or("malformed notAfter")?;
+    parse_asn1_time_unix(na_tag, na_val).ok_or_else(|| "invalid notAfter timestamp".into())
+}
+
+type CertExpiryCacheEntry = (PathBuf, Option<(i64, i64, u64, u64)>, i64);
+static SELF_CERT_EXPIRY_CACHE: std::sync::Mutex<Option<CertExpiryCacheEntry>> =
+    std::sync::Mutex::new(None);
+
+fn cached_cert_not_after_unix(cert_path: &Path) -> Result<i64, String> {
+    let stamp = file_stamp(cert_path);
+    if let Ok(g) = SELF_CERT_EXPIRY_CACHE.lock()
+        && let Some((ref p, cached_stamp, exp)) = *g
+        && p == cert_path
+        && cached_stamp == stamp
+    {
+        return Ok(exp);
+    }
+    let pem = fs::read(cert_path).map_err(|e| format!("read {}: {e}", cert_path.display()))?;
+    let exp = parse_pem_leaf_not_after_unix(&pem)?;
+    if let Ok(mut g) = SELF_CERT_EXPIRY_CACHE.lock() {
+        *g = Some((cert_path.to_path_buf(), stamp, exp));
+    }
+    Ok(exp)
+}
+
 /// If the active TLS certificate is the CellCore self-signed fallback (`/etc/cellcore/tls/cert.pem`)
-/// and the wall clock has synced (`>= 2025-01-01`), verify `openssl x509 -checkend 0 -noout -in <cert>`.
-/// If expired (e.g. generated at `1970` pre-NTP!), regenerate a fresh 10-year ECDSA P-256 pair so the
-/// TLS watcher hot-reloads it automatically. Returns `Ok(true)` when regenerated.
+/// and the wall clock has synced (`>= 2025-01-01`), check cached in-process DER `notAfter`
+/// (re-parsing only when the file's mtime/size/ino stamp changes — zero `openssl` forks!).
+/// If expired/corrupt (e.g. generated at `1970` pre-NTP!), regenerate a fresh 10-year ECDSA P-256
+/// pair so the TLS watcher hot-reloads it automatically. Returns `Ok(true)` when regenerated.
 pub fn check_and_heal_self_signed_cert(
     src: &TlsSources,
     wall_now_secs: u64,
@@ -1349,12 +1522,8 @@ pub fn check_and_heal_self_signed_cert(
     if cp != self_cp || !cp.exists() {
         return Ok(false);
     }
-    let check_ok = std::process::Command::new(crate::paths::program("openssl"))
-        .args(["x509", "-checkend", "0", "-noout", "-in"])
-        .arg(&cp)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true);
+    let check_ok = cached_cert_not_after_unix(&cp)
+        .is_ok_and(|not_after| not_after > wall_now_secs as i64);
     if check_ok {
         return Ok(false);
     }
@@ -1363,6 +1532,9 @@ pub fn check_and_heal_self_signed_cert(
         cp.display()
     );
     generate_self_signed_cert(&cp, &kp, lan_ip)?;
+    if let Ok(mut g) = SELF_CERT_EXPIRY_CACHE.lock() {
+        *g = None;
+    }
     Ok(true)
 }
 
@@ -1376,6 +1548,37 @@ pub type TlsFingerprint = (PathBuf, PathBuf, Option<(i64, i64, u64, u64)>, Optio
 
 pub fn tls_fingerprint(cert: &Path, key: &Path) -> TlsFingerprint {
     (cert.to_path_buf(), key.to_path_buf(), file_stamp(cert), file_stamp(key))
+}
+
+fn extract_cert_public_key_bytes(cert_der: &[u8]) -> Result<&[u8], String> {
+    let (tag, cert_seq, _) = der_read_tlv(cert_der).ok_or("malformed DER cert")?;
+    if tag != 0x30 {
+        return Err("expected SEQUENCE at cert root".into());
+    }
+    let (tbs_tag, mut tbs, _) = der_read_tlv(cert_seq).ok_or("malformed TBSCertificate")?;
+    if tbs_tag != 0x30 {
+        return Err("expected SEQUENCE for TBSCertificate".into());
+    }
+    // Optional [0] EXPLICIT version
+    if tbs.first() == Some(&0xA0) {
+        let (_, _, rem) = der_read_tlv(tbs).ok_or("malformed TBS version")?;
+        tbs = rem;
+    }
+    // Skip serialNumber, signature AlgorithmIdentifier, issuer Name, validity, subject Name
+    for _ in 0..5 {
+        let (_, _, rem) = der_read_tlv(tbs).ok_or("malformed TBS field before SPKI")?;
+        tbs = rem;
+    }
+    let (spki_tag, spki_body, _) = der_read_tlv(tbs).ok_or("malformed SubjectPublicKeyInfo")?;
+    if spki_tag != 0x30 {
+        return Err("expected SEQUENCE for SubjectPublicKeyInfo".into());
+    }
+    let (_, _, spki_rem) = der_read_tlv(spki_body).ok_or("malformed SPKI algorithm")?;
+    let (bs_tag, bs_body, _) = der_read_tlv(spki_rem).ok_or("malformed SPKI BIT STRING")?;
+    if bs_tag != 0x03 || bs_body.is_empty() || bs_body[0] != 0 {
+        return Err("unexpected SPKI BIT STRING encoding".into());
+    }
+    Ok(&bs_body[1..])
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<rustls::ServerConfig, String> {
@@ -1395,6 +1598,57 @@ fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<rustls::ServerCo
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| format!("parse key {}: {e}", key_path.display()))?
         .ok_or_else(|| format!("No private key in {}", key_path.display()))?;
+
+    // Validate that the private key actually matches the leaf certificate's public key
+    // (ServerConfig::with_single_cert only checks algorithm compatibility, not key equality).
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls_rustcrypto::provider()));
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key.clone_key())
+        .map_err(|e| format!("load private key {}: {e}", key_path.display()))?;
+    let ck = rustls::sign::CertifiedKey::new(certs.clone(), signing_key);
+    match ck.keys_match() {
+        Ok(()) => {}
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {
+            // Provider did not expose raw SPKI on SigningKey; verify a live signature against
+            // the leaf certificate's public key using the provider's verification algorithms.
+            let pub_key_bytes = extract_cert_public_key_bytes(certs[0].as_ref())?;
+            let probe = b"cellcore-tls-key-cert-match-probe";
+            let schemes = [
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            ];
+            let signer = ck
+                .key
+                .choose_scheme(&schemes)
+                .ok_or_else(|| "TLS private key has no supported signature scheme".to_string())?;
+            let scheme = signer.scheme();
+            let sig = signer
+                .sign(probe)
+                .map_err(|e| format!("TLS key probe sign failed: {e}"))?;
+            let verifiers = provider
+                .signature_verification_algorithms
+                .mapping
+                .iter()
+                .find(|(s, _)| *s == scheme)
+                .map(|(_, algs)| *algs)
+                .ok_or_else(|| format!("no verifier for TLS signature scheme {scheme:?}"))?;
+            if !verifiers
+                .iter()
+                .any(|alg| alg.verify_signature(pub_key_bytes, probe, &sig).is_ok())
+            {
+                return Err("TLS certificate and private key mismatch".into());
+            }
+        }
+        Err(e) => {
+            return Err(format!("TLS certificate and private key mismatch: {e}"));
+        }
+    }
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1898,6 +2152,67 @@ mod tests {
             ),
             Ok(false)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn compression_layer_serves_gzip_when_accepted() {
+        let (router, auth) = test_router();
+        let sess = auth.create_session().await.unwrap();
+        let cookie = format!("qm_session={}", sess.token);
+        let resp = send(
+            &router,
+            Method::GET,
+            "/api/v1/metrics",
+            &[("cookie", cookie.as_str()), ("accept-encoding", "gzip")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "CompressionLayer must gzip compressible API responses"
+        );
+    }
+
+    #[test]
+    fn mismatched_acme_key_and_cert_falls_back_to_self_signed() {
+        let _ = rustls_rustcrypto::provider().install_default();
+        let dir = std::env::temp_dir().join(format!("cc-tls-mismatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("acme")).unwrap();
+        fs::create_dir_all(dir.join("tls")).unwrap();
+        let ac = dir.join("acme/fullchain.pem");
+        let ak = dir.join("acme/privkey.pem");
+        let sc = dir.join("tls/cert.pem");
+        let sk = dir.join("tls/key.pem");
+        // Generate two unrelated keypairs and cross-wire ACME cert + other key.
+        generate_self_signed_cert(&ac, &dir.join("acme/orig.key"), None).unwrap();
+        generate_self_signed_cert(&dir.join("acme/other.crt"), &ak, None).unwrap();
+        assert!(load_tls_config(&ac, &ak).is_err(), "mismatched cert/key must fail rustls validation");
+
+        let ac_s = ac.display().to_string();
+        let ak_s = ak.display().to_string();
+        let sc_s = sc.display().to_string();
+        let sk_s = sk.display().to_string();
+        let src = TlsSources {
+            acme_cert: &ac_s,
+            acme_key: &ak_s,
+            self_cert: &sc_s,
+            self_key: &sk_s,
+            fallback_cert: "",
+            fallback_key: "",
+        };
+        let (chosen_c, chosen_k) = ensure_tls_pair(&src, Some("192.168.225.1")).unwrap();
+        assert_eq!(chosen_c, sc);
+        assert_eq!(chosen_k, sk);
+        assert!(load_tls_config(&chosen_c, &chosen_k).is_ok());
+        // Verify in-process DER notAfter parser reads our freshly generated 10-year cert.
+        let exp = parse_pem_leaf_not_after_unix(&fs::read(&chosen_c).unwrap()).unwrap();
+        assert!(exp > crate::auth::now_secs() as i64 + 86_400 * 3000, "exp={exp}");
         let _ = fs::remove_dir_all(&dir);
     }
 

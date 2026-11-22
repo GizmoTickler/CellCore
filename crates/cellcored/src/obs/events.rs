@@ -128,6 +128,7 @@ impl EventKind {
                 | EventKind::Vpn
                 | EventKind::AntennaDegraded
                 | EventKind::ThermalThrottle
+                | EventKind::SarBackoff
                 | EventKind::AirCipherNull
                 | EventKind::ModemSsr
                 | EventKind::CellLockBypassed
@@ -237,7 +238,9 @@ impl EventStore {
 pub fn emit(kind: EventKind, severity: Severity, title: impl Into<String>, detail: serde_json::Value) {
     let o = obs();
     let ev = lock(&o.events).push(kind, severity, title.into(), detail, now_secs());
-    o.broadcast(&serde_json::json!({ "channel": "event", "event": ev }));
+    if o.has_ws_clients() {
+        o.broadcast(&serde_json::json!({ "channel": "event", "event": ev }));
+    }
     if let Some(tx) = o.notify_tx.get()
         && tx.try_send(ev).is_err()
     {
@@ -374,9 +377,17 @@ fn det(kind: EventKind, severity: Severity, title: String, detail: serde_json::V
     Detected { kind, severity, title, detail }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CellIdentity {
+    rat: String,
+    band: String,
+    pci: Option<i32>,
+    arfcn: Option<i64>,
+}
+
 #[derive(Debug, Default)]
 pub struct SnapshotDetector {
-    cell: Option<ServingView>,
+    cell: Confirm<CellIdentity>,
     registered: Confirm<bool>,
     lost_at: Option<u64>,
     scc: Confirm<BTreeSet<(String, i64)>>,
@@ -391,7 +402,7 @@ pub struct SnapshotDetector {
     null_cipher_active: bool,
 }
 
-fn cell_label(s: &ServingView) -> String {
+fn cell_id_label(s: &CellIdentity) -> String {
     format!(
         "{} {} PCI {} ARFCN {}",
         s.rat,
@@ -440,23 +451,43 @@ impl SnapshotDetector {
         }
         let registered = self.registered.confirmed == Some(true);
 
-        // Serving cell: RAT > band > PCI/ARFCN, one event per change.
+        // Serving cell: RAT > band > PCI/ARFCN, one event per change (confirmed over 2 samples).
         if let Some(cur) = v.serving.as_ref().filter(|_| registered && v.registered() == Some(true)) {
-            if let Some(prev) = self.cell.as_ref() {
-                let cell_moved = prev.pci != cur.pci || prev.arfcn != cur.arfcn;
+            let cid = CellIdentity {
+                rat: cur.rat.clone(),
+                band: cur.band.clone(),
+                pci: cur.pci,
+                arfcn: cur.arfcn,
+            };
+            if let Some((prev, next)) = self.cell.observe(cid, 2) {
+                let cell_moved = prev.pci != next.pci || prev.arfcn != next.arfcn;
                 let detail = serde_json::json!({
                     "from": { "rat": prev.rat, "band": prev.band, "pci": prev.pci, "arfcn": prev.arfcn },
-                    "to": { "rat": cur.rat, "band": cur.band, "pci": cur.pci, "arfcn": cur.arfcn },
+                    "to": { "rat": next.rat, "band": next.band, "pci": next.pci, "arfcn": next.arfcn },
                 });
-                if prev.rat != cur.rat {
-                    out.push(det(EventKind::RatChange, Severity::Warning, format!("RAT {} → {}", prev.rat, cur.rat), detail));
-                } else if prev.band != cur.band {
-                    out.push(det(EventKind::BandChange, Severity::Info, format!("Band {} → {} ({})", prev.band, cur.band, cell_label(cur)), detail));
+                if prev.rat != next.rat {
+                    out.push(det(
+                        EventKind::RatChange,
+                        Severity::Warning,
+                        format!("RAT {} → {}", prev.rat, next.rat),
+                        detail,
+                    ));
+                } else if prev.band != next.band {
+                    out.push(det(
+                        EventKind::BandChange,
+                        Severity::Info,
+                        format!("Band {} → {} ({})", prev.band, next.band, cell_id_label(&next)),
+                        detail,
+                    ));
                 } else if cell_moved {
-                    out.push(det(EventKind::Handover, Severity::Info, format!("Handover to {}", cell_label(cur)), detail));
+                    out.push(det(
+                        EventKind::Handover,
+                        Severity::Info,
+                        format!("Handover to {}", cell_id_label(&next)),
+                        detail,
+                    ));
                 }
             }
-            self.cell = Some(cur.clone());
         }
 
         // Antenna chain health (3 consecutive RRC-connected/active snapshots).
@@ -510,6 +541,19 @@ impl SnapshotDetector {
                     self.antenna_healthy_streak += 1;
                     if self.antenna_degraded_active && self.antenna_healthy_streak >= 3 {
                         self.antenna_degraded_active = false;
+                        out.push(det(
+                            EventKind::AntennaDegraded,
+                            Severity::Info,
+                            format!("Antenna chains recovered ({active_chains} chains balanced)"),
+                            serde_json::json!({
+                                "recovered": true,
+                                "activeChains": active_chains,
+                                "rsrpSpreadDb": spread_db,
+                                "chainRsrp": v.chain_rsrp,
+                                "rat": cur.rat,
+                                "band": cur.band,
+                            }),
+                        ));
                     }
                 }
             }
@@ -593,8 +637,18 @@ impl SnapshotDetector {
                 detail,
             ));
         }
-        if !any_throttling {
+        if !any_throttling && self.throttling_active {
             self.throttling_active = false;
+            let mut d = detail;
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("recovered".into(), serde_json::Value::Bool(true));
+            }
+            return Some(det(
+                EventKind::ThermalThrottle,
+                Severity::Info,
+                "Modem QMI thermal mitigation cleared".into(),
+                d,
+            ));
         }
         None
     }
@@ -625,8 +679,18 @@ impl SnapshotDetector {
                 detail,
             ));
         }
-        if !null_cipher_alert {
+        if !null_cipher_alert && self.null_cipher_active {
             self.null_cipher_active = false;
+            let mut d = detail;
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("recovered".into(), serde_json::Value::Bool(true));
+            }
+            return Some(det(
+                EventKind::AirCipherNull,
+                Severity::Info,
+                "Air-interface encryption restored (null cipher cleared)".into(),
+                d,
+            ));
         }
         None
     }
@@ -783,16 +847,21 @@ mod tests {
     fn handover_band_and_rat_changes() {
         let mut d = SnapshotDetector::default();
         assert!(settle(&mut d, &view(serving("NOCONN", "NR5G-SA", "n41", 258, 521310)), 0).is_empty(), "baseline");
-        let h = d.observe(&view(serving("CONNECT", "NR5G-SA", "n41", 589, 521310)), 10);
+        // Single-sample blip is debounced by Confirm(2)
+        assert!(d.observe(&view(serving("CONNECT", "NR5G-SA", "n41", 589, 521310)), 10).is_empty());
+        let h = d.observe(&view(serving("CONNECT", "NR5G-SA", "n41", 589, 521310)), 11);
         assert_eq!(kinds(&h), vec![EventKind::Handover]);
         assert!(h[0].title.contains("PCI 589"));
-        let b = d.observe(&view(serving("CONNECT", "NR5G-SA", "n71", 100, 126270)), 20);
+        assert!(d.observe(&view(serving("CONNECT", "NR5G-SA", "n71", 100, 126270)), 20).is_empty());
+        let b = d.observe(&view(serving("CONNECT", "NR5G-SA", "n71", 100, 126270)), 21);
         assert_eq!(kinds(&b), vec![EventKind::BandChange], "inter-band move is one event");
-        let r = d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 875)), 30);
+        assert!(d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 875)), 30).is_empty());
+        let r = d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 875)), 31);
         assert_eq!(kinds(&r), vec![EventKind::RatChange]);
-        assert!(d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 875)), 31).is_empty(), "no change, no event");
-        // ARFCN-only change is a handover too
-        assert_eq!(kinds(&d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 900)), 32)), vec![EventKind::Handover]);
+        assert!(d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 875)), 32).is_empty(), "no change, no event");
+        // ARFCN-only change is a handover too (confirmed over 2 samples)
+        assert!(d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 900)), 33).is_empty());
+        assert_eq!(kinds(&d.observe(&view(serving("CONNECT", "LTE", "B2", 1, 900)), 34)), vec![EventKind::Handover]);
     }
 
     #[test]
@@ -907,7 +976,7 @@ mod tests {
         }
         assert!(EventKind::AntennaDegraded.notify_default());
         assert!(EventKind::ThermalThrottle.notify_default());
-        assert!(!EventKind::SarBackoff.notify_default());
+        assert!(EventKind::SarBackoff.notify_default());
         assert!(EventKind::AirCipherNull.notify_default());
         assert!(EventKind::ModemSsr.notify_default());
     }
@@ -941,10 +1010,13 @@ mod tests {
         assert_eq!(ev1[0].detail["rsrpSpreadDb"], 17.0);
         assert!(d.observe(&spread_bad, 33).is_empty(), "no duplicate spam while still degraded");
 
-        // Recover across 3 healthy connected snapshots, then drop to 1 chain -> triggers again!
-        for t in 40..43 {
-            assert!(d.observe(&healthy, t).is_empty());
-        }
+        // Recover across 3 healthy connected snapshots (emits AntennaDegraded Info recovery on 3rd), then drop to 1 chain -> triggers again!
+        assert!(d.observe(&healthy, 40).is_empty());
+        assert!(d.observe(&healthy, 41).is_empty());
+        let rec = d.observe(&healthy, 42);
+        assert_eq!(kinds(&rec), vec![EventKind::AntennaDegraded]);
+        assert_eq!(rec[0].severity, Severity::Info);
+        assert_eq!(rec[0].detail["recovered"], true);
         let mut single_chain = healthy.clone();
         single_chain.chain_rsrp = vec![Some(-88.0), None, None, None];
         assert!(d.observe(&single_chain, 50).is_empty());
@@ -968,12 +1040,18 @@ mod tests {
             kinds(&evs),
             vec![EventKind::ThermalThrottle, EventKind::SarBackoff, EventKind::AirCipherNull]
         );
-        // Holding state does not re-fire; clearing and re-entering fires again.
+        // Holding state does not re-fire; clearing emits Info recovery for thermal & null cipher.
         assert!(d.observe(&v, 11).is_empty());
         v.any_throttling = Some(false);
         v.sar_rf_state = Some(0);
         v.null_cipher_alert = Some(false);
-        assert!(d.observe(&v, 12).is_empty());
+        let cleared = d.observe(&v, 12);
+        assert_eq!(kinds(&cleared), vec![EventKind::ThermalThrottle, EventKind::AirCipherNull]);
+        assert_eq!(cleared[0].severity, Severity::Info);
+        assert_eq!(cleared[0].detail["recovered"], true);
+        assert_eq!(cleared[1].severity, Severity::Info);
+        assert_eq!(cleared[1].detail["recovered"], true);
+        // Re-entering fires again.
         v.any_throttling = Some(true);
         assert_eq!(kinds(&d.observe(&v, 13)), vec![EventKind::ThermalThrottle]);
     }
