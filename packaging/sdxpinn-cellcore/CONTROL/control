@@ -1,10 +1,10 @@
 Package: sdxpinn-cellcore
-Version: 1.7.0-1
+Version: 1.8.0-1
 Architecture: sdxpinn
 Maintainer: GizmoTickler <gizmotickler@users.noreply.github.com>
 Source: github.com/GizmoTickler/CellCore
 Description: CellCore — static Rust cellular gateway daemon (cellcored) and React 19 UI with native QRTR/QMI data plane for Quectel RM55x SDX75 modems
-Depends: libc, uci, ubus, uhttpd, ookla-speedtest, msmtp, ca-bundle, ca-certificates
+Depends: libc, uci, ubus, uhttpd, msmtp, ca-bundle, ca-certificates
 Conflicts: sdxpinn-quecmanager, sdxpinn-quecmanager-beta, sdxpinn-console-menu
 Replaces: sdxpinn-quecmanager-beta, sdxpinn-quecmanager, sdxpinn-patch, socat-at-bridge, sdxpinn-console-menu
 Provides: sdxpinn-quecmanager-beta

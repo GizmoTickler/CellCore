@@ -38,7 +38,7 @@ async fn get_tokens(State(ctx): State<HttpCtx>) -> Response {
 struct CreateTokenReq {
     name: String,
     kind: TokenKind,
-    #[serde(default)]
+    #[serde(default, alias = "expiresDays")]
     expires_in_days: Option<u32>,
 }
 
@@ -317,13 +317,52 @@ mod tests {
         let at = r#"{"command":"AT+CSQ"}"#;
         assert_eq!(send(&t, Method::POST, "/api/v1/modem/at", &[("authorization", &h(&read))], at, PEER).await.0, StatusCode::FORBIDDEN);
         assert_eq!(send(&t, Method::POST, "/api/v1/modem/at", &[("authorization", &h(&rw))], at, PEER).await.0, StatusCode::BAD_GATEWAY);
-        for p in ["/api/v1/bootstrap", "/api/v1/metrics", "/api/v1/events", "/api/v1/notify", "/api/v1/modem/at/classify?command=AT%2BCSQ"] {
+        for p in [
+            "/api/v1/bootstrap",
+            "/api/v1/metrics",
+            "/api/v1/failover",
+            "/api/v1/cellular/tower-finder",
+            "/api/v1/vpn/cloudflared",
+            "/api/v1/modem/at/classify?command=AT%2BCSQ",
+        ] {
             assert_eq!(send(&t, Method::GET, p, &[("authorization", &h(&read))], "", PEER).await.0, StatusCode::OK, "{p}");
         }
-        assert_eq!(send(&t, Method::GET, "/api/v1/audit", &[("authorization", &h(&read))], "", PEER).await.0, StatusCode::FORBIDDEN);
+        for denied in [
+            "/api/v1/audit",
+            "/api/v1/modem/secrets",
+            "/api/v1/events",
+            "/api/v1/notify",
+            "/api/v1/admin/services/rc-local",
+            "/api/v1/admin/software/feeds",
+            "/api/v1/system/ota",
+        ] {
+            assert_eq!(
+                send(&t, Method::GET, denied, &[("authorization", &h(&read))], "", PEER).await.0,
+                StatusCode::FORBIDDEN,
+                "read token must be denied {denied}"
+            );
+        }
         assert_eq!(send(&t, Method::GET, "/api/v1/audit", &[("authorization", &h(&rw))], "", PEER).await.0, StatusCode::OK);
-        assert_eq!(send(&t, Method::GET, "/api/v1/modem/secrets", &[("authorization", &h(&read))], "", PEER).await.0, StatusCode::FORBIDDEN);
         assert_eq!(send(&t, Method::GET, "/api/v1/modem/secrets", &[("authorization", &h(&rw))], "", PEER).await.0, StatusCode::OK);
+        assert_eq!(send(&t, Method::GET, "/api/v1/events", &[("authorization", &h(&rw))], "", PEER).await.0, StatusCode::OK);
+        assert_eq!(send(&t, Method::GET, "/api/v1/notify", &[("authorization", &h(&rw))], "", PEER).await.0, StatusCode::OK);
+
+        // Creating an rw token without expiresInDays via HTTP defaults to 90 days.
+        let sess = t.auth.create_session().await.unwrap();
+        let cookie = format!("qm_session={}", sess.token);
+        let (s, v) = send(
+            &t,
+            Method::POST,
+            "/api/v1/security/tokens",
+            &[("cookie", &cookie), ("x-qm-csrf", &sess.csrf_token)],
+            r#"{"name":"rw-default","kind":"rw"}"#,
+            PEER,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let created_at = v["info"]["createdAt"].as_u64().unwrap();
+        let expires_at = v["info"]["expiresAt"].as_u64().expect("rw token must default to 90d expiry");
+        assert_eq!(expires_at - created_at, u64::from(crate::tokens::DEFAULT_RW_EXPIRY_DAYS) * 86_400);
     }
 
     #[tokio::test]

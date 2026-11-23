@@ -47,7 +47,10 @@ use crate::{
 };
 
 pub const DATAPLANE_CONFIG_PATH: &str = "/etc/cellcore/dataplane.json";
+pub const NATIVE_STATE_PATH: &str = "/var/run/cellcore-native-state.json";
 pub const CONFIRM_NATIVE: &str = "NATIVE";
+const NATIVE_WDS_START_TIMEOUT: Duration = Duration::from_secs(30);
+const QMI_IND_DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
 pub fn routes() -> Router<HttpCtx> {
     Router::new()
@@ -305,9 +308,37 @@ struct DataplaneHub {
     wake: Notify,
     tuning_warnings: Mutex<Vec<String>>,
     reconnect_queue: Mutex<Option<String>>,
+    shutdown_requested: AtomicBool,
+    supervisor_running: AtomicBool,
+    done_notify: Notify,
 }
 
 type EthtoolGroFeatures = (Option<bool>, Option<bool>);
+
+/// Persistent Native-mode handoff & pre-tuning sysctl baseline saved to
+/// `/var/run/cellcore-native-state.json` so stop, crash-restart, or `opkg remove`
+/// (`dataplane-restore`) can cleanly restore `netmgrd`/QCMAP, `mwan3`, DNS,
+/// firewall rules, and original pre-tuning sysctls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PersistedNativeState {
+    pub native_active: bool,
+    pub vendor_daemons_stopped: bool,
+    pub mwan3_stopped: bool,
+    pub iface: Option<String>,
+    pub route_table: Option<u32>,
+    pub created_rmnet_iface: Option<String>,
+    pub saved_resolv: Option<SavedResolvSnapshot>,
+    pub ippt_dnsmasq_active: bool,
+    pub ipa_ippt_active: bool,
+    pub ipa_ippt_dev_type: Option<String>,
+    pub ipa_ippt_vlan: u16,
+    pub ipa_v6_sharing_active: bool,
+    /// Original sysctl values captured strictly BEFORE applying high-throughput tuning.
+    pub baseline_sysctls: Vec<(String, String)>,
+    pub baseline_irq_affinities: HashMap<String, String>,
+    pub baseline_ethtool_features: HashMap<String, EthtoolGroFeatures>,
+}
 
 static HUB: OnceLock<Arc<DataplaneHub>> = OnceLock::new();
 static BASELINE_SYSCTLS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
@@ -317,7 +348,49 @@ static BASELINE_ETHTOOL_FEATURES: OnceLock<Mutex<HashMap<String, EthtoolGroFeatu
 /// Monotonic milliseconds (`crate::state::mono_ms()`) when the native bearer connected (`0` = disconnected).
 static NATIVE_CONNECTED_SINCE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NATIVE_WDS_V4_CONNECTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_WDS_V6_CONNECTED: AtomicBool = AtomicBool::new(false);
+static FORCE_FW_HEAL: AtomicBool = AtomicBool::new(false);
 static SFE_LOADED_BY_US: AtomicBool = AtomicBool::new(false);
+
+pub fn load_persisted_native_state() -> Option<PersistedNativeState> {
+    let p = crate::paths::p(NATIVE_STATE_PATH);
+    let raw = fs::read_to_string(&p).ok()?;
+    serde_json::from_str::<PersistedNativeState>(&raw).ok()
+}
+
+pub fn save_persisted_native_state(st: &PersistedNativeState) -> Result<(), String> {
+    let p = crate::paths::p(NATIVE_STATE_PATH);
+    save_json_atomic(&p, st, 0o600)
+}
+
+pub fn clear_persisted_native_state() {
+    let p = crate::paths::p(NATIVE_STATE_PATH);
+    let _ = fs::remove_file(&p);
+}
+
+/// True when at least one native QMI WDS family (IPv4 or IPv6) is currently connected.
+pub fn is_wds_connected() -> bool {
+    NATIVE_WDS_V4_CONNECTED.load(Ordering::Acquire)
+        || NATIVE_WDS_V6_CONNECTED.load(Ordering::Acquire)
+}
+
+/// Immediately wake the native supervisor to re-assert native fw4/nft/iptables rules
+/// (e.g. right after an external or hardening `fw4 reload`).
+pub fn request_native_firewall_heal() {
+    FORCE_FW_HEAL.store(true, Ordering::Release);
+    if let Some(h) = HUB.get() {
+        h.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_native_wds_state_for_test(native_mode: bool, v4: bool, v6: bool) {
+    NATIVE_MODE_ACTIVE.store(native_mode, Ordering::Release);
+    NATIVE_WDS_V4_CONNECTED.store(v4, Ordering::Release);
+    NATIVE_WDS_V6_CONNECTED.store(v6, Ordering::Release);
+}
 
 const IPPT_DNSMASQ_CONF_PATH: &str = "/tmp/dnsmasq.d/99-cellcore-ippt.conf";
 
@@ -504,6 +577,9 @@ fn hub() -> Arc<DataplaneHub> {
             wake: Notify::new(),
             tuning_warnings: Mutex::new(Vec::new()),
             reconnect_queue: Mutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
+            supervisor_running: AtomicBool::new(false),
+            done_notify: Notify::new(),
         })
     })
     .clone()
@@ -899,27 +975,7 @@ pub(crate) fn socket_buf_max_bytes_for_ram(ram_mib: Option<u64>) -> u64 {
 }
 
 pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&str>) -> Vec<String> {
-    let baseline_lock = BASELINE_SYSCTLS.get_or_init(|| {
-        let mut captured = Vec::new();
-        for (rel, _) in HIGH_THROUGHPUT_SYSCTLS.iter().chain(OPTIONAL_IPA_SYSCTLS.iter()) {
-            if let Some(orig) = read_trimmed(rel) {
-                captured.push(((*rel).to_string(), orig));
-            }
-        }
-        Mutex::new(captured)
-    });
-
-    // Capture any baseline sysctls not yet present on earlier calls (e.g. sandboxes or newly created links).
-    {
-        let mut pairs = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
-        for (rel, _) in HIGH_THROUGHPUT_SYSCTLS.iter().chain(OPTIONAL_IPA_SYSCTLS.iter()) {
-            if !pairs.iter().any(|(k, _)| k == rel)
-                && let Some(orig) = read_trimmed(rel)
-            {
-                pairs.push(((*rel).to_string(), orig));
-            }
-        }
-    }
+    let baseline_lock = BASELINE_SYSCTLS.get_or_init(|| Mutex::new(Vec::new()));
 
     let mut dyn_entries: Vec<(String, &'static str)> = Vec::new();
     if let Some(iface) = active_iface
@@ -939,20 +995,31 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
         }
     }
 
-    if !dyn_entries.is_empty() {
-        let mut pairs = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
-        for (rel, _) in &dyn_entries {
-            if !pairs.iter().any(|(k, _)| k == rel)
-                && let Some(orig) = read_trimmed(rel)
-            {
-                pairs.push((rel.clone(), orig));
-            }
-        }
-    }
-
     let mut warnings = Vec::new();
     match profile {
         KernelTuningProfile::HighThroughput => {
+            // Strictly BEFORE applying tuning: load any previously persisted original baseline
+            // (so crash-restart reuses the original pre-tuning values rather than capturing
+            // already-tuned values!), and only capture values for paths not yet recorded.
+            let mut persisted = load_persisted_native_state().unwrap_or_default();
+            for rel in HIGH_THROUGHPUT_SYSCTLS
+                .iter()
+                .chain(OPTIONAL_IPA_SYSCTLS.iter())
+                .map(|(r, _)| *r)
+                .chain(dyn_entries.iter().map(|(r, _)| r.as_str()))
+            {
+                if !persisted.baseline_sysctls.iter().any(|(k, _)| k == rel)
+                    && let Some(orig) = read_trimmed(rel)
+                {
+                    persisted.baseline_sysctls.push((rel.to_string(), orig));
+                }
+            }
+            {
+                let mut mem = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
+                *mem = persisted.baseline_sysctls.clone();
+            }
+            let _ = save_persisted_native_state(&persisted);
+
             let buf_max = socket_buf_max_bytes_for_ram(total_ram_mib());
             let buf_max_s = buf_max.to_string();
             let tcp_rmem_s = format!("4096 131072 {buf_max}");
@@ -985,7 +1052,12 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
             tune_nic_offloads_and_irqs(active_iface);
         }
         KernelTuningProfile::Default => {
-            let pairs = baseline_lock.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let persisted = load_persisted_native_state();
+            let pairs = persisted
+                .as_ref()
+                .filter(|st| !st.baseline_sysctls.is_empty())
+                .map(|st| st.baseline_sysctls.clone())
+                .unwrap_or_else(|| baseline_lock.lock().unwrap_or_else(|e| e.into_inner()).clone());
             for (rel, orig) in pairs {
                 let real = crate::paths::p(&rel);
                 if !Path::new(&real).exists() {
@@ -998,6 +1070,16 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                 }
             }
             restore_nic_offloads_and_irqs(&mut warnings);
+            if let Some(mut st) = persisted {
+                st.baseline_sysctls.clear();
+                st.baseline_irq_affinities.clear();
+                st.baseline_ethtool_features.clear();
+                if !st.native_active && !st.vendor_daemons_stopped && !st.mwan3_stopped {
+                    clear_persisted_native_state();
+                } else {
+                    let _ = save_persisted_native_state(&st);
+                }
+            }
         }
     }
     warnings
@@ -1076,7 +1158,8 @@ fn irq_affinity_file_for(irq: &str) -> Option<(String, bool)> {
 }
 
 /// Pin `eth0-*` PCIe MSI IRQs split across CPU 2 (`4`) and CPU 3 (`8`), and `gsi` to CPU 1 (`2`),
-/// saving original IRQ affinities so reverting to `KernelTuningProfile::Default` restores them.
+/// saving original IRQ affinities (persisted on disk + in-memory) so reverting to
+/// `KernelTuningProfile::Default` restores them even across crash-restarts.
 pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
     let irqs_path = crate::paths::p("/proc/interrupts");
     let Ok(text) = fs::read_to_string(&irqs_path) else {
@@ -1084,15 +1167,27 @@ pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
     };
     let plan = plan_irq_affinities(&text);
     let baseline = BASELINE_IRQ_AFFINITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut persisted = load_persisted_native_state().unwrap_or_default();
+    let mut persisted_dirty = false;
     let mut assigned = Vec::with_capacity(plan.len());
     for target in plan {
         if let Some((rel, is_list)) = irq_affinity_file_for(&target.irq) {
-            if let Some(orig) = read_trimmed(&rel) {
+            if !persisted.baseline_irq_affinities.contains_key(&rel)
+                && let Some(orig) = read_trimmed(&rel)
+            {
+                persisted.baseline_irq_affinities.insert(rel.clone(), orig.clone());
+                persisted_dirty = true;
                 baseline
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .entry(rel.clone())
                     .or_insert(orig);
+            } else if let Some(orig) = persisted.baseline_irq_affinities.get(&rel) {
+                baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(rel.clone())
+                    .or_insert_with(|| orig.clone());
             }
             let val = if is_list {
                 target.cpu_list
@@ -1102,6 +1197,9 @@ pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
             let _ = fs::write(crate::paths::p(&rel), format!("{val}\n"));
         }
         assigned.push((target.irq, target.cpu_list));
+    }
+    if persisted_dirty {
+        let _ = save_persisted_native_state(&persisted);
     }
     assigned
 }
@@ -1138,24 +1236,25 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
         ifaces.push(iface);
     }
     let eth_baseline = BASELINE_ETHTOOL_FEATURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut persisted = load_persisted_native_state().unwrap_or_default();
+    let mut persisted_dirty = false;
     for iface in ifaces {
         let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
         if !Path::new(&sys_if).exists() {
             continue;
         }
-        let already_saved = eth_baseline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(iface);
+        let already_saved = persisted.baseline_ethtool_features.contains_key(iface);
         if !already_saved
             && let Ok(stdout) = crate::uci::run_cmd_blocking_timeout(
-                "ethtool",
+                &crate::paths::program("ethtool"),
                 &["-k", iface],
                 Duration::from_secs(2),
             )
         {
             let feats = parse_ethtool_gro_features(&stdout);
             if feats.0.is_some() || feats.1.is_some() {
+                persisted.baseline_ethtool_features.insert(iface.to_string(), feats);
+                persisted_dirty = true;
                 eth_baseline
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1163,60 +1262,91 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
             }
         }
         let _ = crate::uci::run_cmd_blocking_timeout(
-            "ethtool",
+            &crate::paths::program("ethtool"),
             &["-K", iface, "rx-gro-list", "off", "rx-udp-gro-forwarding", "on"],
             Duration::from_secs(2),
         );
+    }
+    if persisted_dirty {
+        let _ = save_persisted_native_state(&persisted);
     }
 
     let _ = pin_eth0_irqs_to_cpu2_3();
 }
 
 fn restore_nic_offloads_and_irqs(warnings: &mut Vec<String>) {
-    if let Some(baseline) = BASELINE_IRQ_AFFINITIES.get() {
-        let entries: Vec<(String, String)> = baseline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (rel, orig) in entries {
-            let real = crate::paths::p(&rel);
-            if Path::new(&real).exists()
-                && let Err(e) = fs::write(&real, format!("{orig}\n"))
-            {
-                warnings.push(format!("restore {rel}: {e}"));
-            }
+    let persisted = load_persisted_native_state();
+    let irq_entries: Vec<(String, String)> = persisted
+        .as_ref()
+        .filter(|st| !st.baseline_irq_affinities.is_empty())
+        .map(|st| {
+            st.baseline_irq_affinities
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            BASELINE_IRQ_AFFINITIES
+                .get()
+                .map(|b| {
+                    b.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    for (rel, orig) in irq_entries {
+        let real = crate::paths::p(&rel);
+        if Path::new(&real).exists()
+            && let Err(e) = fs::write(&real, format!("{orig}\n"))
+        {
+            warnings.push(format!("restore {rel}: {e}"));
         }
     }
-    if let Some(eth_baseline) = BASELINE_ETHTOOL_FEATURES.get() {
-        let entries: Vec<(String, EthtoolGroFeatures)> = eth_baseline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        for (iface, (gro_list, udp_gro_fwd)) in entries {
-            let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
-            if !Path::new(&sys_if).exists() {
-                continue;
-            }
-            let mut args: Vec<&str> = vec!["-K", &iface];
-            if let Some(v) = gro_list {
-                args.push("rx-gro-list");
-                args.push(if v { "on" } else { "off" });
-            }
-            if let Some(v) = udp_gro_fwd {
-                args.push("rx-udp-gro-forwarding");
-                args.push(if v { "on" } else { "off" });
-            }
-            if args.len() > 2 {
-                let _ = crate::uci::run_cmd_blocking_timeout(
-                    "ethtool",
-                    &args,
-                    Duration::from_secs(2),
-                );
-            }
+
+    let eth_entries: Vec<(String, EthtoolGroFeatures)> = persisted
+        .as_ref()
+        .filter(|st| !st.baseline_ethtool_features.is_empty())
+        .map(|st| {
+            st.baseline_ethtool_features
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            BASELINE_ETHTOOL_FEATURES
+                .get()
+                .map(|b| {
+                    b.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    for (iface, (gro_list, udp_gro_fwd)) in eth_entries {
+        let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
+        if !Path::new(&sys_if).exists() {
+            continue;
+        }
+        let mut args: Vec<&str> = vec!["-K", &iface];
+        if let Some(v) = gro_list {
+            args.push("rx-gro-list");
+            args.push(if v { "on" } else { "off" });
+        }
+        if let Some(v) = udp_gro_fwd {
+            args.push("rx-udp-gro-forwarding");
+            args.push(if v { "on" } else { "off" });
+        }
+        if args.len() > 2 {
+            let _ = crate::uci::run_cmd_blocking_timeout(
+                &crate::paths::program("ethtool"),
+                &args,
+                Duration::from_secs(2),
+            );
         }
     }
 }
@@ -1439,9 +1569,14 @@ pub fn start(state: &AppState) {
     });
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct AppliedCfgSig {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedCfgSig {
     iface: String,
+    mux_id: u8,
+    ep_type: u32,
+    ep_iface_id: u32,
+    profile_index: u8,
+    ip_family: IpFamily,
     route_table: u32,
     ippt: bool,
     ippt_mac: Option<String>,
@@ -1456,6 +1591,11 @@ impl From<&DataplaneConfig> for AppliedCfgSig {
     fn from(c: &DataplaneConfig) -> Self {
         Self {
             iface: c.iface.clone(),
+            mux_id: c.mux_id,
+            ep_type: c.ep_type,
+            ep_iface_id: c.ep_iface_id,
+            profile_index: c.profile_index,
+            ip_family: c.ip_family,
             route_table: c.route_table,
             ippt: c.ippt,
             ippt_mac: c.ippt_mac.clone(),
@@ -1465,6 +1605,52 @@ impl From<&DataplaneConfig> for AppliedCfgSig {
             manage_dns: c.manage_dns,
             ipv6_prefix_sharing: c.ipv6_prefix_sharing,
         }
+    }
+}
+
+/// True when a config change requires tearing down and restarting the active QMI WDS
+/// bearer session(s) (APN profile index, IP family, interface, mux ID, or endpoint changed).
+pub(crate) fn bearer_restart_needed(prev: Option<&AppliedCfgSig>, cur: &AppliedCfgSig) -> bool {
+    let Some(p) = prev else {
+        return false;
+    };
+    p.profile_index != cur.profile_index
+        || p.ip_family != cur.ip_family
+        || p.iface != cur.iface
+        || p.mux_id != cur.mux_id
+        || p.ep_type != cur.ep_type
+        || p.ep_iface_id != cur.ep_iface_id
+}
+
+fn persist_native_handoff_state(nh: &NativeHandles, cfg: &DataplaneConfig, active: bool) {
+    let mut st = load_persisted_native_state().unwrap_or_default();
+    st.native_active = active;
+    st.vendor_daemons_stopped = nh.vendor_daemons_stopped;
+    st.mwan3_stopped = nh.mwan3_stopped;
+    st.iface = nh.last_resolved_iface.clone().or_else(|| Some(cfg.iface.clone()));
+    st.route_table = Some(
+        nh.last_applied_sig
+            .as_ref()
+            .map(|s| s.route_table)
+            .unwrap_or(cfg.route_table),
+    );
+    st.created_rmnet_iface = nh.created_rmnet_iface.clone();
+    st.saved_resolv = nh.saved_resolv.clone();
+    st.ippt_dnsmasq_active = nh.ippt_dnsmasq_active;
+    st.ipa_ippt_active = nh.ipa_ippt_active;
+    st.ipa_ippt_dev_type = Some(cfg.ippt_dev_type.clone());
+    st.ipa_ippt_vlan = cfg.ippt_vlan;
+    st.ipa_v6_sharing_active = nh.ipa_v6_sharing_prefix.is_some();
+    if !st.native_active
+        && !st.vendor_daemons_stopped
+        && !st.mwan3_stopped
+        && st.baseline_sysctls.is_empty()
+        && st.baseline_irq_affinities.is_empty()
+        && st.baseline_ethtool_features.is_empty()
+    {
+        clear_persisted_native_state();
+    } else {
+        let _ = save_persisted_native_state(&st);
     }
 }
 
@@ -2002,6 +2188,84 @@ async fn teardown_native_nat(nh: &mut NativeHandles, warnings: &mut Vec<String>)
     }
 }
 
+/// Parse `iptables -S <chain>` output and build `-D ...` delete argv lists for any
+/// orphaned rules carrying `--comment qm_native` (or `--comment "qm_native"`).
+pub(crate) fn extract_qm_native_ipt_delete_args(rules_text: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for line in rules_text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("-A ") {
+            continue;
+        }
+        if !trimmed.contains("--comment qm_native") && !trimmed.contains("--comment \"qm_native\"") {
+            continue;
+        }
+        let mut args = Vec::new();
+        for tok in trimmed.split_whitespace() {
+            let clean = tok.trim_matches('"');
+            if args.is_empty() && clean == "-A" {
+                args.push("-D".to_string());
+            } else {
+                args.push(clean.to_string());
+            }
+        }
+        if args.len() >= 2 {
+            out.push(args);
+        }
+    }
+    out
+}
+
+/// Remove any orphaned `qm_native` nftables / iptables / ip6tables rules left behind
+/// by a previous crash before re-applying or restoring vendor mode (all non-blocking).
+pub(crate) async fn cleanup_orphaned_native_firewall_rules(warnings: &mut Vec<String>) {
+    let nft_bin = "/usr/sbin/nft";
+    let ipt_bin = "/usr/sbin/iptables";
+    let ip6t_bin = "/usr/sbin/ip6tables";
+
+    if Path::new(&crate::paths::p(nft_bin)).exists() {
+        let _ = run(nft_bin, &["delete", "table", "inet", "qm_native_nat"], ExecOpts::new(5, 16 * KIB)).await;
+        if let Ok(out) = run(nft_bin, &["-a", "list", "chain", "inet", "fw4", "accept_to_wan"], ExecOpts::new(5, 32 * KIB)).await
+            && out.ok()
+        {
+            for h in extract_qm_native_nft_handles(&out.stdout_str()) {
+                let hs = h.to_string();
+                if let Ok(r) = run(
+                    nft_bin,
+                    &["delete", "rule", "inet", "fw4", "accept_to_wan", "handle", &hs],
+                    ExecOpts::new(5, 16 * KIB),
+                )
+                .await
+                    && !r.ok()
+                {
+                    warnings.push(format!("orphan fw4 handle {hs}: {}", r.err_summary("nft")));
+                }
+            }
+        }
+    }
+
+    for (bin, table, chain) in [
+        (ipt_bin, "nat", "POSTROUTING"),
+        (ipt_bin, "filter", "zone_wan_dest_accept"),
+        (ipt_bin, "mangle", "FORWARD"),
+        (ip6t_bin, "filter", "zone_wan_dest_accept"),
+        (ip6t_bin, "mangle", "FORWARD"),
+    ] {
+        if !Path::new(&crate::paths::p(bin)).exists() {
+            continue;
+        }
+        if let Ok(out) = run(bin, &["-t", table, "-S", chain], ExecOpts::new(5, 32 * KIB)).await
+            && out.ok()
+        {
+            for del_tail in extract_qm_native_ipt_delete_args(&out.stdout_str()) {
+                let mut argv: Vec<&str> = vec!["-t", table];
+                argv.extend(del_tail.iter().map(String::as_str));
+                let _ = run(bin, &argv, ExecOpts::new(5, 16 * KIB)).await;
+            }
+        }
+    }
+}
+
 async fn heal_native_firewall_if_needed(
     nh: &mut NativeHandles,
     iface: &str,
@@ -2096,12 +2360,17 @@ async fn ensure_native_rmnet_link(
 
     let iface = cfg.iface.clone();
     let mux_id = cfg.mux_id;
+    let high_tput = cfg.kernel_tuning == KernelTuningProfile::HighThroughput;
     let res = tokio::task::spawn_blocking(move || {
         let links = netlink::list_links()?;
         if netlink::resolve_rmnet_link(&links, &iface, mux_id).is_some() {
             return Ok::<_, String>(None);
         }
-        netlink::create_rmnet_link("rmnet_ipa0", &iface, u16::from(mux_id)).map(Some)
+        let (link, created) = netlink::create_rmnet_link("rmnet_ipa0", &iface, u16::from(mux_id))?;
+        if created && high_tput {
+            apply_iface_rps_high_throughput(&link.name);
+        }
+        Ok(Some((link, created)))
     })
     .await;
 
@@ -2109,9 +2378,6 @@ async fn ensure_native_rmnet_link(
         Ok(Ok(Some((link, created)))) => {
             if created {
                 nh.created_rmnet_iface = Some(link.name.clone());
-                if cfg.kernel_tuning == KernelTuningProfile::HighThroughput {
-                    apply_iface_rps_high_throughput(&link.name);
-                }
                 state.push_daemon_log(format!(
                     "dataplane: created rmnet link {} (mux_id={}, ifindex={}) on rmnet_ipa0",
                     link.name, cfg.mux_id, link.ifindex
@@ -2235,7 +2501,9 @@ async fn teardown_ipa_and_dns(
 }
 
 async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: &DataplaneConfig) {
-    NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
     let iface = nh
         .last_resolved_iface
         .clone()
@@ -2249,6 +2517,7 @@ async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: 
 
     let mut warnings = Vec::new();
     teardown_ipa_and_dns(nh, cfg, true, &mut warnings).await;
+    cleanup_orphaned_native_firewall_rules(&mut warnings).await;
 
     if let (Some(cli), Some(hdl)) = (&nh.v4_client, nh.v4_handle.take()) {
         let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
@@ -2541,7 +2810,12 @@ async fn bring_up_native_family(
         ip_family,
         ..Default::default()
     };
-    let hdl = wds::start_network_interface(cli.as_ref(), &params).await?;
+    let hdl = tokio::time::timeout(
+        NATIVE_WDS_START_TIMEOUT,
+        wds::start_network_interface(cli.as_ref(), &params),
+    )
+    .await
+    .map_err(|_| QmiError::Timeout)??;
     let pkt = wds::get_pkt_srvc_status(cli.as_ref()).await.ok();
     let rt = wds::get_runtime_settings(cli.as_ref()).await?;
     fam_snap.handle = Some(hdl);
@@ -2854,6 +3128,207 @@ async fn flush_rmnet_stale_state(iface: String, table: u32) {
     .await;
 }
 
+/// Immediately strip stale IPv4 or IPv6 addresses and default route on `iface`
+/// (or both families when `family` is `None`).
+async fn flush_rmnet_stale_family(iface: String, table: u32, family: Option<u8>) {
+    if family.is_none() {
+        flush_rmnet_stale_state(iface, table).await;
+        return;
+    }
+    let iface_nl = iface.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if netlink::validate_managed_iface(&iface_nl).is_err()
+            || netlink::validate_managed_table(table).is_err()
+        {
+            return;
+        }
+        if let Ok(links) = netlink::list_links()
+            && let Some(link) = links.into_iter().find(|l| l.name == iface_nl)
+        {
+            let _ = netlink::flush_iface_addrs(&iface_nl, link.ifindex, family);
+        }
+    })
+    .await;
+    if netlink::validate_managed_iface(&iface).is_ok()
+        && netlink::validate_managed_table(table).is_ok()
+    {
+        let fam_flag = if family == Some(libc::AF_INET6 as u8) { "-6" } else { "-4" };
+        let tbl_s = table.to_string();
+        let _ = run(
+            "ip",
+            &[fam_flag, "route", "del", "default", "dev", &iface, "table", &tbl_s],
+            ExecOpts::new(3, 8 * KIB),
+        )
+        .await;
+    }
+}
+
+/// Coalesce a burst of QMI indications arriving within `window` into a single batch,
+/// waking early if `wake` fires (e.g. config change or clean shutdown).
+pub(crate) async fn drain_coalesced_indications(
+    rx: &mut mpsc::Receiver<QmiIndication>,
+    wake: &Notify,
+    window: Duration,
+) -> Vec<QmiIndication> {
+    let mut batch = Vec::new();
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::select! {
+            _ = wake.notified() => break,
+            res = tokio::time::timeout(remaining, rx.recv()) => {
+                match res {
+                    Ok(Some(ind)) => {
+                        batch.push(ind);
+                        if batch.len() >= 128 {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    batch
+}
+
+/// Restore vendor CM daemons (`netmgrd`/QCMAP), `mwan3`, DNS, firewall rules,
+/// and original pre-tuning sysctls from `/var/run/cellcore-native-state.json`.
+/// Safe to invoke on clean shutdown, crash recovery, or `opkg remove` (`postrm`).
+pub async fn restore_from_persisted_state() -> Result<Vec<String>, String> {
+    let Some(st) = load_persisted_native_state() else {
+        return Ok(Vec::new());
+    };
+    let mut actions = Vec::new();
+    let mut warnings = Vec::new();
+
+    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+
+    if st.native_active {
+        cleanup_orphaned_native_firewall_rules(&mut warnings).await;
+        actions.push("Cleaned native nft/iptables/ip6tables rules".into());
+
+        if let Some(ref iface) = st.iface {
+            if st.ipa_ippt_active {
+                let dt = st.ipa_ippt_dev_type.as_deref().unwrap_or("eth0");
+                let args = build_ipa_ippass_disable_args(dt, st.ipa_ippt_vlan, iface);
+                let _ = run_ipa_cli(&args).await;
+                actions.push(format!("Disabled IPA IPPT on {iface}"));
+            }
+            if st.ipa_v6_sharing_active {
+                let args = build_ipa_v6_sharing_disable_args(iface);
+                let _ = run_ipa_cli(&args).await;
+                actions.push(format!("Disabled IPA IPv6 prefix sharing on {iface}"));
+            }
+            let tbl = st.route_table.unwrap_or(netlink::TABLE_MAIN);
+            flush_rmnet_stale_state(iface.clone(), tbl).await;
+            actions.push(format!("Flushed stale rmnet state on {iface}"));
+        }
+
+        if (st.ippt_dnsmasq_active || Path::new(&crate::paths::p(IPPT_DNSMASQ_CONF_PATH)).exists())
+            && remove_ippt_dnsmasq_conf().await.unwrap_or(false)
+        {
+            actions.push("Removed IPPT dnsmasq override".into());
+        }
+
+        let mut saved_resolv = st.saved_resolv.clone();
+        if saved_resolv.is_some() {
+            let _ = restore_native_dns(&mut saved_resolv).await;
+            actions.push("Restored pre-native resolv.conf files".into());
+        }
+
+        if let Some(created_iface) = st.created_rmnet_iface.clone() {
+            let del = created_iface.clone();
+            if let Ok(Ok(())) = tokio::task::spawn_blocking(move || netlink::delete_rmnet_link(&del)).await {
+                actions.push(format!("Deleted daemon-created rmnet link {created_iface}"));
+            }
+        }
+    }
+
+    if !st.baseline_sysctls.is_empty()
+        || !st.baseline_irq_affinities.is_empty()
+        || !st.baseline_ethtool_features.is_empty()
+    {
+        let iface_opt = st.iface.clone();
+        let _ = crate::paths::spawn_blocking(move || {
+            apply_kernel_tuning(KernelTuningProfile::Default, iface_opt.as_deref())
+        })
+        .await;
+        actions.push("Restored pre-tuning original kernel sysctls and IRQ/NIC baselines".into());
+    }
+
+    if st.vendor_daemons_stopped || st.native_active {
+        start_vendor_cm_daemons().await;
+        actions.push("Restored vendor netmgrd/QCMAP daemons".into());
+    }
+    if st.mwan3_stopped {
+        start_mwan3().await;
+        actions.push("Restored mwan3".into());
+    }
+
+    NATIVE_MODE_ACTIVE.store(false, Ordering::Release);
+    clear_persisted_native_state();
+    Ok(actions)
+}
+
+/// Clean shutdown hook invoked on `SIGTERM`/`SIGINT` in `main.rs`:
+/// stops the supervisor and restores vendor QCMAP/`netmgrd`, `mwan3`, and original
+/// pre-tuning sysctls whenever Native mode was active.
+pub async fn shutdown_cleanly(state: &AppState) {
+    let Some(h) = HUB.get().cloned() else {
+        if load_persisted_native_state().is_some_and(|s| s.native_active) {
+            let _ = restore_from_persisted_state().await;
+        }
+        return;
+    };
+    let was_native = NATIVE_MODE_ACTIVE.load(Ordering::Acquire)
+        || load_persisted_native_state().is_some_and(|s| s.native_active);
+    h.shutdown_requested.store(true, Ordering::Release);
+    h.wake.notify_one();
+
+    if h.supervisor_running.load(Ordering::Acquire) {
+        let _ = tokio::time::timeout(Duration::from_secs(12), h.done_notify.notified()).await;
+    }
+
+    if was_native && load_persisted_native_state().is_some_and(|s| s.native_active) {
+        state.push_daemon_log("dataplane: restoring vendor QCMAP/netmgrd, mwan3, and sysctls on shutdown");
+        let _ = restore_from_persisted_state().await;
+    }
+}
+
+/// CLI entrypoint for `cellcored dataplane-restore` / `cellctl dataplane-restore`
+/// (also invoked by `postrm` on `opkg remove` to reverse Native mode cleanly).
+pub fn run_dataplane_restore_cli() -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dataplane-restore: runtime init failed: {e}");
+            return 1;
+        }
+    };
+    match rt.block_on(restore_from_persisted_state()) {
+        Ok(actions) => {
+            if actions.is_empty() {
+                println!("ok=1 restored=0 note=no_persisted_native_state");
+            } else {
+                for a in &actions {
+                    println!("ok=1 action={a}");
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("dataplane-restore failed: {e}");
+            1
+        }
+    }
+}
+
 fn handle_modem_ssr(
     state: &AppState,
     ph: &mut ProbeHandles,
@@ -2862,7 +3337,9 @@ fn handle_modem_ssr(
     ssr_count: u64,
     reason: &str,
 ) {
-    NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
     state.push_daemon_log(format!("dataplane: QRTR SSR #{ssr_count} detected on node {node}: {reason}"));
     crate::obs::emit(
         crate::obs::EventKind::ModemSsr,
@@ -2989,7 +3466,85 @@ pub(crate) fn evaluate_native_bearer_health(
     (false, delay, format!("native-backoff-{}s", delay.as_secs()))
 }
 
+struct SupervisorRunGuard(Arc<DataplaneHub>);
+
+impl Drop for SupervisorRunGuard {
+    fn drop(&mut self) {
+        self.0.supervisor_running.store(false, Ordering::Release);
+        self.0.done_notify.notify_waiters();
+    }
+}
+
+async fn apply_qmi_indication(
+    h: &DataplaneHub,
+    nh: &mut NativeHandles,
+    cfg: &DataplaneConfig,
+    ind: QmiIndication,
+) {
+    let mut flush_fam: Option<Option<u8>> = None;
+    {
+        let mut s = h.snapshot.write().await;
+        s.indications_received += 1;
+        s.last_indication = Some(format!(
+            "{} {:#06x} ({})",
+            qmi::service_name(ind.service),
+            ind.msg_id,
+            ind.tag
+        ));
+        if ind.service == SVC_NAS && ind.msg_id == nas::NAS_SYS_INFO_IND {
+            s.nas_sys = Some(nas::parse_sys_info_tlvs(&ind.tlvs));
+        } else if ind.service == SVC_WDS
+            && ind.msg_id == WDS_PKT_SRVC_STATUS_IND
+            && let Ok(ps) = wds::parse_pkt_srvc_status_tlvs(&ind.tlvs)
+            && (ps.reconfig_required || ps.status == PktConnStatus::Disconnected)
+        {
+            if ind.tag == "WDS_V4" {
+                nh.v4_client = None;
+                nh.v4_handle = None;
+                nh.last_v4_ip = None;
+                NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                s.wds_v4.state = "disconnected";
+                s.wds_v4.pkt_status = Some(ps);
+                flush_fam = Some(if is_wds_connected() {
+                    Some(libc::AF_INET as u8)
+                } else {
+                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                    None
+                });
+            } else if ind.tag == "WDS_V6" {
+                nh.v6_client = None;
+                nh.v6_handle = None;
+                nh.last_v6_ip = None;
+                nh.last_v6_key = None;
+                NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                s.wds_v6.state = "disconnected";
+                s.wds_v6.pkt_status = Some(ps);
+                flush_fam = Some(if is_wds_connected() {
+                    Some(libc::AF_INET6 as u8)
+                } else {
+                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                    None
+                });
+            }
+        }
+    }
+    if cfg.mode == DataplaneMode::Native
+        && let Some(fam) = flush_fam
+    {
+        let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+        let flush_tbl = nh
+            .last_applied_sig
+            .as_ref()
+            .map(|s| s.route_table)
+            .unwrap_or(cfg.route_table);
+        flush_rmnet_stale_family(flush_if, flush_tbl, fam).await;
+    }
+}
+
 async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
+    h.supervisor_running.store(true, Ordering::Release);
+    let _run_guard = SupervisorRunGuard(Arc::clone(&h));
+
     let (ind_tx, mut ind_rx) = mpsc::channel::<QmiIndication>(64);
     let mut bus: Option<Arc<QrtrBus>> = None;
     let mut bus_rx: Option<tokio::sync::broadcast::Receiver<QrtrBusEvent>> = None;
@@ -2999,10 +3554,27 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
     let mut loop_tick: u64 = 0;
     let mut last_ssr_count: u64 = 0;
     let mut pending_phy_reenable = false;
-    let mut unregistered_ticks: u32 = 0;
     let mut flushed_unregistered = false;
+    let mut need_orphan_fw_cleanup = true;
+
+    // On crash-restart, hydrate handoff flags from `/var/run/cellcore-native-state.json`
+    // so vendor daemons, mwan3, DNS, and created links remain cleanly reversible.
+    if let Some(prev) = load_persisted_native_state()
+        && prev.native_active
+    {
+        nh.vendor_daemons_stopped = prev.vendor_daemons_stopped;
+        nh.mwan3_stopped = prev.mwan3_stopped;
+        nh.created_rmnet_iface = prev.created_rmnet_iface;
+        nh.saved_resolv = prev.saved_resolv;
+        nh.ippt_dnsmasq_active = prev.ippt_dnsmasq_active;
+        nh.ipa_ippt_active = prev.ipa_ippt_active;
+        nh.last_resolved_iface = prev.iface;
+    }
 
     loop {
+        if h.shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
         loop_tick = loop_tick.wrapping_add(1);
         let cfg = h.config.read().await.clone();
         if bus.is_none() {
@@ -3090,9 +3662,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         match cfg.mode {
             DataplaneMode::Coexist => {
                 native_tick = 0;
-                unregistered_ticks = 0;
                 flushed_unregistered = false;
-                NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+                need_orphan_fw_cleanup = true;
+                NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                 if nh.has_native_state() {
                     teardown_native_handles(&state, &mut nh, &cfg).await;
                 }
@@ -3100,18 +3674,60 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     start_vendor_cm_daemons().await;
                     nh.vendor_daemons_stopped = false;
                 }
-                NATIVE_MODE_ACTIVE.store(false, Ordering::Relaxed);
+                NATIVE_MODE_ACTIVE.store(false, Ordering::Release);
                 if nh.mwan3_stopped {
                     start_mwan3().await;
                     nh.mwan3_stopped = false;
                     state.push_daemon_log("dataplane: restarted mwan3 for coexist mode");
                 }
+                persist_native_handoff_state(&nh, &cfg, false);
                 snap.supervisor_state = "coexist-observing".into();
             }
             DataplaneMode::Native => {
                 native_tick = native_tick.wrapping_add(1);
+                if need_orphan_fw_cleanup {
+                    // Clean up any orphaned iptables/nft rules left across a crash-restart before re-applying.
+                    cleanup_orphaned_native_firewall_rules(&mut snap.warnings).await;
+                    need_orphan_fw_cleanup = false;
+                }
+
+                let cur_sig_pre = AppliedCfgSig::from(&cfg);
+                if bearer_restart_needed(nh.last_applied_sig.as_ref(), &cur_sig_pre) {
+                    state.push_daemon_log(format!(
+                        "dataplane: bearer config changed (profile={}, ip_family={:?}, iface={}); restarting native bearer",
+                        cfg.profile_index, cfg.ip_family, cfg.iface
+                    ));
+                    teardown_native_handles(&state, &mut nh, &cfg).await;
+                } else {
+                    if !cfg.ip_family.wants_v4() && (nh.v4_client.is_some() || nh.last_v4_ip.is_some()) {
+                        if let (Some(cli), Some(hdl)) = (&nh.v4_client, nh.v4_handle.take()) {
+                            let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
+                        }
+                        nh.v4_client = None;
+                        nh.last_v4_ip = None;
+                        NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                        let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                        let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                        flush_rmnet_stale_family(flush_if, flush_tbl, Some(libc::AF_INET as u8)).await;
+                    }
+                    if !cfg.ip_family.wants_v6() && (nh.v6_client.is_some() || nh.last_v6_ip.is_some()) {
+                        if let (Some(cli), Some(hdl)) = (&nh.v6_client, nh.v6_handle.take()) {
+                            let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
+                        }
+                        nh.v6_client = None;
+                        nh.last_v6_ip = None;
+                        nh.last_v6_key = None;
+                        NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                        let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                        let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                        flush_rmnet_stale_family(flush_if, flush_tbl, Some(libc::AF_INET6 as u8)).await;
+                    }
+                }
+
                 let manual_family = h.reconnect_queue.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(ref f) = manual_family {
+                    let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                    let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
                     if f == "all" || f == "ipv4" {
                         if let (Some(cli), Some(hdl)) = (&nh.v4_client, nh.v4_handle.take()) {
                             let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
@@ -3121,6 +3737,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         nh.v4_backoff.reset();
                         nh.v4_next_retry_ms = 0;
                         nh.v4_last_error = None;
+                        NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                     }
                     if f == "all" || f == "ipv6" {
                         if let (Some(cli), Some(hdl)) = (&nh.v6_client, nh.v6_handle.take()) {
@@ -3132,11 +3749,21 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         nh.v6_backoff.reset();
                         nh.v6_next_retry_ms = 0;
                         nh.v6_last_error = None;
+                        NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                     }
+                    let flush_fam = match f.as_str() {
+                        "ipv4" => Some(libc::AF_INET as u8),
+                        "ipv6" => Some(libc::AF_INET6 as u8),
+                        _ => None,
+                    };
+                    if !is_wds_connected() {
+                        NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                    }
+                    flush_rmnet_stale_family(flush_if, flush_tbl, flush_fam).await;
                     nh.netlink_backoff.reset();
                 }
 
-                NATIVE_MODE_ACTIVE.store(true, Ordering::Relaxed);
+                NATIVE_MODE_ACTIVE.store(true, Ordering::Release);
                 let vendor_procs = tokio::task::spawn_blocking(|| {
                     proc_comms_present(&["QCMAP_ConnectionManager", "netmgrd"])
                 })
@@ -3167,12 +3794,14 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                 }
 
                 ensure_native_rmnet_link(&state, &cfg, &mut nh, &mut snap.warnings).await;
+                persist_native_handoff_state(&nh, &cfg, true);
 
                 let ps_ready = snap.nas_sys.as_ref().is_some_and(|s| s.registered);
                 if !ps_ready {
-                    unregistered_ticks = unregistered_ticks.saturating_add(1);
-                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
-                    if unregistered_ticks >= 2 && !flushed_unregistered {
+                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                    if !flushed_unregistered {
                         nh.v4_client = None;
                         nh.v6_client = None;
                         nh.v4_handle = None;
@@ -3184,11 +3813,10 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
                         flush_rmnet_stale_state(flush_if, flush_tbl).await;
                         flushed_unregistered = true;
-                        state.push_daemon_log("dataplane: flushed stale rmnet addresses/routes after sustained PS loss");
+                        state.push_daemon_log("dataplane: immediately flushed stale rmnet addresses/routes after PS registration loss");
                     }
                     snap.supervisor_state = "native-waiting-registration".into();
                 } else {
-                    unregistered_ticks = 0;
                     flushed_unregistered = false;
                     let mut v4_rt = None;
                     let mut v6_rt = None;
@@ -3199,176 +3827,249 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     let mut netlink_err = false;
                     let mut netlink_delay: Option<Duration> = None;
                     let now_ms = crate::state::mono_ms();
+                    let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                    let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
 
-                    if cfg.ip_family.wants_v4() {
-                        if let Some(cli) = nh.v4_client.clone().filter(|c| c.is_alive()) {
-                            if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
-                                snap.wds_v4.pkt_status = Some(st.clone());
-                                if st.status == PktConnStatus::Connected && !st.reconfig_required {
-                                    match wds::get_runtime_settings(cli.as_ref()).await {
-                                        Ok(rt) => {
-                                            v4_rt = Some(rt.clone());
-                                            snap.wds_v4.runtime = Some(rt);
-                                            snap.wds_v4.handle = nh.v4_handle;
-                                            snap.wds_v4.state = "connected";
-                                            nh.v4_backoff.reset();
-                                            nh.v4_next_retry_ms = 0;
-                                            nh.v4_last_error = None;
-                                        }
-                                        Err(e) => {
-                                            nh.v4_client = None;
-                                            nh.v4_handle = None;
-                                            nh.last_v4_ip = None;
-                                            v4_failed_this_tick = true;
-                                            let d = nh.v4_backoff.next_delay();
-                                            nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
-                                            v4_retry_delay = Some(d);
-                                            let msg = format!("get_runtime_settings: {e}");
-                                            nh.v4_last_error = Some(msg.clone());
-                                            snap.wds_v4.state = "backoff";
-                                            snap.wds_v4.last_error = Some(msg);
-                                        }
-                                    }
-                                } else {
-                                    nh.v4_client = None;
-                                    nh.v4_handle = None;
-                                    nh.last_v4_ip = None;
-                                }
-                            } else {
-                                nh.v4_client = None;
-                                nh.v4_handle = None;
-                                nh.last_v4_ip = None;
-                            }
-                        }
-                        if nh.v4_client.is_none() && !v4_failed_this_tick {
-                            if now_ms >= nh.v4_next_retry_ms {
-                                snap.reconnect_attempts += 1;
-                                match bring_up_native_family(
-                                    b,
-                                    &ind_tx,
-                                    &cfg,
-                                    4,
-                                    "WDS_V4",
-                                    &mut snap.wds_v4,
-                                    &mut snap.warnings,
-                                )
-                                .await
-                                {
-                                    Ok((c, hdl, rt)) => {
-                                        nh.v4_client = Some(c);
-                                        nh.v4_handle = Some(hdl);
+                    // 1. Poll existing live WDS clients; immediately strip stale netlink state on disconnect.
+                    if cfg.ip_family.wants_v4()
+                        && let Some(cli) = nh.v4_client.clone().filter(|c| c.is_alive())
+                    {
+                        if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
+                            snap.wds_v4.pkt_status = Some(st.clone());
+                            if st.status == PktConnStatus::Connected && !st.reconfig_required {
+                                match wds::get_runtime_settings(cli.as_ref()).await {
+                                    Ok(rt) => {
+                                        v4_rt = Some(rt.clone());
+                                        snap.wds_v4.runtime = Some(rt);
+                                        snap.wds_v4.handle = nh.v4_handle;
+                                        snap.wds_v4.state = "connected";
                                         nh.v4_backoff.reset();
                                         nh.v4_next_retry_ms = 0;
                                         nh.v4_last_error = None;
-                                        v4_rt = Some(rt);
+                                        NATIVE_WDS_V4_CONNECTED.store(true, Ordering::Release);
                                     }
                                     Err(e) => {
+                                        nh.v4_client = None;
+                                        nh.v4_handle = None;
+                                        nh.last_v4_ip = None;
+                                        NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                                        flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
+                                        v4_failed_this_tick = true;
                                         let d = nh.v4_backoff.next_delay();
                                         nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
                                         v4_retry_delay = Some(d);
-                                        let msg = e.to_string();
+                                        let msg = format!("get_runtime_settings: {e}");
                                         nh.v4_last_error = Some(msg.clone());
                                         snap.wds_v4.state = "backoff";
                                         snap.wds_v4.last_error = Some(msg);
                                     }
                                 }
                             } else {
-                                let rem_ms = nh.v4_next_retry_ms.saturating_sub(now_ms);
-                                v4_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
-                                snap.wds_v4.state = "backoff";
-                                snap.wds_v4.last_error = nh.v4_last_error.clone();
+                                nh.v4_client = None;
+                                nh.v4_handle = None;
+                                nh.last_v4_ip = None;
+                                NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                                snap.wds_v4.state = "disconnected";
+                                flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
                             }
+                        } else {
+                            nh.v4_client = None;
+                            nh.v4_handle = None;
+                            nh.last_v4_ip = None;
+                            NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                            snap.wds_v4.state = "disconnected";
+                            flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
                         }
                     }
 
-                    if cfg.ip_family.wants_v6() {
-                        if let Some(cli) = nh.v6_client.clone().filter(|c| c.is_alive()) {
-                            if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
-                                snap.wds_v6.pkt_status = Some(st.clone());
-                                if st.status == PktConnStatus::Connected && !st.reconfig_required {
-                                    match wds::get_runtime_settings(cli.as_ref()).await {
-                                        Ok(mut rt) => {
-                                            if !ipv6_bearer_changed(Some(&rt), nh.last_v6_key.as_ref())
-                                                && let Some(applied_v6) = nh.last_v6_ip.as_ref()
-                                            {
-                                                rt.ipv6_addr = Some(applied_v6.clone());
-                                            }
-                                            v6_rt = Some(rt.clone());
-                                            snap.wds_v6.runtime = Some(rt);
-                                            snap.wds_v6.handle = nh.v6_handle;
-                                            snap.wds_v6.state = "connected";
-                                            nh.v6_backoff.reset();
-                                            nh.v6_next_retry_ms = 0;
-                                            nh.v6_last_error = None;
+                    if cfg.ip_family.wants_v6()
+                        && let Some(cli) = nh.v6_client.clone().filter(|c| c.is_alive())
+                    {
+                        if let Ok(st) = wds::get_pkt_srvc_status(cli.as_ref()).await {
+                            snap.wds_v6.pkt_status = Some(st.clone());
+                            if st.status == PktConnStatus::Connected && !st.reconfig_required {
+                                match wds::get_runtime_settings(cli.as_ref()).await {
+                                    Ok(mut rt) => {
+                                        if !ipv6_bearer_changed(Some(&rt), nh.last_v6_key.as_ref())
+                                            && let Some(applied_v6) = nh.last_v6_ip.as_ref()
+                                        {
+                                            rt.ipv6_addr = Some(applied_v6.clone());
                                         }
-                                        Err(e) => {
-                                            nh.v6_client = None;
-                                            nh.v6_handle = None;
-                                            nh.last_v6_ip = None;
-                                            nh.last_v6_key = None;
-                                            v6_failed_this_tick = true;
-                                            let d = nh.v6_backoff.next_delay();
-                                            nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
-                                            v6_retry_delay = Some(d);
-                                            let msg = format!("get_runtime_settings: {e}");
-                                            nh.v6_last_error = Some(msg.clone());
-                                            snap.wds_v6.state = "backoff";
-                                            snap.wds_v6.last_error = Some(msg);
-                                        }
-                                    }
-                                } else {
-                                    nh.v6_client = None;
-                                    nh.v6_handle = None;
-                                    nh.last_v6_ip = None;
-                                    nh.last_v6_key = None;
-                                }
-                            } else {
-                                nh.v6_client = None;
-                                nh.v6_handle = None;
-                                nh.last_v6_ip = None;
-                                nh.last_v6_key = None;
-                            }
-                        }
-                        if nh.v6_client.is_none() && !v6_failed_this_tick {
-                            if now_ms >= nh.v6_next_retry_ms {
-                                snap.reconnect_attempts += 1;
-                                match bring_up_native_family(
-                                    b,
-                                    &ind_tx,
-                                    &cfg,
-                                    6,
-                                    "WDS_V6",
-                                    &mut snap.wds_v6,
-                                    &mut snap.warnings,
-                                )
-                                .await
-                                {
-                                    Ok((c, hdl, rt)) => {
-                                        nh.v6_client = Some(c);
-                                        nh.v6_handle = Some(hdl);
+                                        v6_rt = Some(rt.clone());
+                                        snap.wds_v6.runtime = Some(rt);
+                                        snap.wds_v6.handle = nh.v6_handle;
+                                        snap.wds_v6.state = "connected";
                                         nh.v6_backoff.reset();
                                         nh.v6_next_retry_ms = 0;
                                         nh.v6_last_error = None;
-                                        v6_rt = Some(rt);
+                                        NATIVE_WDS_V6_CONNECTED.store(true, Ordering::Release);
                                     }
                                     Err(e) => {
+                                        nh.v6_client = None;
+                                        nh.v6_handle = None;
+                                        nh.last_v6_ip = None;
+                                        nh.last_v6_key = None;
+                                        NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                                        flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
+                                        v6_failed_this_tick = true;
                                         let d = nh.v6_backoff.next_delay();
                                         nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
                                         v6_retry_delay = Some(d);
-                                        let msg = e.to_string();
+                                        let msg = format!("get_runtime_settings: {e}");
                                         nh.v6_last_error = Some(msg.clone());
                                         snap.wds_v6.state = "backoff";
                                         snap.wds_v6.last_error = Some(msg);
                                     }
                                 }
                             } else {
-                                let rem_ms = nh.v6_next_retry_ms.saturating_sub(now_ms);
-                                v6_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
-                                snap.wds_v6.state = "backoff";
-                                snap.wds_v6.last_error = nh.v6_last_error.clone();
+                                nh.v6_client = None;
+                                nh.v6_handle = None;
+                                nh.last_v6_ip = None;
+                                nh.last_v6_key = None;
+                                NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                                snap.wds_v6.state = "disconnected";
+                                flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
                             }
+                        } else {
+                            nh.v6_client = None;
+                            nh.v6_handle = None;
+                            nh.last_v6_ip = None;
+                            nh.last_v6_key = None;
+                            NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                            snap.wds_v6.state = "disconnected";
+                            flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
                         }
                     }
+
+                    // 2. Start missing IPv4 and IPv6 WDS sessions CONCURRENTLY (bounded to 30 s each)
+                    //    so dual-stack attach never stalls back-to-back for 4 minutes.
+                    let start_v4 = cfg.ip_family.wants_v4()
+                        && nh.v4_client.is_none()
+                        && !v4_failed_this_tick
+                        && now_ms >= nh.v4_next_retry_ms;
+                    let start_v6 = cfg.ip_family.wants_v6()
+                        && nh.v6_client.is_none()
+                        && !v6_failed_this_tick
+                        && now_ms >= nh.v6_next_retry_ms;
+                    if start_v4 {
+                        snap.reconnect_attempts += 1;
+                    }
+                    if start_v6 {
+                        snap.reconnect_attempts += 1;
+                    }
+                    let mut v4_snap_tmp = snap.wds_v4.clone();
+                    let mut v6_snap_tmp = snap.wds_v6.clone();
+                    let mut v4_warns = Vec::new();
+                    let mut v6_warns = Vec::new();
+                    let (v4_start_res, v6_start_res) = tokio::join!(
+                        async {
+                            if start_v4 {
+                                Some(
+                                    bring_up_native_family(
+                                        b,
+                                        &ind_tx,
+                                        &cfg,
+                                        4,
+                                        "WDS_V4",
+                                        &mut v4_snap_tmp,
+                                        &mut v4_warns,
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            }
+                        },
+                        async {
+                            if start_v6 {
+                                Some(
+                                    bring_up_native_family(
+                                        b,
+                                        &ind_tx,
+                                        &cfg,
+                                        6,
+                                        "WDS_V6",
+                                        &mut v6_snap_tmp,
+                                        &mut v6_warns,
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            }
+                        },
+                    );
+                    snap.warnings.extend(v4_warns);
+                    snap.warnings.extend(v6_warns);
+
+                    if cfg.ip_family.wants_v4() && nh.v4_client.is_none() && !v4_failed_this_tick {
+                        if let Some(res) = v4_start_res {
+                            snap.wds_v4 = v4_snap_tmp;
+                            match res {
+                                Ok((c, hdl, rt)) => {
+                                    nh.v4_client = Some(c);
+                                    nh.v4_handle = Some(hdl);
+                                    nh.v4_backoff.reset();
+                                    nh.v4_next_retry_ms = 0;
+                                    nh.v4_last_error = None;
+                                    NATIVE_WDS_V4_CONNECTED.store(true, Ordering::Release);
+                                    v4_rt = Some(rt);
+                                }
+                                Err(e) => {
+                                    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                                    let d = nh.v4_backoff.next_delay();
+                                    nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                    v4_retry_delay = Some(d);
+                                    let msg = e.to_string();
+                                    nh.v4_last_error = Some(msg.clone());
+                                    snap.wds_v4.state = "backoff";
+                                    snap.wds_v4.last_error = Some(msg);
+                                }
+                            }
+                        } else {
+                            NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                            let rem_ms = nh.v4_next_retry_ms.saturating_sub(now_ms);
+                            v4_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
+                            snap.wds_v4.state = "backoff";
+                            snap.wds_v4.last_error = nh.v4_last_error.clone();
+                        }
+                    }
+
+                    if cfg.ip_family.wants_v6() && nh.v6_client.is_none() && !v6_failed_this_tick {
+                        if let Some(res) = v6_start_res {
+                            snap.wds_v6 = v6_snap_tmp;
+                            match res {
+                                Ok((c, hdl, rt)) => {
+                                    nh.v6_client = Some(c);
+                                    nh.v6_handle = Some(hdl);
+                                    nh.v6_backoff.reset();
+                                    nh.v6_next_retry_ms = 0;
+                                    nh.v6_last_error = None;
+                                    NATIVE_WDS_V6_CONNECTED.store(true, Ordering::Release);
+                                    v6_rt = Some(rt);
+                                }
+                                Err(e) => {
+                                    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                                    let d = nh.v6_backoff.next_delay();
+                                    nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                    v6_retry_delay = Some(d);
+                                    let msg = e.to_string();
+                                    nh.v6_last_error = Some(msg.clone());
+                                    snap.wds_v6.state = "backoff";
+                                    snap.wds_v6.last_error = Some(msg);
+                                }
+                            }
+                        } else {
+                            NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                            let rem_ms = nh.v6_next_retry_ms.saturating_sub(now_ms);
+                            v6_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
+                            snap.wds_v6.state = "backoff";
+                            snap.wds_v6.last_error = nh.v6_last_error.clone();
+                        }
+                    }
+
+                    NATIVE_WDS_V4_CONNECTED.store(v4_rt.is_some(), Ordering::Release);
+                    NATIVE_WDS_V6_CONNECTED.store(v6_rt.is_some(), Ordering::Release);
 
                     let cur_sig = AppliedCfgSig::from(&cfg);
                     let v4_changed = v4_rt.as_ref().and_then(|r| r.ipv4_addr.clone()) != nh.last_v4_ip;
@@ -3525,6 +4226,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                     )
                                     .await;
                                 }
+                                persist_native_handoff_state(&nh, &cfg, true);
                                 nh.netlink_backoff.reset();
                             }
                             Err(e) => {
@@ -3535,9 +4237,9 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                     } else if v4_rt.is_some() || v6_rt.is_some() {
                         nh.netlink_backoff.reset();
-                        // Self-heal firewall rules after fw4/fw3 reload (~every 60s), including IPPT MSS clamp
-                        // and IPv6-only carriers in Ipv4v6 mode.
-                        if native_tick.is_multiple_of(4)
+                        let forced_heal = FORCE_FW_HEAL.swap(false, Ordering::AcqRel);
+                        // Self-heal firewall rules immediately on fw4 reload notification or ~every 60s.
+                        if (forced_heal || native_tick.is_multiple_of(4))
                             && let Some(active_iface) = nh.last_resolved_iface.clone()
                         {
                             let has_v4 = v4_rt.as_ref().and_then(|r| r.ipv4_addr.as_ref()).is_some();
@@ -3569,11 +4271,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         let _ = NATIVE_CONNECTED_SINCE.compare_exchange(
                             0,
                             crate::state::mono_ms(),
-                            Ordering::Relaxed,
+                            Ordering::Release,
                             Ordering::Relaxed,
                         );
                     } else if v4_rt.is_none() && v6_rt.is_none() {
-                        NATIVE_CONNECTED_SINCE.store(0, Ordering::Relaxed);
+                        NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
                     }
                     next_sleep = sleep_dur;
                     snap.supervisor_state = sup_state;
@@ -3629,29 +4331,20 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         let need_services = snap.qrtr.services.is_empty();
         *h.snapshot.write().await = snap;
 
+        if h.shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
+
         tokio::select! {
             _ = tokio::time::sleep(next_sleep) => {}
             _ = h.wake.notified() => {}
             Some(ind) = ind_rx.recv() => {
-                let mut s = h.snapshot.write().await;
-                s.indications_received += 1;
-                s.last_indication = Some(format!("{} {:#06x} ({})", qmi::service_name(ind.service), ind.msg_id, ind.tag));
-                if ind.service == SVC_NAS && ind.msg_id == nas::NAS_SYS_INFO_IND {
-                    s.nas_sys = Some(nas::parse_sys_info_tlvs(&ind.tlvs));
-                } else if ind.service == SVC_WDS && ind.msg_id == WDS_PKT_SRVC_STATUS_IND
-                    && let Ok(ps) = wds::parse_pkt_srvc_status_tlvs(&ind.tlvs)
-                    && (ps.reconfig_required || ps.status == PktConnStatus::Disconnected)
-                {
-                    if ind.tag == "WDS_V4" {
-                        nh.v4_client = None;
-                        nh.v4_handle = None;
-                        nh.last_v4_ip = None;
-                    } else if ind.tag == "WDS_V6" {
-                        nh.v6_client = None;
-                        nh.v6_handle = None;
-                        nh.last_v6_ip = None;
-                        nh.last_v6_key = None;
-                    }
+                // Process first indication immediately (so WDS PDN drop strips stale rmnet state in <1 ms),
+                // then debounce/coalesce any indication burst for 300 ms before running a full supervisor pass.
+                apply_qmi_indication(&h, &mut nh, &cfg, ind).await;
+                let burst = drain_coalesced_indications(&mut ind_rx, &h.wake, QMI_IND_DEBOUNCE_WINDOW).await;
+                for extra in burst {
+                    apply_qmi_indication(&h, &mut nh, &cfg, extra).await;
                 }
             }
             ev = recv_bus_wakeup(bus_rx.as_mut(), Some(b.as_ref()), last_ssr_count, need_services) => {
@@ -3670,6 +4363,34 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                 }
             }
         }
+    }
+
+    // Clean shutdown teardown when Native mode was active: stop WDS handles, strip stale
+    // rules/addresses, restore vendor QCMAP/netmgrd, mwan3, DNS, and original pre-tuning sysctls.
+    let cfg = h.config.read().await.clone();
+    let was_native = cfg.mode == DataplaneMode::Native
+        || NATIVE_MODE_ACTIVE.load(Ordering::Acquire)
+        || nh.has_native_state()
+        || nh.vendor_daemons_stopped
+        || nh.mwan3_stopped;
+    if was_native {
+        state.push_daemon_log("dataplane: tearing down native mode cleanly on shutdown");
+        teardown_native_handles(&state, &mut nh, &cfg).await;
+        let iface_opt = Some(cfg.iface.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            apply_kernel_tuning(KernelTuningProfile::Default, iface_opt.as_deref())
+        })
+        .await;
+        if nh.vendor_daemons_stopped || cfg.mode == DataplaneMode::Native {
+            start_vendor_cm_daemons().await;
+            nh.vendor_daemons_stopped = false;
+        }
+        if nh.mwan3_stopped {
+            start_mwan3().await;
+            nh.mwan3_stopped = false;
+        }
+        NATIVE_MODE_ACTIVE.store(false, Ordering::Release);
+        clear_persisted_native_state();
     }
 }
 
@@ -4695,5 +5416,131 @@ mod tests {
                 assert!(matches!(mv.mode, "coexist" | "native"));
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn persisted_native_baseline_survives_crash_restart_and_restores_cleanly() {
+        let sbx = crate::paths::TestSandbox::new("dp_persist_restore");
+        let rmem = sbx.write("/proc/sys/net/core/rmem_max", "229376\n");
+        let qdisc = sbx.write("/proc/sys/net/core/default_qdisc", "pfifo_fast\n");
+        let resolv = sbx.write("/tmp/resolv.conf.d/resolv.conf.auto", "nameserver 9.9.9.9\n");
+        let call_log = sbx.root.join("restore_calls.log");
+        sbx.write_exec(
+            "/etc/init.d/netmgrd",
+            &format!("#!/bin/sh\necho \"netmgrd $*\" >> {}\nexit 0\n", call_log.display()),
+        );
+        sbx.write_exec(
+            "/etc/init.d/mwan3",
+            &format!("#!/bin/sh\necho \"mwan3 $*\" >> {}\nexit 0\n", call_log.display()),
+        );
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                // 1. First tuning pass captures original pre-tuning baseline (229376, pfifo_fast) to disk.
+                let _ = apply_kernel_tuning(KernelTuningProfile::HighThroughput, Some("rmnet_data0"));
+                assert_eq!(fs::read_to_string(&rmem).unwrap().trim(), "16777216");
+                assert_eq!(fs::read_to_string(&qdisc).unwrap().trim(), "fq_codel");
+
+                // 2. Simulate crash-restart: clear in-memory baseline cache and call HighThroughput AGAIN
+                //    while sysctls are ALREADY tuned. Must reuse persisted original baseline (229376)!
+                if let Some(lock) = BASELINE_SYSCTLS.get() {
+                    lock.lock().unwrap().clear();
+                }
+                let _ = apply_kernel_tuning(KernelTuningProfile::HighThroughput, Some("rmnet_data0"));
+                let persisted = load_persisted_native_state().expect("persisted native state file");
+                assert!(
+                    persisted
+                        .baseline_sysctls
+                        .iter()
+                        .any(|(k, v)| k == "/proc/sys/net/core/rmem_max" && v == "229376"),
+                    "crash-restart must reuse pre-tuning baseline, got {:?}",
+                    persisted.baseline_sysctls
+                );
+
+                // 3. Record native handoff state (vendor daemons + mwan3 stopped, resolv overwritten).
+                let mut st = persisted;
+                st.native_active = true;
+                st.vendor_daemons_stopped = true;
+                st.mwan3_stopped = true;
+                st.saved_resolv = Some(vec![(
+                    "/tmp/resolv.conf.d/resolv.conf.auto".into(),
+                    Some(b"nameserver 9.9.9.9\n".to_vec()),
+                )]);
+                save_persisted_native_state(&st).unwrap();
+                fs::write(&resolv, b"nameserver 192.0.0.30\n").unwrap();
+
+                // 4. `restore_from_persisted_state()` restores sysctls, resolv.conf, netmgrd, mwan3, and removes state file.
+                let actions = restore_from_persisted_state().await.unwrap();
+                assert!(!actions.is_empty());
+                assert_eq!(fs::read_to_string(&rmem).unwrap().trim(), "229376");
+                assert_eq!(fs::read_to_string(&qdisc).unwrap().trim(), "pfifo_fast");
+                assert_eq!(fs::read_to_string(&resolv).unwrap(), "nameserver 9.9.9.9\n");
+                assert!(load_persisted_native_state().is_none());
+                let calls = fs::read_to_string(&call_log).unwrap_or_default();
+                assert!(calls.contains("netmgrd start"), "{calls}");
+                assert!(calls.contains("mwan3 start"), "{calls}");
+            })
+            .await;
+    }
+
+    #[test]
+    fn bearer_restart_detects_apn_profile_and_ip_family_and_parses_orphan_ipt_rules() {
+        let base = DataplaneConfig::default();
+        let sig_base = AppliedCfgSig::from(&base);
+
+        let mut apn_changed = base.clone();
+        apn_changed.profile_index = 2;
+        assert!(bearer_restart_needed(Some(&sig_base), &AppliedCfgSig::from(&apn_changed)));
+
+        let mut fam_changed = base.clone();
+        fam_changed.ip_family = IpFamily::Ipv4;
+        assert!(bearer_restart_needed(Some(&sig_base), &AppliedCfgSig::from(&fam_changed)));
+
+        let mut dns_only = base.clone();
+        dns_only.manage_dns = !base.manage_dns;
+        assert!(!bearer_restart_needed(Some(&sig_base), &AppliedCfgSig::from(&dns_only)));
+        assert_ne!(sig_base, AppliedCfgSig::from(&dns_only));
+
+        let ipt_dump = concat!(
+            "-P POSTROUTING ACCEPT\n",
+            "-A POSTROUTING -o eth1 -j MASQUERADE\n",
+            "-A POSTROUTING -o rmnet_data0 -m comment --comment \"qm_native\" -j MASQUERADE\n",
+            "-A FORWARD -o rmnet_data0 -p tcp --tcp-flags SYN,RST SYN -m comment --comment qm_native -j TCPMSS --set-mss 1388\n",
+        );
+        let dels = extract_qm_native_ipt_delete_args(ipt_dump);
+        assert_eq!(dels.len(), 2);
+        assert_eq!(
+            dels[0],
+            vec!["-D", "POSTROUTING", "-o", "rmnet_data0", "-m", "comment", "--comment", "qm_native", "-j", "MASQUERADE"]
+        );
+        assert_eq!(dels[1][0], "-D");
+        assert!(dels[1].contains(&"TCPMSS".to_string()));
+    }
+
+    #[tokio::test]
+    async fn coalesces_qmi_indication_bursts_and_tracks_live_wds_connected_flag() {
+        let (tx, mut rx) = mpsc::channel::<QmiIndication>(16);
+        let wake = Notify::new();
+        for i in 0..5u16 {
+            tx.send(QmiIndication {
+                service: SVC_NAS,
+                msg_id: nas::NAS_SYS_INFO_IND,
+                tlvs: vec![(0x01, vec![i as u8])],
+                tag: "NAS",
+            })
+            .await
+            .unwrap();
+        }
+        let batch = drain_coalesced_indications(&mut rx, &wake, Duration::from_millis(80)).await;
+        assert_eq!(batch.len(), 5, "burst indications must be coalesced into one pass");
+
+        // WDS live state tracking for ipc.rs false-positive guard.
+        set_native_wds_state_for_test(true, true, false);
+        assert!(is_wds_connected());
+        set_native_wds_state_for_test(true, false, true);
+        assert!(is_wds_connected());
+        set_native_wds_state_for_test(true, false, false);
+        assert!(!is_wds_connected());
+        set_native_wds_state_for_test(false, false, false);
     }
 }

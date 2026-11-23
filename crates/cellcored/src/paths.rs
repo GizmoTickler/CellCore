@@ -90,6 +90,37 @@ pub fn ipc_socket() -> String {
     env::var("QM_IPC_SOCKET").unwrap_or_else(|_| p(crate::ipc::IPC_SOCKET_PATH))
 }
 
+/// Like `tokio::task::spawn_blocking`, but propagates the active `TEST_ENV`
+/// sandbox into the blocking worker thread under `#[cfg(test)]`.
+pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(test)]
+    {
+        let inherited = test_env();
+        tokio::task::spawn_blocking(move || {
+            let prev = TEST_LOCAL.with(|cell| cell.replace(inherited));
+            struct Restore(Option<TestEnv>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let prev = self.0.take();
+                    let _ = TEST_LOCAL.try_with(|cell| {
+                        let _ = cell.replace(prev);
+                    });
+                }
+            }
+            let _guard = Restore(prev);
+            f()
+        })
+    }
+    #[cfg(not(test))]
+    {
+        tokio::task::spawn_blocking(f)
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn luci_upstream() -> String {

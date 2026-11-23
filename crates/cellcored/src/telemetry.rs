@@ -67,6 +67,10 @@ pub const CELL_LOCK_BYPASS_TMP_PATH: &str = "/tmp/cellcore/cell_lock_bypassed.js
 pub const LIVENESS_WATCHDOG_CHECK_SECS: u64 = 30;
 pub const LIVENESS_WATCHDOG_TIMEOUT_MS: u64 = 180_000;
 pub const QSCAN_WATCHDOG_GRACE_MS: u64 = 200_000;
+/// Extra slack beyond an in-flight console AT command's timeout for resync/RF batch completion.
+pub const CONSOLE_AT_WATCHDOG_OVERHEAD_MS: u64 = 20_000;
+/// Hard ceiling on watchdog grace granted to an in-flight console AT command so a wedged daemon still aborts.
+pub const CONSOLE_AT_WATCHDOG_MAX_GRACE_MS: u64 = 90_000;
 pub const RSS_WARN_BYTES: u64 = 80 * 1024 * 1024;
 pub const FD_WARN_COUNT: u64 = 256;
 pub const LINKWATCH_COOLDOWN_SECS: u64 = 900;
@@ -172,10 +176,32 @@ fn sample_self_rss_and_fds() -> (u64, u64) {
     (rss, fds)
 }
 
+/// Pure watchdog RF grace predicate: grants bounded grace while an active
+/// `AT+QSCAN` (`<= QSCAN_WATCHDOG_GRACE_MS`) or a tracked console AT command
+/// (`<= (timeout + overhead).min(CONSOLE_AT_WATCHDOG_MAX_GRACE_MS)`) is in flight.
+pub fn watchdog_rf_in_grace(
+    now_ms: u64,
+    qscan_started_ms: u64,
+    console_at_started_ms: u64,
+    console_at_timeout_ms: u64,
+) -> bool {
+    let in_qscan =
+        qscan_started_ms > 0 && now_ms.saturating_sub(qscan_started_ms) <= QSCAN_WATCHDOG_GRACE_MS;
+    let in_console_at = if console_at_started_ms > 0 {
+        let budget = console_at_timeout_ms
+            .saturating_add(CONSOLE_AT_WATCHDOG_OVERHEAD_MS)
+            .min(CONSOLE_AT_WATCHDOG_MAX_GRACE_MS);
+        now_ms.saturating_sub(console_at_started_ms) <= budget
+    } else {
+        false
+    };
+    in_qscan || in_console_at
+}
+
 /// Spawn a dedicated lightweight OS thread (`cellcore-wdt`) outside the Tokio runtime
 /// that checks independent monotonic heartbeats (`rf`, `net`, `linkwatch`, `http`)
 /// every 30s, samples RSS/FD counts, and aborts if any loop stalls >180s
-/// (with a bounded 200s grace window on `rf` while `AT+QSCAN` runs).
+/// (with bounded grace on `rf` while `AT+QSCAN` or a tracked console AT command runs).
 pub fn spawn_liveness_watchdog(state: &AppState) {
     let init = mono_ms();
     state.hb_rf_ms.store(init, Ordering::Release);
@@ -219,11 +245,16 @@ pub fn spawn_liveness_watchdog(state: &AppState) {
                 }
 
                 let qscan_start = st.qscan_started_ms.load(Ordering::Acquire);
-                let in_qscan_grace =
-                    qscan_start > 0 && now.saturating_sub(qscan_start) <= QSCAN_WATCHDOG_GRACE_MS;
+                let (console_at_start, console_at_timeout) = st.console_at_window();
+                let rf_in_grace = watchdog_rf_in_grace(
+                    now,
+                    qscan_start,
+                    console_at_start,
+                    console_at_timeout,
+                );
 
                 let checks: [(&str, &Arc<AtomicU64>, bool); 4] = [
-                    ("rf", &st.hb_rf_ms, in_qscan_grace),
+                    ("rf", &st.hb_rf_ms, rf_in_grace),
                     ("net", &st.hb_net_ms, false),
                     ("linkwatch", &st.hb_linkwatch_ms, false),
                     ("http", &st.hb_http_ms, false),
@@ -1489,6 +1520,16 @@ async fn run_stage2_cfun_cycle(state: &AppState) {
     }
 }
 
+/// Strictly parse `+QUIMSLOT: <1|2>`. Returns `None` on empty, error, or
+/// out-of-range replies so transient AT failures never fabricate slot `1`.
+pub fn parse_quimslot_reply(body: &str) -> Option<i32> {
+    parse_scalar_at_value(body, "+QUIMSLOT:")
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|s| (1..=2).contains(s))
+}
+
 async fn run_stage4_dual_sim_failover(state: &AppState) -> bool {
     let guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
     if guard.is_none() {
@@ -1498,9 +1539,10 @@ async fn run_stage4_dual_sim_failover(state: &AppState) -> bool {
         .smd
         .exec("AT+QUIMSLOT?", Priority::Emergency, Duration::from_secs(4))
         .await
+        && cur_slot_res.ok
+        && let Some(cur) = parse_quimslot_reply(&cur_slot_res.body)
     {
-        let cur = parse_scalar_at_value(&cur_slot_res.body, "+QUIMSLOT:");
-        let next_slot: u8 = if cur.trim() == "1" { 2 } else { 1 };
+        let next_slot: u8 = if cur == 1 { 2 } else { 1 };
         try_verified_sim_switch(state, next_slot, "LinkWatch Dual-SIM failover").await
     } else {
         false
@@ -1953,12 +1995,19 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     let cfun = parse_scalar_at_value(&get_resp("CFUN"), "+CFUN:")
         .parse::<i32>()
         .unwrap_or(1);
-    let sim_slot = parse_scalar_at_value(&get_resp("QUIMSLOT"), "+QUIMSLOT:")
-        .parse::<i32>()
-        .unwrap_or(1);
-
-    let prev_sim_slot = state.last_sim_slot.swap(sim_slot, Ordering::AcqRel);
-    let sim_slot_changed = prev_sim_slot != 0 && prev_sim_slot != sim_slot;
+    let parsed_sim_slot = parse_quimslot_reply(&get_resp("QUIMSLOT"));
+    let (sim_slot, prev_sim_slot, sim_slot_changed) = if let Some(slot) = parsed_sim_slot {
+        let prev = state.last_sim_slot.swap(slot, Ordering::AcqRel);
+        (slot, prev, prev != 0 && prev != slot)
+    } else {
+        let prev = state.last_sim_slot.load(Ordering::Acquire);
+        let preserved = if (1..=2).contains(&prev) {
+            prev
+        } else {
+            state.modem.read().await.identity.sim_slot
+        };
+        (preserved, prev, false)
+    };
     let mut trigger_profile_sync = false;
     let mut extra_cnum: Option<String> = None;
 
@@ -4896,6 +4945,114 @@ mod tests {
                 .await;
                 let etc_after: DataUsageState = load_json_or_default(DATA_USAGE_PATH);
                 assert_eq!(etc_after.daily[0].rx_bytes, 1000 + sixty_mib);
+            })
+            .await;
+    }
+
+    #[test]
+    fn watchdog_rf_grace_covers_console_at_and_bounds_ceiling() {
+        // Idle -> no grace
+        assert!(!watchdog_rf_in_grace(100_000, 0, 0, 0));
+        // Active 60s console AT (e.g. AT+COPS=?) -> grace for 60s + 20s overhead = 80s
+        assert!(watchdog_rf_in_grace(100_000 + 60_000, 0, 100_000, 60_000));
+        assert!(watchdog_rf_in_grace(100_000 + 80_000, 0, 100_000, 60_000));
+        assert!(!watchdog_rf_in_grace(100_000 + 80_001, 0, 100_000, 60_000));
+        // Even if a huge timeout is passed, grace is hard-capped at CONSOLE_AT_WATCHDOG_MAX_GRACE_MS (90s)
+        assert!(watchdog_rf_in_grace(
+            100_000 + CONSOLE_AT_WATCHDOG_MAX_GRACE_MS,
+            0,
+            100_000,
+            300_000
+        ));
+        assert!(!watchdog_rf_in_grace(
+            100_000 + CONSOLE_AT_WATCHDOG_MAX_GRACE_MS + 1,
+            0,
+            100_000,
+            300_000
+        ));
+        // QSCAN grace still works up to QSCAN_WATCHDOG_GRACE_MS
+        assert!(watchdog_rf_in_grace(100_000 + QSCAN_WATCHDOG_GRACE_MS, 100_000, 0, 0));
+        assert!(!watchdog_rf_in_grace(100_000 + QSCAN_WATCHDOG_GRACE_MS + 1, 100_000, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn failed_quimslot_preserves_last_known_slot_without_churn() {
+        assert_eq!(parse_quimslot_reply("+QUIMSLOT: 1"), Some(1));
+        assert_eq!(parse_quimslot_reply("+QUIMSLOT: 2"), Some(2));
+        assert_eq!(parse_quimslot_reply(""), None);
+        assert_eq!(parse_quimslot_reply("ERROR"), None);
+        assert_eq!(parse_quimslot_reply("+QUIMSLOT: 0"), None);
+        assert_eq!(parse_quimslot_reply("+QUIMSLOT: 9"), None);
+
+        let sbx = crate::paths::TestSandbox::new("quimslot-fail-preserve");
+        let fail_slot = Arc::new(AtomicBool::new(false));
+        let fail_c = fail_slot.clone();
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = b.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|&c| c == b'\r') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    if acc.first() == Some(&b'\n') {
+                        acc.remove(0);
+                    }
+                    let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    let reply = match cmd.as_str() {
+                        "AT+CGMI" => format!("{cmd}\r\r\n+CGMI: Quectel\r\nOK\r\n"),
+                        "AT+CGMM" => format!("{cmd}\r\r\n+CGMM: RM551E-GL\r\nOK\r\n"),
+                        "AT+QGMR" => format!("{cmd}\r\r\nRM551EGL00AAR01A02M8G\r\nOK\r\n"),
+                        "AT+ICCID" => format!("{cmd}\r\r\n+ICCID: 89014102222222222222\r\nOK\r\n"),
+                        "AT+CIMI" => format!("{cmd}\r\r\n310410222222222\r\nOK\r\n"),
+                        "AT+CFUN?" => format!("{cmd}\r\r\n+CFUN: 1\r\nOK\r\n"),
+                        "AT+QUIMSLOT?" => {
+                            if fail_c.load(Ordering::SeqCst) {
+                                format!("{cmd}\r\r\nERROR\r\n")
+                            } else {
+                                format!("{cmd}\r\r\n+QUIMSLOT: 2\r\nOK\r\n")
+                            }
+                        }
+                        _ => format!("{cmd}\r\r\nOK\r\n"),
+                    };
+                    let _ = b.write_all(reply.as_bytes());
+                }
+            }
+        });
+
+        use std::os::unix::io::IntoRawFd;
+        let fd_opt = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_opt.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+
+        crate::paths::TEST_ENV
+            .scope(sbx.env(), async {
+                let auth = crate::auth::AuthStore::new(sbx.root.join("sessions"));
+                let app = AppState::for_tests_with_smd(sbx.root.clone(), auth, smd);
+
+                // Poll 1: establishes SIM slot 2 and caches ICCID/IMSI.
+                refresh_modem_snapshot(&app, Priority::Telemetry, true).await;
+                assert_eq!(app.modem.read().await.identity.sim_slot, 2);
+                assert_eq!(app.last_sim_slot.load(Ordering::Acquire), 2);
+                assert_eq!(app.secrets.read().await.iccid, "89014102222222222222");
+                assert_eq!(app.sim_switched_at_ms.load(Ordering::Acquire), 0);
+
+                // Poll 2: AT+QUIMSLOT? fails with ERROR -> must preserve slot 2 and NOT wipe ICCID or set sim_switched_at_ms!
+                fail_slot.store(true, Ordering::SeqCst);
+                refresh_modem_snapshot(&app, Priority::Telemetry, false).await;
+                assert_eq!(app.modem.read().await.identity.sim_slot, 2);
+                assert_eq!(app.last_sim_slot.load(Ordering::Acquire), 2);
+                assert_eq!(app.secrets.read().await.iccid, "89014102222222222222");
+                assert_eq!(app.sim_switched_at_ms.load(Ordering::Acquire), 0);
             })
             .await;
     }

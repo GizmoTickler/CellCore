@@ -72,7 +72,7 @@ KEYFILE=$(mktemp)
 trap 'shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"; rm -rf "$TMPDIR"' EXIT
 
 python3 "$ROOT/scripts/feed/build_ipk.py" "$PKG_DIR" --out "$TMPDIR"
-python3 "$ROOT/scripts/feed/build_feed.py" "$ROOT/feed" "$TMPDIR/sdxpinn-cellcore_${VERSION}_sdxpinn.ipk"
+python3 "$ROOT/scripts/feed/build_feed.py" --prune-missing "$ROOT/feed" "$TMPDIR/sdxpinn-cellcore_${VERSION}_sdxpinn.ipk"
 
 chmod 600 "$KEYFILE"
 op read "op://Infrastructure/SDXPINN-opkg-usign/credential" > "$KEYFILE"
@@ -83,6 +83,6 @@ echo "==> [6/6] Package & signed feed ready: feed/sdxpinn-cellcore_${VERSION}_sd
 
 if [ "$DEPLOY" -eq 1 ]; then
   echo "==> Deploying staged rollout: mgateway0 (QA) -> mgateway1 (prod)..."
-  ssh -o StrictHostKeyChecking=no root@192.168.228.1 'cellctl upgrade --check && cellctl upgrade --yes && cellctl verify'
-  ssh -o StrictHostKeyChecking=no root@192.168.224.1 'cellctl upgrade --check && cellctl upgrade --yes && cellctl verify --expect-wan 1'
+  ssh -o StrictHostKeyChecking=accept-new root@192.168.228.1 'cellctl upgrade --check && cellctl upgrade --yes && cellctl verify'
+  ssh -o StrictHostKeyChecking=accept-new root@192.168.224.1 'cellctl upgrade --check && cellctl upgrade --yes && cellctl verify --expect-wan 1'
 fi

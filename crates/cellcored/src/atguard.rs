@@ -23,6 +23,7 @@ pub enum AtClass {
     Read,
     Caution,
     Dangerous,
+    Blocked,
 }
 
 impl AtClass {
@@ -31,6 +32,7 @@ impl AtClass {
             AtClass::Read => "read",
             AtClass::Caution => "caution",
             AtClass::Dangerous => "dangerous",
+            AtClass::Blocked => "blocked",
         }
     }
 }
@@ -65,11 +67,24 @@ const READ_EXEC: &[&str] = &[
 /// Write-form commands that only query (`AT+CMGR=3`, `AT+CGPADDR=1`).
 const READ_SET: &[&str] = &["CMGL", "CMGR", "CGPADDR", "CGCONTRDP", "QLTS", "CEER", "QCSQ"];
 
-/// Long-running or session-affecting, but nothing that needs a confirmation.
+/// Long-running or session-affecting, but nothing that needs a confirmation
+/// (except long-blocking scans checked via [`is_long_blocking_scan`]).
 const CAUTION_SET: &[&str] = &[
-    "QSCAN", "QENG", "CMGF", "CSCS", "CMEE", "CREG", "CEREG", "CGREG", "C5GREG", "CNMI", "CPMS", "CMGD", "CMGS", "CSMS", "QINDCFG",
+    "QSCAN", "QENG", "CMGF", "CSCS", "CMEE", "CREG", "CEREG", "CGREG", "C5GREG", "CNMI", "CPMS", "CMGD", "CSMS", "QINDCFG",
 ];
 const CAUTION_EXEC: &[&str] = &["QSCAN"];
+
+/// Commands that are always blocked in the raw web AT console (exec or write form).
+const BLOCKED: &[(&str, &str)] = &[
+    ("QPRTPARA", "restoring or overwriting factory parameters is blocked in the AT console"),
+    ("QFOTADL", "modem firmware download is blocked in the AT console"),
+    ("CMGS", "interactive SMS prompt mode (+CMGS) is blocked in the AT console; use the SMS API"),
+    ("CMGW", "interactive SMS prompt mode (+CMGW) is blocked in the AT console; use the SMS API"),
+];
+
+fn blocked_reason(name: &str) -> Option<&'static str> {
+    BLOCKED.iter().find(|(n, _)| *n == name).map(|(_, r)| *r)
+}
 
 /// `AT+NAME="key"` (one argument) reads, `AT+NAME="key",value` writes.
 const KEYED_CONFIG: &[&str] = &["QNWPREFCFG", "QNWLOCK", "QCFG", "QNWCFG", "QMAP", "QMBNCFG", "QINDCFG"];
@@ -165,9 +180,8 @@ fn unquote_lower(arg: &str) -> String {
 }
 
 fn strip_at_prefix(s: &str) -> &str {
-    let b = s.as_bytes();
-    if b.len() >= 2 && b[0].eq_ignore_ascii_case(&b'A') && b[1].eq_ignore_ascii_case(&b'T') {
-        &s[2..]
+    if s.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("AT")) {
+        s.get(2..).unwrap_or(s)
     } else {
         s
     }
@@ -191,12 +205,12 @@ fn classify_extended(seg: &str) -> AtPart {
     let prefix = chars.next().unwrap_or('+');
     let rest: String = chars.collect();
     let name_len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
-    let name = rest[..name_len].to_ascii_uppercase();
+    let name = rest.get(..name_len).unwrap_or("").to_ascii_uppercase();
     let full_name = format!("{prefix}{name}");
     if name.is_empty() {
         return part(seg, full_name, AtClass::Dangerous, "unrecognised command syntax");
     }
-    let tail = &rest[name_len..];
+    let tail = rest.get(name_len..).unwrap_or("");
     let form = if tail.is_empty() {
         Form::Exec
     } else if tail == "?" {
@@ -218,7 +232,16 @@ fn classify_extended(seg: &str) -> AtPart {
         }
         Form::Test => part(seg, full_name, AtClass::Read, "test (lists supported values)"),
         Form::Exec => {
-            if known && let Some(r) = danger_reason(&name) {
+            if known && name == "EGMR" {
+                part(
+                    seg,
+                    full_name,
+                    AtClass::Blocked,
+                    "IMEI changes are blocked in the AT console; use /api/v1/modem/imei",
+                )
+            } else if known && let Some(r) = blocked_reason(&name) {
+                part(seg, full_name, AtClass::Blocked, r)
+            } else if known && let Some(r) = danger_reason(&name) {
                 part(seg, full_name, AtClass::Dangerous, r)
             } else if known && READ_EXEC.contains(&name.as_str()) {
                 part(seg, full_name, AtClass::Read, "read-only")
@@ -238,8 +261,16 @@ fn classify_extended(seg: &str) -> AtPart {
                 return if first == "0" {
                     part(seg, full_name, AtClass::Read, "reads a stored identity")
                 } else {
-                    part(seg, full_name, AtClass::Dangerous, "writes the IMEI")
+                    part(
+                        seg,
+                        full_name,
+                        AtClass::Blocked,
+                        "IMEI changes are blocked in the AT console; use /api/v1/modem/imei",
+                    )
                 };
+            }
+            if let Some(r) = blocked_reason(&name) {
+                return part(seg, full_name, AtClass::Blocked, r);
             }
             if let Some(r) = danger_reason(&name) {
                 return part(seg, full_name, AtClass::Dangerous, r);
@@ -273,7 +304,7 @@ fn classify_extended(seg: &str) -> AtPart {
                 let why = match name.as_str() {
                     "QSCAN" => "long-running cell scan",
                     "QENG" => "engineering query; some modes are slow",
-                    "CMGS" | "CMGD" => "sends or deletes SMS",
+                    "CMGD" => "deletes SMS",
                     _ => "changes session/reporting settings",
                 };
                 return part(seg, full_name, AtClass::Caution, why);
@@ -291,18 +322,37 @@ fn classify_basic(seg: &str, out: &mut Vec<AtPart>) {
         let start = i;
         let (name, class, reason): (String, AtClass, &str);
         if b[i] == b'&' {
-            let letter = b.get(i + 1).map(|c| c.to_ascii_uppercase());
-            i += 2;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
+            match seg.get(i + 1..).and_then(|s| s.chars().next()) {
+                Some(ch) if ch.is_ascii() => {
+                    let letter = (ch as u8).to_ascii_uppercase();
+                    i += 2;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    name = format!("&{}", letter as char);
+                    (class, reason) = match letter {
+                        b'V' => (AtClass::Read, "shows the active profile"),
+                        b'F' => (AtClass::Blocked, "factory reset (&F) is blocked in the AT console"),
+                        b'W' => (AtClass::Dangerous, "stores the active profile"),
+                        _ => (AtClass::Dangerous, "unknown basic command (fail closed)"),
+                    };
+                }
+                Some(ch) => {
+                    i += 1 + ch.len_utf8();
+                    name = "&?".into();
+                    (class, reason) = (AtClass::Dangerous, "non-ASCII basic command (fail closed)");
+                }
+                None => {
+                    i = b.len();
+                    name = "&?".into();
+                    (class, reason) = (AtClass::Dangerous, "unknown basic command (fail closed)");
+                }
             }
-            name = format!("&{}", letter.map(|c| c as char).unwrap_or('?'));
-            (class, reason) = match letter {
-                Some(b'V') => (AtClass::Read, "shows the active profile"),
-                Some(b'F') => (AtClass::Dangerous, "restores factory defaults"),
-                Some(b'W') => (AtClass::Dangerous, "stores the active profile"),
-                _ => (AtClass::Dangerous, "unknown basic command (fail closed)"),
-            };
+        } else if !b[i].is_ascii() {
+            let step = seg.get(i..).and_then(|s| s.chars().next()).map_or(1, char::len_utf8);
+            i = (i + step).min(b.len());
+            name = "?".into();
+            (class, reason) = (AtClass::Dangerous, "non-ASCII basic command (fail closed)");
         } else {
             let letter = b[i].to_ascii_uppercase();
             i += 1;
@@ -354,7 +404,8 @@ fn classify_basic(seg: &str, out: &mut Vec<AtPart>) {
                 }
             }
         }
-        out.push(part(&seg[start..i.min(seg.len())], name, class, reason));
+        let slice = seg.get(start..i.min(seg.len())).unwrap_or("");
+        out.push(part(slice, name, class, reason));
     }
 }
 
@@ -410,10 +461,22 @@ pub(crate) fn parse_at_parts(line_after_at: &str) -> Result<Vec<AtPart>, ()> {
     Ok(parts)
 }
 
-/// True if any line in `input` contains a dangerous AT command (or malformed /
-/// unquoted input that fails closed). Used by the raw AT / IPC paths to decide
-/// when the radio lock and cached-mode invalidation apply.
+/// True if any part is a long-blocking RF scan (`AT+COPS=?` or `AT+QSCAN`),
+/// which requires explicit confirmation and bounded timeout handling in the AT console.
+pub fn is_long_blocking_scan(v: &AtVerdict) -> bool {
+    v.parts.iter().any(|p| {
+        (p.name == "+COPS" && p.text.ends_with("=?"))
+            || (p.name == "+QSCAN" && p.class == AtClass::Caution)
+    })
+}
+
+/// True if any line in `input` contains a dangerous/blocked AT command (or
+/// malformed / non-ASCII / unquoted input that fails closed). Used by the raw
+/// AT / IPC paths to decide when the radio lock and cached-mode invalidation apply.
 pub fn has_dangerous_part(input: &str) -> bool {
+    if !input.is_ascii() {
+        return true;
+    }
     for raw in input.split(['\r', '\n']) {
         let line = raw.trim();
         if line.is_empty() {
@@ -422,8 +485,8 @@ pub fn has_dangerous_part(input: &str) -> bool {
         if !line.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("AT")) {
             return true;
         }
-        match parse_at_parts(&line[2..]) {
-            Ok(parts) if parts.iter().any(|p| p.class == AtClass::Dangerous) => return true,
+        match parse_at_parts(line.get(2..).unwrap_or("")) {
+            Ok(parts) if parts.iter().any(|p| p.class >= AtClass::Dangerous) => return true,
             Ok(_) => {}
             Err(()) => return true,
         }
@@ -556,13 +619,10 @@ mod tests {
     #[test]
     fn dangerous_commands() {
         for s in [
-            "AT+EGMR=1,7,\"356938035643809\"",
             "AT+CFUN=0",
             "AT+CFUN=1",
             "AT+CFUN=4",
             "AT+CFUN=1,1",
-            "AT+QPRTPARA=1",
-            "AT+QPRTPARA=3",
             "AT+QCFG=\"usbnet\",1",
             "AT+QCFG=\"pcie/mode\",1",
             "AT+QCFG=\"data_interface\",1,0",
@@ -582,17 +642,76 @@ mod tests {
             "AT+QPOWD=1",
             "AT+CPOF",
             "AT+CRESET",
-            "AT&F",
-            "AT&F0",
             "ATZ",
             "ATE0",
             "ATD*99#",
             "AT+CGATT=0",
             "AT+COPS=2",
             "AT+CPIN=\"1234\"",
-            "AT+QFOTADL=\"http://x/y.zip\"",
         ] {
             assert_eq!(c(s), AtClass::Dangerous, "{s}");
+        }
+    }
+
+    #[test]
+    fn blocked_commands_cannot_run_in_console() {
+        for s in [
+            "AT+EGMR=1,7,\"356938035643809\"",
+            "at+egmr=1,7,\"356938035643809\"",
+            "AT+EGMR=2,7,\"356938035643809\"",
+            "AT+EGMR",
+            "AT+QPRTPARA",
+            "AT+QPRTPARA=1",
+            "AT+QPRTPARA=3",
+            "AT+QFOTADL",
+            "AT+QFOTADL=\"http://x/y.zip\"",
+            "AT&F",
+            "AT&F0",
+            "ATI;&F",
+            "AT+CMGS=20",
+            "AT+CMGS=\"+15551234567\"",
+            "AT+CMGS",
+            "AT+CMGW=20",
+            "AT+CMGW",
+            "AT+CSQ;+CMGS=10",
+            "AT+CSQ;+EGMR=1,7,\"356938035643809\"",
+        ] {
+            assert_eq!(c(s), AtClass::Blocked, "{s}");
+        }
+        // Reading IMEI via EGMR=0,7 remains read-only.
+        assert_eq!(c("AT+EGMR=0,7"), AtClass::Read);
+    }
+
+    #[test]
+    fn long_blocking_scans_are_detected() {
+        for s in ["AT+COPS=?", "AT+QSCAN=3,1", "AT+QSCAN", "AT+CSQ;+COPS=?"] {
+            let v = classify(s).unwrap();
+            assert!(is_long_blocking_scan(&v), "expected long-blocking scan for {s}");
+        }
+        for s in ["AT+CSQ", "AT+COPS?", "AT+QENG=\"servingcell\"", "AT+CFUN?"] {
+            let v = classify(s).unwrap();
+            assert!(!is_long_blocking_scan(&v), "unexpected scan flag for {s}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_utf8_never_panics_in_classify_or_has_dangerous_part() {
+        for s in [
+            "ATé",
+            "AT&é",
+            "AT€",
+            "AT+QÉ",
+            "AT+CSQ;é",
+            "AT&€0",
+            "AT+EGMR=1,7,\"é\"",
+            "éAT+CSQ",
+            "AT\u{1F680}",
+            "AT&\u{1F680}",
+        ] {
+            assert!(classify(s).is_err(), "classify must reject {s:?}");
+            assert!(has_dangerous_part(s), "has_dangerous_part must fail closed on {s:?}");
+            // Direct parse_at_parts fuzzing must also never panic on multi-byte UTF-8.
+            let _ = parse_at_parts(s);
         }
     }
 
@@ -615,11 +734,11 @@ mod tests {
             "AT+CFUN =0",
             "AT+qcfg=\"USBNET\",1",
             "AT+QCFG = \"usbnet\" , 1",
-            "at+egmr=1,7,\"356938035643809\"",
             "AT+QNWPREFCFG= \"lte_band\" ,3",
         ] {
             assert_eq!(c(s), AtClass::Dangerous, "{s}");
         }
+        assert_eq!(c("at+egmr=1,7,\"356938035643809\""), AtClass::Blocked);
         assert_eq!(c("  at+cfun?  "), AtClass::Read);
         assert_eq!(c("AT+QNWLOCK = \"common/4g\""), AtClass::Read);
     }
@@ -631,7 +750,7 @@ mod tests {
         assert_eq!(c("AT+CSQ; +CFUN=0"), AtClass::Dangerous);
         assert_eq!(c("AT+CSQ;;+QSCAN=3,1"), AtClass::Caution);
         assert_eq!(c("AT+CSQ;"), AtClass::Read);
-        assert_eq!(c("ATI;&F"), AtClass::Dangerous);
+        assert_eq!(c("ATI;&F"), AtClass::Blocked);
         assert_eq!(c("ATE0+CSQ"), AtClass::Dangerous);
         let d = classify("ATD+15551234567;").unwrap();
         assert_eq!((d.class, d.parts.len()), (AtClass::Dangerous, 1));

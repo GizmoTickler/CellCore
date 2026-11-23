@@ -1,13 +1,37 @@
 use std::{
     fs,
     path::Path,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::uci::{detect_wan_rmnet_ifaces_blocking, run_cmd_blocking, uci_get_blocking};
+use crate::uci::{detect_wan_rmnet_ifaces_blocking, run_cmd_blocking_timeout, uci_get_blocking};
+
+const RECONCILE_CMD_TIMEOUT: Duration = Duration::from_secs(5);
+const VENDOR_SCRIPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_reconcile_cmd(prog: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let resolved = crate::paths::program(prog);
+    run_cmd_blocking_timeout(&resolved, args, timeout)
+}
+
+fn sh_binary() -> String {
+    let mapped = crate::paths::p("/bin/sh");
+    if Path::new(&mapped).exists() {
+        mapped
+    } else {
+        "/bin/sh".into()
+    }
+}
+
+pub(crate) fn run_vendor_script_timeout(
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    run_cmd_blocking_timeout(prog, args, timeout)
+}
 
 pub const USB_DISABLED_MARKER: &str = "/etc/cellcore/usb_gadget_disabled";
 
@@ -181,7 +205,7 @@ pub fn run_boot_reconcile(enforce_uhttpd_loopback: bool) -> ReconcileReport {
     reconcile_qualcomm_scripts(&mut actions, &mut warnings);
 
     // 6. Disable unused noisy vendor services (preserving mwan3!)
-    disable_unused_services(&mut actions);
+    disable_unused_services(&mut actions, &mut warnings);
 
     // 7. Bind USB ConfigFS gadget g1 when adb is excluded and not user-disabled
     let usb_udc = ensure_usb_gadget_bound(&mut actions, &mut warnings);
@@ -330,9 +354,10 @@ fn reconcile_qualcomm_scripts(actions: &mut Vec<String>, warnings: &mut Vec<Stri
             match write_atomic(lu_path, &updated, 0o755) {
                 Ok(()) => {
                     actions.push("Patched /etc/data/lanUtils.sh".into());
-                    let _ = Command::new(crate::paths::p("/bin/sh"))
-                        .args(["-c", &format!(". {} && util_combine_iptable_rules", crate::paths::p(lu_path))])
-                        .output();
+                    let cmd = format!(". {} && util_combine_iptable_rules", crate::paths::p(lu_path));
+                    if let Err(e) = run_vendor_script_timeout(&sh_binary(), &["-c", &cmd], VENDOR_SCRIPT_TIMEOUT) {
+                        warnings.push(format!("lanUtils.sh combine failed: {e}"));
+                    }
                 }
                 Err(e) => warnings.push(e),
             }
@@ -362,8 +387,8 @@ fn reconcile_qualcomm_scripts(actions: &mut Vec<String>, warnings: &mut Vec<Stri
     if let Some(level) = uci_get_blocking("ql_cust_config.@qcmap_configs[0].log_config")
         && (level == "5" || level == "6")
     {
-        let _ = run_cmd_blocking("uci", &["set", "ql_cust_config.@qcmap_configs[0].log_config=2"]);
-        let _ = run_cmd_blocking("uci", &["commit", "ql_cust_config"]);
+        let _ = run_reconcile_cmd("uci", &["set", "ql_cust_config.@qcmap_configs[0].log_config=2"], RECONCILE_CMD_TIMEOUT);
+        let _ = run_reconcile_cmd("uci", &["commit", "ql_cust_config"], RECONCILE_CMD_TIMEOUT);
         actions.push(format!("Quiet QCMAP log_config=2 (was {level})"));
     }
 }
@@ -375,15 +400,11 @@ fn validate_sh_syntax(script: &str) -> bool {
     let _ = fs::create_dir_all(dir);
     let seq = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let tmp = dir.join(format!(".shcheck.{}.{seq}", std::process::id()));
+    let tmp_s = tmp.to_string_lossy().to_string();
     let ok = match crate::state::create_private_tmp(&tmp, 0o600) {
         Ok(mut f) => {
             f.write_all(script.as_bytes()).is_ok()
-                && Command::new(crate::paths::p("/bin/sh"))
-                    .arg("-n")
-                    .arg(&tmp)
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
+                && run_vendor_script_timeout(&sh_binary(), &["-n", &tmp_s], RECONCILE_CMD_TIMEOUT).is_ok()
         }
         Err(_) => false,
     };
@@ -544,7 +565,7 @@ fn guard_sourced_case(orig: &str, script_name: &str, marker: &str) -> String {
     format!("{}\n", out.join("\n"))
 }
 
-fn disable_unused_services(actions: &mut Vec<String>) {
+fn disable_unused_services(actions: &mut Vec<String>, warnings: &mut Vec<String>) {
     // Preserve mwan3! Only disable noisy/unused vendor daemons.
     let svcs = [
         "quectel-voice-server.init",
@@ -572,8 +593,16 @@ fn disable_unused_services(actions: &mut Vec<String>) {
                 n.contains(svc.trim_end_matches(".init"))
             });
         if enabled && Path::new(&init_path).exists() {
-            let _ = Command::new(&init_path).arg("stop").output();
-            let _ = Command::new(&init_path).arg("disable").output();
+            if let Err(e) = run_vendor_script_timeout(&init_path, &["stop"], VENDOR_SCRIPT_TIMEOUT)
+                && e.contains("timed out")
+            {
+                warnings.push(format!("{svc} stop timed out: {e}"));
+            }
+            if let Err(e) = run_vendor_script_timeout(&init_path, &["disable"], VENDOR_SCRIPT_TIMEOUT)
+                && e.contains("timed out")
+            {
+                warnings.push(format!("{svc} disable timed out: {e}"));
+            }
             actions.push(format!("Disabled unused service {svc}"));
         }
     }
@@ -753,14 +782,18 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
             _ => None,
         };
         if let Some(hex_adv) = adv {
-            if let Ok(eth_info) = run_cmd_blocking("ethtool", &["eth0"])
+            if let Ok(eth_info) = run_reconcile_cmd("ethtool", &["eth0"], RECONCILE_CMD_TIMEOUT)
                 && let Err(reason) = crate::handlers::check_partner_speed_limit(&eth_info, &limit)
             {
                 warnings.push(format!("Skipped eth0 speed limit {limit}M: {reason}"));
-            } else if run_cmd_blocking("ethtool", &["-s", "eth0", "advertise", hex_adv, "autoneg", "on"])
-                .is_ok()
+            } else if run_reconcile_cmd(
+                "ethtool",
+                &["-s", "eth0", "advertise", hex_adv, "autoneg", "on"],
+                RECONCILE_CMD_TIMEOUT,
+            )
+            .is_ok()
             {
-                let _ = run_cmd_blocking("ethtool", &["-r", "eth0"]);
+                let _ = run_reconcile_cmd("ethtool", &["-r", "eth0"], RECONCILE_CMD_TIMEOUT);
                 actions.push(format!("Applied eth0 speed limit {limit}M"));
             } else {
                 warnings.push(format!("Failed to apply eth0 limit {limit}M"));
@@ -773,17 +806,22 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
     let ttl_file = Path::new(&ttl_s);
     if ttl_file.exists() {
         let ttl_content = fs::read_to_string(ttl_file).unwrap_or_default();
-        let cur4 = run_cmd_blocking("iptables", &["-t", "mangle", "-S", "POSTROUTING"]).unwrap_or_default();
+        let cur4 = run_reconcile_cmd("iptables", &["-t", "mangle", "-S", "POSTROUTING"], RECONCILE_CMD_TIMEOUT)
+            .unwrap_or_default();
         let need_v4 = !cur4.contains("--ttl-set");
         let need_v6 = if ttl_content.contains("--hl-set") || ttl_content.contains("ip6tables") {
-            let cur6 = run_cmd_blocking("ip6tables", &["-t", "mangle", "-S", "POSTROUTING"]).unwrap_or_default();
+            let cur6 = run_reconcile_cmd("ip6tables", &["-t", "mangle", "-S", "POSTROUTING"], RECONCILE_CMD_TIMEOUT)
+                .unwrap_or_default();
             !cur6.contains("--hl-set")
         } else {
             false
         };
         if need_v4 || need_v6 {
-            let _ = Command::new("sh").arg(ttl_file).output();
-            actions.push("Re-applied /etc/firewall.user.ttl rules".into());
+            if let Err(e) = run_vendor_script_timeout(&sh_binary(), &[&ttl_s], VENDOR_SCRIPT_TIMEOUT) {
+                warnings.push(format!("/etc/firewall.user.ttl failed: {e}"));
+            } else {
+                actions.push("Re-applied /etc/firewall.user.ttl rules".into());
+            }
         }
     }
 
@@ -812,14 +850,16 @@ fn reapply_network_policies(actions: &mut Vec<String>, warnings: &mut Vec<String
             }
         }
         for iface in &ifaces {
-            let _ = run_cmd_blocking("ip", &["link", "set", iface, "mtu", &m_str]);
+            let _ = run_reconcile_cmd("ip", &["link", "set", iface, "mtu", &m_str], RECONCILE_CMD_TIMEOUT);
         }
         if mtu_val < 1500 && !ifaces.is_empty() {
             let desired = build_mtu_firewall_script(&ifaces, mtu_val);
             if !desired.is_empty() && !mtu_script_covers_ifaces(&content, &ifaces) {
                 let _ = write_atomic("/etc/firewall.user.mtu", &desired, 0o644);
             }
-            let _ = Command::new("sh").arg(mtu_file).output();
+            if let Err(e) = run_vendor_script_timeout(&sh_binary(), &[&mtu_s], VENDOR_SCRIPT_TIMEOUT) {
+                warnings.push(format!("/etc/firewall.user.mtu failed: {e}"));
+            }
         }
         actions.push(format!("Verified WAN MTU={m_str}"));
     }
@@ -867,8 +907,10 @@ pub(crate) fn prune_legacy_crontabs(actions: &mut Vec<String>, warnings: &mut Ve
         Ok(()) => {
             actions.push("Pruned legacy keep_alive_worker.sh entry from /etc/crontabs/root".into());
             let cron_init = crate::paths::p("/etc/init.d/cron");
-            if Path::new(&cron_init).exists() {
-                let _ = Command::new(&cron_init).arg("reload").output();
+            if Path::new(&cron_init).exists()
+                && let Err(e) = run_vendor_script_timeout(&cron_init, &["reload"], RECONCILE_CMD_TIMEOUT)
+            {
+                warnings.push(format!("cron reload failed: {e}"));
             }
         }
         Err(e) => warnings.push(format!("prune {cron_path}: {e}")),
@@ -897,15 +939,17 @@ pub fn ensure_uhttpd_loopback(actions: &mut Vec<String>, warnings: &mut Vec<Stri
         &["commit", "uhttpd"][..],
     ];
     for args in cmds {
-        if let Err(e) = run_cmd_blocking("uci", args)
+        if let Err(e) = run_reconcile_cmd("uci", args, RECONCILE_CMD_TIMEOUT)
             && !args.contains(&"delete")
         {
             warnings.push(format!("uci {}: {e}", args.join(" ")));
             return;
         }
     }
-    if Path::new(&crate::paths::p("/etc/init.d/uhttpd")).exists() {
-        let _ = run_cmd_blocking("/etc/init.d/uhttpd", &["restart"]);
+    if Path::new(&crate::paths::p("/etc/init.d/uhttpd")).exists()
+        && let Err(e) = run_reconcile_cmd("/etc/init.d/uhttpd", &["restart"], VENDOR_SCRIPT_TIMEOUT)
+    {
+        warnings.push(format!("uhttpd restart: {e}"));
     }
     actions.push("Rebound uhttpd (LuCI-only) to 127.0.0.1:8080".into());
 }
@@ -1135,5 +1179,20 @@ mod tests {
         assert!(mtu_script_covers_ifaces(&s0, &["rmnet_data0".into()]));
         assert!(!mtu_script_covers_ifaces(&s0, &["rmnet_data0".into(), "rmnet_data1".into()]));
         assert!(!mtu_script_covers_ifaces(&s0, &["rmnet_data1".into()]));
+    }
+
+    #[test]
+    fn vendor_script_invocation_enforces_explicit_timeout() {
+        let env = crate::paths::TestSandbox::new("reconcile-timeout");
+        let hung = env.write_exec("/etc/init.d/hung-vendor.init", "#!/bin/sh\nexec sleep 30\n");
+        let t0 = std::time::Instant::now();
+        let res = run_vendor_script_timeout(
+            &hung.to_string_lossy(),
+            &["stop"],
+            Duration::from_millis(200),
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("timed out"));
+        assert!(t0.elapsed() < Duration::from_secs(3));
     }
 }

@@ -233,6 +233,10 @@ impl EventStore {
     }
 }
 
+/// Slots reserved in the notifier queue for non-SMS alerts so an SMS burst
+/// cannot fill the queue and drop critical WAN/failover notifications.
+pub const NOTIFY_QUEUE_CRITICAL_RESERVE: usize = 8;
+
 /// Record an event: ring + counter, WebSocket push, notifier queue. Never
 /// blocks (the notifier queue is bounded; a full queue drops and counts).
 pub fn emit(kind: EventKind, severity: Severity, title: impl Into<String>, detail: serde_json::Value) {
@@ -242,7 +246,8 @@ pub fn emit(kind: EventKind, severity: Severity, title: impl Into<String>, detai
         o.broadcast(&serde_json::json!({ "channel": "event", "event": ev }));
     }
     if let Some(tx) = o.notify_tx.get()
-        && tx.try_send(ev).is_err()
+        && ((kind == EventKind::SmsReceived && tx.capacity() <= NOTIFY_QUEUE_CRITICAL_RESERVE)
+            || tx.try_send(ev).is_err())
     {
         lock(&o.notify).dropped += 1;
     }

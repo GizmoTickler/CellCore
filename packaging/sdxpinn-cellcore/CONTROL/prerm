@@ -1,8 +1,25 @@
 #!/bin/ash
 
+# OpenWrt opkg sets PKG_UPGRADE=1 and/or passes "upgrade" as $1 during package upgrades.
+# Never disable cellcored during an upgrade so a power loss mid-upgrade cannot leave
+# the daemon disabled across reboots.
+is_upgrade=0
+if [ "${PKG_UPGRADE:-0}" = "1" ] || [ "${1:-}" = "upgrade" ]; then
+    is_upgrade=1
+fi
+
+if [ "$is_upgrade" -eq 0 ]; then
+    # On actual removal (while /usr/bin/cellctl is still present), restore stock WAN dataplane.
+    if [ -x /usr/bin/cellctl ]; then
+        /usr/bin/cellctl dataplane-restore 2>/dev/null || true
+    fi
+fi
+
 if [ -x /etc/init.d/cellcored ]; then
     /etc/init.d/cellcored stop 2>/dev/null || true
-    /etc/init.d/cellcored disable 2>/dev/null || true
+    if [ "$is_upgrade" -eq 0 ]; then
+        /etc/init.d/cellcored disable 2>/dev/null || true
+    fi
 fi
 
 exit 0

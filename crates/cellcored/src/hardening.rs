@@ -141,6 +141,41 @@ const FIREWALL_USER_PATH: &str = "/etc/firewall.user";
 const FW_USER_SSH_BEGIN: &str = "# cellcore-ssh-wan-guard-begin";
 const FW_USER_SSH_END: &str = "# cellcore-ssh-wan-guard-end";
 
+fn run_hardening_cmd(prog: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let resolved = crate::paths::program(prog);
+    run_cmd_blocking_timeout(&resolved, args, timeout)
+}
+
+/// TCP ports explicitly dropped on inbound cellular WAN interfaces (`rmnet+`, `wwan+`):
+/// Dropbear's configured SSH port plus HTTP (80) and HTTPS (443).
+pub(crate) fn wan_guarded_tcp_ports(ssh_port: u16) -> Vec<u16> {
+    let mut ports = vec![ssh_port];
+    for p in [80u16, 443u16] {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+pub(crate) fn build_wan_guard_nft_rule(ssh_port: u16) -> String {
+    let mut s = String::from(
+        "chain cellcore_ssh_wan_guard {\n\ttype filter hook input priority -5; policy accept;\n",
+    );
+    for port in wan_guarded_tcp_ports(ssh_port) {
+        let label = match port {
+            80 if port != ssh_port => "block WAN HTTP",
+            443 if port != ssh_port => "block WAN HTTPS",
+            _ => "block WAN SSH",
+        };
+        s.push_str(&format!(
+            "\tiifname {{ \"rmnet*\", \"wwan*\" }} tcp dport {port} drop comment \"cellcore: {label}\"\n"
+        ));
+    }
+    s.push_str("}\n");
+    s
+}
+
 pub(crate) fn update_firewall_user_ssh_guard(existing: &str, port: u16) -> String {
     let mut kept = Vec::new();
     let mut skipping = false;
@@ -166,9 +201,11 @@ pub(crate) fn update_firewall_user_ssh_guard(existing: &str, port: u16) -> Strin
     out.push('\n');
     for bin in ["iptables", "ip6tables"] {
         for ifp in ["rmnet+", "wwan+"] {
-            out.push_str(&format!(
-                "{bin} -C INPUT -i {ifp} -p tcp --dport {port} -j DROP 2>/dev/null || {bin} -I INPUT 1 -i {ifp} -p tcp --dport {port} -j DROP\n"
-            ));
+            for p in wan_guarded_tcp_ports(port) {
+                out.push_str(&format!(
+                    "{bin} -C INPUT -i {ifp} -p tcp --dport {p} -j DROP 2>/dev/null || {bin} -I INPUT 1 -i {ifp} -p tcp --dport {p} -j DROP\n"
+                ));
+            }
         }
     }
     out.push_str(FW_USER_SSH_END);
@@ -184,7 +221,7 @@ pub(crate) fn has_wan_ssh_drop_rule(port: u16) -> bool {
             return true;
         }
     }
-    let v4 = run_cmd_blocking_timeout("iptables", &["-S", "INPUT"], Duration::from_secs(2))
+    let v4 = run_hardening_cmd("iptables", &["-S", "INPUT"], Duration::from_secs(2))
         .unwrap_or_default();
     let needle = format!("--dport {port}");
     (v4.contains("rmnet+") && v4.contains(&needle) && v4.contains("DROP"))
@@ -196,11 +233,13 @@ pub(crate) fn has_wan_ssh_drop_rule(port: u16) -> bool {
 pub fn sync_wan_ssh_drop_rules(old_port: Option<u16>, port: u16) {
     if let Some(old) = old_port
         && old != port
+        && old != 80
+        && old != 443
     {
         let old_s = old.to_string();
         for bin in ["iptables", "ip6tables"] {
             for ifp in ["rmnet+", "wwan+"] {
-                let _ = run_cmd_blocking_timeout(
+                let _ = run_hardening_cmd(
                     bin,
                     &["-D", "INPUT", "-i", ifp, "-p", "tcp", "--dport", &old_s, "-j", "DROP"],
                     Duration::from_secs(2),
@@ -212,30 +251,37 @@ pub fn sync_wan_ssh_drop_rules(old_port: Option<u16>, port: u16) {
 }
 
 fn apply_wan_ssh_drop_rules(port: u16) {
-    let p_str = port.to_string();
-    for bin in ["iptables", "ip6tables"] {
-        for ifp in ["rmnet+", "wwan+"] {
-            let exists = run_cmd_blocking_timeout(
-                bin,
-                &["-C", "INPUT", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
-                Duration::from_secs(2),
-            )
-            .is_ok();
-            if !exists {
-                let _ = run_cmd_blocking_timeout(
+    for p in wan_guarded_tcp_ports(port) {
+        let p_str = p.to_string();
+        for bin in ["iptables", "ip6tables"] {
+            for ifp in ["rmnet+", "wwan+"] {
+                let exists = run_hardening_cmd(
                     bin,
-                    &["-I", "INPUT", "1", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
+                    &["-C", "INPUT", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
                     Duration::from_secs(2),
-                );
+                )
+                .is_ok();
+                if !exists {
+                    let _ = run_hardening_cmd(
+                        bin,
+                        &["-I", "INPUT", "1", "-i", ifp, "-p", "tcp", "--dport", &p_str, "-j", "DROP"],
+                        Duration::from_secs(2),
+                    );
+                }
             }
         }
     }
     if Path::new(&crate::paths::p("/etc/nftables.d")).exists() {
-        let nft_rule = format!(
-            "chain cellcore_ssh_wan_guard {{\n\ttype filter hook input priority -5; policy accept;\n\tiifname {{ \"rmnet*\", \"wwan*\" }} tcp dport {port} drop comment \"cellcore: block WAN SSH\"\n}}\n"
-        );
-        if crate::state::atomic_write(Path::new(NFT_SSH_LAN_PATH), nft_rule.as_bytes(), 0o644).is_ok() {
-            let _ = run_cmd_blocking_timeout("fw4", &["reload"], Duration::from_secs(5));
+        let nft_rule = build_wan_guard_nft_rule(port);
+        let nft_mapped = crate::paths::p(NFT_SSH_LAN_PATH);
+        let existing_nft = fs::read_to_string(&nft_mapped).unwrap_or_default();
+        // Only write and reload fw4 when the nftables rule file actually changed,
+        // avoiding redundant reloads that wipe native-mode fw4 rules.
+        if existing_nft != nft_rule
+            && crate::state::atomic_write(Path::new(NFT_SSH_LAN_PATH), nft_rule.as_bytes(), 0o644).is_ok()
+        {
+            let _ = run_hardening_cmd("fw4", &["reload"], Duration::from_secs(5));
+            crate::dataplane::request_native_firewall_heal();
         }
     }
     let fw_user_mapped = crate::paths::p(FIREWALL_USER_PATH);
@@ -324,7 +370,7 @@ fn check_dropbear_key_only() -> SecurityCheck {
 }
 
 fn check_wan_firewall() -> SecurityCheck {
-    let v4 = run_cmd_blocking_timeout("iptables", &["-S", "INPUT"], Duration::from_secs(2))
+    let v4 = run_hardening_cmd("iptables", &["-S", "INPUT"], Duration::from_secs(2))
         .unwrap_or_default();
     let has_wan_drop = v4.contains("rmnet") && (v4.contains("WAN_IN") || v4.contains("DROP") || v4.contains("zone_wan"));
     if has_wan_drop {
@@ -595,9 +641,9 @@ fn wait_for_tcp_port_listening(port: u16, attempts: usize, step: Duration) -> bo
 }
 
 fn rollback_dropbear_interface() {
-    let _ = run_cmd_blocking_timeout("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
-    let _ = run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3));
-    let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
+    let _ = run_hardening_cmd("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
+    let _ = run_hardening_cmd("uci", &["commit", "dropbear"], Duration::from_secs(3));
+    let _ = run_hardening_cmd("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
 }
 
 pub fn bind_dropbear_lan_only() -> Result<String, String> {
@@ -605,15 +651,15 @@ pub fn bind_dropbear_lan_only() -> Result<String, String> {
     // Always keep dropbear.@dropbear[0].Interface UNSET so OpenWrt S19dropbear
     // starts unconditionally on every boot even if cellcored is absent/stopped,
     // and enforce LAN-only SSH at the kernel firewall layer instead.
-    let _ = run_cmd_blocking_timeout("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
-    let _ = run_cmd_blocking_timeout("uci", &["commit", "dropbear"], Duration::from_secs(3));
+    let _ = run_hardening_cmd("uci", &["delete", "dropbear.@dropbear[0].Interface"], Duration::from_secs(3));
+    let _ = run_hardening_cmd("uci", &["commit", "dropbear"], Duration::from_secs(3));
     apply_wan_ssh_drop_rules(port);
-    let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
+    let _ = run_hardening_cmd("/etc/init.d/dropbear", &["restart"], Duration::from_secs(6));
 
     if probe_tcp_port_listener(port).is_some()
         && !wait_for_tcp_port_listening(port, 10, Duration::from_millis(250))
     {
-        let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
+        let _ = run_hardening_cmd("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
     }
 
     // Ensure standalone POSIX S99 init safeguard is installed & enabled so Dropbear
@@ -622,16 +668,17 @@ pub fn bind_dropbear_lan_only() -> Result<String, String> {
     if Path::new(&crate::paths::p("/etc/init.d")).exists() {
         let script = include_bytes!("../../../scripts/etc/init.d/dropbear-lan-watchdog");
         if crate::state::atomic_write(wdog_init, script, 0o755).is_ok() {
-            let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear-lan-watchdog", &["enable"], Duration::from_secs(3));
+            let _ = run_hardening_cmd("/etc/init.d/dropbear-lan-watchdog", &["enable"], Duration::from_secs(3));
         }
     }
     Ok(format!(
-        "Cleared Dropbear Interface (boot-safe), enforced WAN port {port} firewall drop, and verified SSH listening"
+        "Cleared Dropbear Interface (boot-safe), enforced WAN port {port} + 80/443 firewall drop, and verified SSH listening"
     ))
 }
 
-/// Reconcile Dropbear after OpenWrt boot: clear any stale `Interface='lan'` that
-/// could trigger OpenWrt's `BOOT=1` skip, enforce WAN SSH drop rules, and start Dropbear.
+/// Reconcile Dropbear after OpenWrt boot: enforce WAN firewall DROP rules (ports SSH/80/443)
+/// without redundant `fw4 reload` calls, respect user-configured `Interface` when Dropbear is
+/// listening, and only fall back to clearing `Interface` if Dropbear fails to listen after start.
 pub fn reconcile_dropbear_listener() -> Option<String> {
     if !Path::new(&crate::paths::p("/etc/init.d/dropbear")).exists() {
         return None;
@@ -641,27 +688,29 @@ pub fn reconcile_dropbear_listener() -> Option<String> {
         return None;
     }
     let port = dropbear_configured_port();
-    let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
-    let mut cleared_iface = false;
-    if !iface.trim().is_empty() {
-        rollback_dropbear_interface();
-        cleared_iface = true;
-    }
     apply_wan_ssh_drop_rules(port);
     if !matches!(probe_tcp_port_listener(port), Some((false, _))) {
-        return cleared_iface.then(|| {
-            format!(
-                "Migrated Dropbear Interface='{}' -> boot-safe unset + WAN firewall drop on port {port}",
-                iface.trim()
-            )
-        });
+        return None;
     }
 
-    let _ = run_cmd_blocking_timeout("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
+    // Try starting Dropbear first while preserving any user-configured Interface.
+    let _ = run_hardening_cmd("/etc/init.d/dropbear", &["start"], Duration::from_secs(6));
     if wait_for_tcp_port_listening(port, 10, Duration::from_millis(250)) {
         return Some(format!(
             "Started Dropbear cleanly on port {port} with WAN firewall drop active"
         ));
+    }
+
+    // Last-resort lockout recovery: only clear Interface if Dropbear still refused to listen.
+    let iface = uci_get_blocking("dropbear.@dropbear[0].Interface").unwrap_or_default();
+    if !iface.trim().is_empty() {
+        rollback_dropbear_interface();
+        if wait_for_tcp_port_listening(port, 10, Duration::from_millis(250)) {
+            return Some(format!(
+                "Recovered non-listening Dropbear on port {port} by clearing Interface='{}'",
+                iface.trim()
+            ));
+        }
     }
     Some(format!(
         "Dropbear not listening on port {port} after boot start attempt"
@@ -949,8 +998,56 @@ mod tests {
             let fw_user = fs::read_to_string(sbx.root.join("etc/firewall.user")).unwrap();
             assert!(fw_user.contains("# custom user rules"));
             assert!(fw_user.contains("--dport 2222 -j DROP"));
+            assert!(fw_user.contains("--dport 80 -j DROP"));
+            assert!(fw_user.contains("--dport 443 -j DROP"));
             assert!(!fw_user.contains("--dport 22 -j DROP"));
             assert_eq!(fw_user.matches(FW_USER_SSH_BEGIN).count(), 1);
+
+            let nft = fs::read_to_string(sbx.root.join("etc/nftables.d/25-cellcore-ssh-lan.nft")).unwrap();
+            assert!(nft.contains("tcp dport 2222 drop"));
+            assert!(nft.contains("tcp dport 80 drop"));
+            assert!(nft.contains("tcp dport 443 drop"));
         });
+    }
+
+    #[test]
+    fn dropbear_watchdog_preserves_interface_when_listening_and_avoids_redundant_fw4_reloads() {
+        let sbx = TestSandbox::new("hardening-watchdog");
+        fs::create_dir_all(sbx.root.join("etc/nftables.d")).unwrap();
+        let fw4_log = sbx.root.join("fw4.log");
+        let uci_log = sbx.root.join("uci.log");
+        sbx.write_exec("/etc/init.d/dropbear", "#!/bin/sh\nexit 0\n");
+        sbx.write_exec("/bin/iptables", "#!/bin/sh\nexit 0\n");
+        sbx.write_exec("/bin/ip6tables", "#!/bin/sh\nexit 0\n");
+        sbx.write_exec(
+            "/bin/fw4",
+            &format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", fw4_log.display()),
+        );
+        sbx.write_exec(
+            "/bin/uci",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"-q\" ] && [ \"$2\" = \"get\" ]; then\n  case \"$3\" in\n    *Interface) echo lan;;\n    *Port) echo 22;;\n    *enable) echo 1;;\n  esac\nfi\nexit 0\n",
+                uci_log.display()
+            ),
+        );
+        sbx.write(
+            "/proc/net/tcp",
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 01E4A8C0:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1234\n",
+        );
+
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            // First watchdog pass installs nft rule (1 fw4 reload), preserves Interface='lan'.
+            assert_eq!(reconcile_dropbear_listener(), None);
+            // Second watchdog pass sees unchanged nft rule -> ZERO additional fw4 reloads!
+            assert_eq!(reconcile_dropbear_listener(), None);
+        });
+
+        let reloads = fs::read_to_string(&fw4_log).unwrap_or_default();
+        assert_eq!(reloads.lines().count(), 1, "fw4 reload must not run twice: {reloads}");
+        let uci_calls = fs::read_to_string(&uci_log).unwrap_or_default();
+        assert!(
+            !uci_calls.contains("delete dropbear.@dropbear[0].Interface"),
+            "watchdog must not clear user-configured Interface while Dropbear is listening: {uci_calls}"
+        );
     }
 }

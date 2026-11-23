@@ -76,22 +76,47 @@ fn format_listen_addrs_with_extra(
     extra: &[std::net::Ipv4Addr],
     port: u16,
 ) -> Vec<SocketAddr> {
-    match primary {
-        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
-            let mut out = vec![
-                SocketAddr::from((ip, port)),
-                SocketAddr::from(([127, 0, 0, 1], port)),
-            ];
-            for &e in extra {
-                let sa = SocketAddr::from((e, port));
-                if !e.is_unspecified() && !out.contains(&sa) {
-                    out.push(sa);
-                }
-            }
-            out
-        }
-        _ => vec![SocketAddr::from(([0, 0, 0, 0], port))],
+    let mut out = Vec::new();
+    if let Some(ip) = primary
+        && !ip.is_loopback()
+        && !ip.is_unspecified()
+    {
+        out.push(SocketAddr::from((ip, port)));
     }
+    let lo = SocketAddr::from(([127, 0, 0, 1], port));
+    if !out.contains(&lo) {
+        out.push(lo);
+    }
+    for &e in extra {
+        let sa = SocketAddr::from((e, port));
+        if !e.is_unspecified() && !out.contains(&sa) {
+            out.push(sa);
+        }
+    }
+    out
+}
+
+fn detect_lan_ipv4_with_retry<F>(
+    mut detect: F,
+    max_attempts: usize,
+    delay: std::time::Duration,
+) -> Option<std::net::Ipv4Addr>
+where
+    F: FnMut() -> Option<std::net::Ipv4Addr>,
+{
+    let attempts = max_attempts.max(1);
+    for i in 0..attempts {
+        if let Some(ip) = detect()
+            && !ip.is_loopback()
+            && !ip.is_unspecified()
+        {
+            return Some(ip);
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -195,6 +220,10 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
             return;
         }
+        Some("dataplane-restore") => {
+            let code = dataplane::run_dataplane_restore_cli();
+            process::exit(code);
+        }
         _ => {}
     }
 
@@ -216,9 +245,22 @@ async fn async_main() {
         if env::var_os("QM_HTTPS_ADDR").is_some() && env::var_os("QM_HTTP_ADDR").is_some() {
             (None, Vec::new())
         } else {
-            tokio::task::spawn_blocking(|| (detect_lan_ipv4(), detect_loopback_mgmt_ipv4s()))
-                .await
-                .unwrap_or((None, Vec::new()))
+            tokio::task::spawn_blocking(|| {
+                let lan = detect_lan_ipv4_with_retry(
+                    detect_lan_ipv4,
+                    10,
+                    std::time::Duration::from_millis(500),
+                );
+                let lo_mgmt = detect_loopback_mgmt_ipv4s();
+                if lan.is_none() {
+                    eprintln!(
+                        "cellcored: br-lan IPv4 unavailable after boot wait; binding loopback/mgmt only (never 0.0.0.0)"
+                    );
+                }
+                (lan, lo_mgmt)
+            })
+            .await
+            .unwrap_or((None, Vec::new()))
         };
     let https_addrs = resolve_listen_addrs("QM_HTTPS_ADDR", detected_lan, &loopback_mgmt, 443);
     let http_addrs = resolve_listen_addrs("QM_HTTP_ADDR", detected_lan, &loopback_mgmt, 80);
@@ -357,9 +399,10 @@ async fn async_main() {
             _ = int.recv() => {},
         }
     }
+    dataplane::shutdown_cleanly(&state).await;
     flush_persistent_state(&state).await;
-    state.audit.flush_now();
     state.push_daemon_log("cellcored shutting down cleanly");
+    state.audit.flush_now();
     drop(device_lock);
 }
 
@@ -378,11 +421,11 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.7.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.8.0");
     }
 
     #[test]
-    fn dynamic_listen_addrs_formats_detected_or_wildcard() {
+    fn dynamic_listen_addrs_never_falls_back_to_wildcard() {
         use std::net::{Ipv4Addr, SocketAddr};
         assert_eq!(
             super::format_listen_addrs(Some(Ipv4Addr::new(192, 168, 1, 1)), 443),
@@ -391,13 +434,29 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], 443)),
             ]
         );
+        // When br-lan is unavailable (None, loopback, or 0.0.0.0), bind ONLY loopback/mgmt, NEVER 0.0.0.0.
         assert_eq!(
             super::format_listen_addrs(None, 443),
-            vec![SocketAddr::from(([0, 0, 0, 0], 443))]
+            vec![SocketAddr::from(([127, 0, 0, 1], 443))]
         );
         assert_eq!(
             super::format_listen_addrs(Some(Ipv4Addr::new(127, 0, 0, 1)), 80),
-            vec![SocketAddr::from(([0, 0, 0, 0], 80))]
+            vec![SocketAddr::from(([127, 0, 0, 1], 80))]
+        );
+        assert_eq!(
+            super::format_listen_addrs(Some(Ipv4Addr::UNSPECIFIED), 443),
+            vec![SocketAddr::from(([127, 0, 0, 1], 443))]
+        );
+        assert_eq!(
+            super::format_listen_addrs_with_extra(
+                None,
+                &[Ipv4Addr::new(10, 254, 224, 1), Ipv4Addr::UNSPECIFIED],
+                443,
+            ),
+            vec![
+                SocketAddr::from(([127, 0, 0, 1], 443)),
+                SocketAddr::from(([10, 254, 224, 1], 443)),
+            ]
         );
         assert_eq!(
             super::format_listen_addrs_with_extra(
@@ -412,6 +471,38 @@ mod tests {
                 SocketAddr::from(([10, 254, 228, 1], 443)),
             ]
         );
+    }
+
+    #[test]
+    fn detect_lan_ipv4_retries_briefly_until_available() {
+        use std::net::Ipv4Addr;
+        let mut calls = 0usize;
+        let ip = super::detect_lan_ipv4_with_retry(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    None
+                } else {
+                    Some(Ipv4Addr::new(192, 168, 224, 1))
+                }
+            },
+            5,
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(ip, Some(Ipv4Addr::new(192, 168, 224, 1)));
+        assert_eq!(calls, 3);
+
+        let mut miss_calls = 0usize;
+        let none = super::detect_lan_ipv4_with_retry(
+            || {
+                miss_calls += 1;
+                Some(Ipv4Addr::UNSPECIFIED)
+            },
+            3,
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(none, None);
+        assert_eq!(miss_calls, 3);
     }
 
     #[test]

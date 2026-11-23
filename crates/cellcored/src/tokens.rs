@@ -46,6 +46,8 @@ pub const TOKEN_LEN: usize = TOKEN_PREFIX.len() + ID_HEX + 1 + SECRET_HEX;
 pub const MAX_TOKENS: usize = 16;
 pub const MAX_NAME_LEN: usize = 40;
 pub const MAX_EXPIRY_DAYS: u32 = 3650;
+/// Default expiry applied to new `rw` tokens when the caller omits expiry.
+pub const DEFAULT_RW_EXPIRY_DAYS: u32 = 90;
 pub const MAX_FAILURE_PEERS: usize = 256;
 const FAIL_WINDOW_SECS: u64 = 60;
 const FAIL_MAX: u32 = 10;
@@ -61,13 +63,28 @@ const SESSION_ONLY_PREFIX: &[&str] = &["/api/v1/security/tokens"];
 /// re-validated against the session store; it is not offered to tokens.
 const NO_TOKEN_TRANSPORT: &[&str] = &["/api/v1/ws"];
 
-/// Secret-revealing reads a `read` token may not make.
+/// Secret-revealing or privileged reads a `read` token may not make.
+/// Keeps Prometheus (`/api/v1/metrics`), bootstrap/status, failover, cellular
+/// telemetry, tower-finder, dataplane and VPN status routes open for monitoring.
 pub const READ_DENY: &[&str] = &[
     "/api/v1/audit",
     "/api/v1/modem/secrets",
+    "/api/v1/admin/backup",
     "/api/v1/admin/backup/download",
     "/api/v1/sms",
+    "/api/v1/events",
+    "/api/v1/notify",
     "/api/v1/admin/cron",
+    "/api/v1/admin/services/rc-local",
+    "/api/v1/admin/software/feeds",
+    "/api/v1/admin/software/self-upgrade",
+    "/api/v1/admin/access",
+    "/api/v1/system/ota",
+    "/api/v1/system/logs",
+    "/api/v1/system/maintenance",
+    "/api/v1/system/acme",
+    "/api/v1/cellular/profiles",
+    "/api/v1/security/audit",
 ];
 
 /// The config export is readable, but not with SIM identifiers.
@@ -428,6 +445,8 @@ impl TokenStore {
     }
 
     /// Create a token. Returns its info and the plaintext (shown once).
+    /// New `rw` tokens default to expiring in [`DEFAULT_RW_EXPIRY_DAYS`] (90 days)
+    /// when `expires_in_days` is omitted.
     pub fn create(&self, name: &str, kind: TokenKind, expires_in_days: Option<u32>) -> Result<(TokenInfo, String), String> {
         let name = validate_name(name)?;
         if let Some(d) = expires_in_days
@@ -435,6 +454,10 @@ impl TokenStore {
         {
             return Err(format!("Expiry must be 1-{MAX_EXPIRY_DAYS} days"));
         }
+        let effective_days = match (kind, expires_in_days) {
+            (TokenKind::Rw, None) => Some(DEFAULT_RW_EXPIRY_DAYS),
+            (_, days) => days,
+        };
         let id = crate::auth::random_hex(ID_HEX / 2)?;
         let secret = crate::auth::random_hex(SECRET_HEX / 2)?;
         let token = format!("{TOKEN_PREFIX}{id}_{secret}");
@@ -445,7 +468,7 @@ impl TokenStore {
             hash: hash_token(&token),
             kind,
             created_at: now,
-            expires_at: expires_in_days.map(|d| now + u64::from(d) * 86_400),
+            expires_at: effective_days.map(|d| now + u64::from(d) * 86_400),
             last_used_at: None,
             last_used_ip: None,
         };
@@ -476,6 +499,24 @@ impl TokenStore {
         g.usage_dirty = false;
         self.persist_tmp_usage(&g.tokens);
         Ok(Some(removed.name))
+    }
+
+    /// Revoke every stored API token (e.g. on root password reset).
+    /// Returns the number of tokens revoked.
+    pub fn revoke_all(&self) -> Result<usize, String> {
+        let mut g = lock(&self.inner);
+        let count = g.tokens.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let prev = std::mem::take(&mut g.tokens);
+        if let Err(e) = self.persist(&g.tokens) {
+            g.tokens = prev;
+            return Err(e);
+        }
+        g.usage_dirty = false;
+        self.persist_tmp_usage(&g.tokens);
+        Ok(count)
     }
 
     /// Authenticate a bearer value that starts with the token prefix.
@@ -630,7 +671,14 @@ mod tests {
         assert!(token_may_access(r, &head, "/api/v1/bootstrap", None).is_ok());
         assert!(token_may_access(r, &get, "/api/v1/metrics", None).is_ok());
         assert!(token_may_access(r, &get, "/api/v1/admin/processes", None).is_ok());
-        assert!(token_may_access(r, &get, "/api/v1/system/ota", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/cellular/bands", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/cellular/tower-finder", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/vpn/cloudflared", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/system/ota", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/events", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/notify", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/admin/services/rc-local", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/admin/software/feeds", None).is_err());
         assert!(token_may_access(r, &post, "/api/v1/cellular/bands", None).is_err());
         assert!(token_may_access(r, &del, "/api/v1/cellular/cell-lock", None).is_err());
         assert!(token_may_access(r, &put, "/api/v1/admin/cron", None).is_err());
@@ -777,5 +825,38 @@ mod tests {
                 assert!(lock(&st.inner).failures.len() <= MAX_FAILURE_PEERS);
             })
             .await;
+    }
+
+    #[test]
+    fn rw_tokens_default_to_90_day_expiry_and_revoke_all_clears_store() {
+        let dir = std::env::temp_dir().join(format!("qm-tok-revall-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("api_tokens.json");
+        let st = TokenStore::new(Some(path.clone()));
+
+        // Omitting expiry on rw defaults to DEFAULT_RW_EXPIRY_DAYS (90 days).
+        let (rw_def, rw_tok) = st.create("ops-default", TokenKind::Rw, None).unwrap();
+        assert_eq!(
+            rw_def.expires_at,
+            Some(rw_def.created_at + u64::from(DEFAULT_RW_EXPIRY_DAYS) * 86_400)
+        );
+        assert!(!rw_def.expired);
+
+        // Explicit expiry up to MAX_EXPIRY_DAYS still honored.
+        let (rw_exp, _) = st.create("ops-365", TokenKind::Rw, Some(365)).unwrap();
+        assert_eq!(rw_exp.expires_at, Some(rw_exp.created_at + 365 * 86_400));
+
+        // Read tokens omitting expiry remain non-expiring.
+        let (rd_info, rd_tok) = st.create("mon", TokenKind::Read, None).unwrap();
+        assert_eq!(rd_info.expires_at, None);
+
+        // revoke_all removes every token from memory and disk.
+        assert_eq!(st.revoke_all().unwrap(), 3);
+        assert!(st.list().is_empty());
+        assert_eq!(st.authenticate(&rw_tok, ip("192.0.2.10")), Err(TokenError::Invalid));
+        assert_eq!(st.authenticate(&rd_tok, ip("192.0.2.10")), Err(TokenError::Invalid));
+        assert!(TokenStore::new(Some(path)).list().is_empty());
+        assert_eq!(st.revoke_all().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

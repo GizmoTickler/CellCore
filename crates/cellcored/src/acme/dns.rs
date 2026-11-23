@@ -949,7 +949,7 @@ mod tests {
         );
         assert_eq!(
             relative_subname("_acme-challenge.modem1.example.test", "example.test"),
-            "_acme-challenge.mgateway1"
+            "_acme-challenge.modem1"
         );
     }
 

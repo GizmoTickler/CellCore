@@ -73,6 +73,12 @@ pub struct SmdStats {
     pub latency_count: AtomicU64,
     pub latency_sum_ms: AtomicU64,
     pub last_latency_ms: AtomicU64,
+    /// Active raw console AT commands in flight (refcount).
+    pub console_at_inflight: AtomicU64,
+    /// Monotonic timestamp (`mono_ms()`) when the current console AT window began (`0` = none).
+    pub console_at_started_ms: AtomicU64,
+    /// Bounded timeout budget (ms) of the in-flight console AT command (`0` = none).
+    pub console_at_timeout_ms: AtomicU64,
 }
 
 impl SmdStats {
@@ -450,13 +456,16 @@ pub(crate) fn is_qcmap_dependent_at_cmd(cmd: &str) -> bool {
             if seg.is_empty() {
                 continue;
             }
-            let body = if seg.len() >= 2 && seg[..2].eq_ignore_ascii_case("AT") {
-                seg[2..].trim_start()
+            let body = if seg.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("AT")) {
+                seg.get(2..).unwrap_or("").trim_start()
             } else {
                 seg
             };
             for &pfx in PREFIXES {
-                if body.len() >= pfx.len() && body[..pfx.len()].eq_ignore_ascii_case(pfx) {
+                if body
+                    .get(..pfx.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(pfx))
+                {
                     match body.as_bytes().get(pfx.len()) {
                         None | Some(b'=') | Some(b'?') | Some(b' ') | Some(b'\t') => return true,
                         _ => {}
@@ -477,9 +486,12 @@ pub fn sanitize_at_command(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() || trimmed.len() > 1024 {
         return Err("Invalid AT command length".into());
     }
+    if !trimmed.is_ascii() {
+        return Err("AT command must contain only ASCII characters".into());
+    }
     if trimmed
         .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == 0x1a)
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == 0x1a || (b.is_ascii_control() && b != b'\t'))
     {
         return Err("Invalid control character in AT command".into());
     }
@@ -1325,7 +1337,12 @@ impl Actor {
         self.pull_pending();
         while self.has_batch_preemptor(current) {
             let Some(r) = self.heap.pop() else { break };
-            Box::pin(self.execute(r, false)).await;
+            // Strictly higher priority (< current) bounds recursion to at most 3 levels
+            // while keeping Emergency preemption active for Interactive/Telemetry preemptors
+            // (so a slow console command that preempted a telemetry batch still yields to
+            // an arriving Emergency command within PREEMPT_GRACE).
+            let allow_yield = r.priority > Priority::Emergency;
+            Box::pin(self.execute(r, allow_yield)).await;
             self.pull_pending();
         }
     }
@@ -3367,5 +3384,108 @@ mod tests {
             .expect("second call must reopen onto healthy port");
         assert!(ok.ok);
         assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn non_ascii_at_input_is_rejected_without_panicking() {
+        for bad in [
+            "ATé",
+            "éAT",
+            "€",
+            "AT+€€€",
+            "AT+QMAP=é",
+            "aé;AT+QMAP?",
+            "AT+CSQ;€+QMAP?",
+            "AT+QÉ",
+            "AT+CSQ\x07",
+        ] {
+            assert!(sanitize_at_command(bad).is_err(), "expected error for {bad:?}");
+            // Must never panic on byte-index slicing regardless of UTF-8 boundaries.
+            let _ = is_qcmap_dependent_at_cmd(bad);
+        }
+        assert!(is_qcmap_dependent_at_cmd("é;AT+QMAP?"));
+        assert!(!is_qcmap_dependent_at_cmd("€€€"));
+        assert!(sanitize_at_command("AT+CSQ").is_ok());
+    }
+
+    #[tokio::test]
+    async fn emergency_preempts_slow_console_command_even_when_launched_inside_telemetry_batch() {
+        let (ours, theirs) = socketpair();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let ab = Arc::clone(&aborted);
+        let mut scanning = false;
+        let modem = fake_modem(
+            theirs,
+            false,
+            Box::new(move |cmd| {
+                if cmd == "AT+ITEM" {
+                    return vec![(150, "\r\nOK\r\n".into())];
+                }
+                if cmd == "AT+COPS=?" {
+                    scanning = true;
+                    return vec![];
+                }
+                if scanning {
+                    scanning = false;
+                    ab.store(true, AtomicOrdering::SeqCst);
+                    let mut out = vec![(5, "\r\nOK\r\n".to_string())];
+                    if !cmd.is_empty() {
+                        out.push((5, "\r\n+CFUN: 1\r\n\r\nOK\r\n".into()));
+                    }
+                    return out;
+                }
+                if cmd.is_empty() {
+                    return vec![];
+                }
+                vec![(5, "\r\n+CFUN: 1\r\n\r\nOK\r\n".into())]
+            }),
+        );
+        let c = client_on(ours, Arc::new(AtomicU64::new(0)));
+
+        // 1. Start a Telemetry batch; item 0 takes 150 ms.
+        let c_batch = c.clone();
+        let batch = tokio::spawn(async move {
+            let cmds = vec![
+                ("AT+ITEM".to_string(), Duration::from_secs(2)),
+                ("AT+ITEM".to_string(), Duration::from_secs(2)),
+                ("AT+ITEM".to_string(), Duration::from_secs(2)),
+            ];
+            c_batch.exec_batch(cmds, Priority::Telemetry).await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // 2. Enqueue a slow Interactive console command (AT+COPS=?) while item 0 is running.
+        //    It will be popped inside `run_batch_preemptors(Telemetry)` between item 0 and item 1!
+        let c_console = c.clone();
+        let console = tokio::spawn(async move {
+            c_console
+                .exec("AT+COPS=?", Priority::Interactive, Duration::from_secs(60))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // 3. Enqueue an Emergency AT+CFUN? while AT+COPS=? is running inside run_batch_preemptors.
+        //    Previously run_batch_preemptors passed allow_yield=false, blocking Emergency for 60-180s!
+        let t0 = Instant::now();
+        let em = c
+            .exec("AT+CFUN?", Priority::Emergency, Duration::from_secs(5))
+            .await
+            .expect("emergency command must preempt slow console command inside telemetry batch");
+        assert_eq!(em.body, "+CFUN: 1");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "emergency waited {:?} behind mid-batch console AT+COPS=?",
+            t0.elapsed()
+        );
+        assert!(aborted.load(AtomicOrdering::SeqCst), "slow console scan should have been aborted");
+        let console_err = console.await.unwrap().unwrap_err();
+        assert!(console_err.contains("preempted"), "{console_err}");
+
+        // Telemetry batch finishes cleanly after preemption.
+        let results = batch.await.unwrap().unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.as_ref().is_ok_and(|r| r.ok)));
+        drop(c);
+        let _ = modem;
     }
 }

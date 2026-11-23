@@ -9,8 +9,12 @@
 //! was validated when it was saved (`config::validate_*`).
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::Path,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::Serialize;
@@ -33,7 +37,9 @@ pub const QUEUE_CAP: usize = 64;
 pub const SMS_MIN_INTERVAL_SECS: u64 = 120;
 const SINK_TIMEOUT_SECS: u64 = 15;
 const DEDUPE_MAP_CAP: usize = 256;
-const SMS_SEEN_CAP: usize = 200;
+pub const SMS_SEEN_CAP: usize = 1024;
+/// Cap how many SMS events a single poll tick emits so an inbox burst cannot flood the notifier queue.
+const MAX_SMS_EMIT_PER_TICK: usize = 16;
 pub const MSMTPRC: &str = "/etc/msmtprc";
 pub const RECIPIENT_FILE: &str = "/etc/cellcore_alert_recipient";
 
@@ -101,6 +107,10 @@ pub fn in_window(now: u16, start: u16, end: u16) -> bool {
 pub struct Gate {
     last_sent: HashMap<String, u64>,
     window: VecDeque<u64>,
+    /// Dedicated dedupe & rolling-hour rate-limit bucket for `EventKind::SmsReceived`
+    /// so an external SMS flood can never starve critical WAN/failover alerts.
+    sms_last_sent: HashMap<String, u64>,
+    sms_window: VecDeque<u64>,
 }
 
 impl Gate {
@@ -119,27 +129,32 @@ impl Gate {
         {
             return Err(Suppress::Quiet);
         }
+        let (last_sent, window) = if kind == EventKind::SmsReceived {
+            (&mut self.sms_last_sent, &mut self.sms_window)
+        } else {
+            (&mut self.last_sent, &mut self.window)
+        };
         let key = format!("{}|{title}", kind.as_str());
         if cfg.dedupe_secs > 0
-            && self.last_sent.get(&key).is_some_and(|t| now.saturating_sub(*t) < cfg.dedupe_secs)
+            && last_sent.get(&key).is_some_and(|t| now.saturating_sub(*t) < cfg.dedupe_secs)
         {
             return Err(Suppress::Dedupe);
         }
-        while self.window.front().is_some_and(|t| now.saturating_sub(*t) >= 3600) {
-            self.window.pop_front();
+        while window.front().is_some_and(|t| now.saturating_sub(*t) >= 3600) {
+            window.pop_front();
         }
-        if self.window.len() >= cfg.rate_per_hour as usize {
+        if window.len() >= cfg.rate_per_hour as usize {
             return Err(Suppress::Rate);
         }
-        self.window.push_back(now);
-        if self.last_sent.len() >= DEDUPE_MAP_CAP {
+        window.push_back(now);
+        if last_sent.len() >= DEDUPE_MAP_CAP {
             let horizon = cfg.dedupe_secs.max(1);
-            self.last_sent.retain(|_, t| now.saturating_sub(*t) < horizon);
-            if self.last_sent.len() >= DEDUPE_MAP_CAP {
-                self.last_sent.clear();
+            last_sent.retain(|_, t| now.saturating_sub(*t) < horizon);
+            if last_sent.len() >= DEDUPE_MAP_CAP {
+                last_sent.clear();
             }
         }
-        self.last_sent.insert(key, now);
+        last_sent.insert(key, now);
         Ok(())
     }
 }
@@ -222,10 +237,10 @@ pub fn webhook_body(n: &Notice, fmt: WebhookFormat, host: &str, version: &str) -
 /// (UTF-8 titles work this way, unlike the Title header).
 pub fn ntfy_target(url: &str) -> Result<(String, String), String> {
     let (base, topic) = url.trim().trim_end_matches('/').rsplit_once('/').ok_or("ntfy URL must end in /<topic>")?;
-    if base.len() < 8 || !base[..8].eq_ignore_ascii_case("https://") {
+    if !base.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
         return Err("ntfy URL must be https://server/<topic>".into());
     }
-    let server = &base[8..];
+    let server = base.get(8..).unwrap_or("");
     if server.is_empty()
         || server.starts_with('/')
         || server.ends_with('/')
@@ -332,9 +347,40 @@ pub fn curl_config(url: &str, headers: &[(String, String)], body: &str) -> Strin
 // Sinks
 // ---------------------------------------------------------------------------
 
+/// Check resolved IPs against the SSRF blocklist (protects against DNS rebinding
+/// or hostnames resolving to loopback / link-local / cloud metadata addresses).
+pub fn check_resolved_webhook_ips(ips: &[std::net::IpAddr]) -> Result<(), String> {
+    for &ip in ips {
+        if super::config::is_blocked_webhook_ip(ip) {
+            return Err(format!("Webhook target resolved to blocked address {ip}"));
+        }
+    }
+    Ok(())
+}
+
+async fn check_dns_ssrf(url: &str) -> Result<(), String> {
+    let Some((host, port)) = super::config::extract_url_host_port(url) else {
+        return Ok(());
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if let Ok(Ok(addrs)) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    {
+        let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
+        check_resolved_webhook_ips(&ips)?;
+    }
+    Ok(())
+}
+
 async fn curl_post(url: &str, headers: &[(String, String)], body: &str) -> Result<(), String> {
     // Re-validate at send time: the stored config may predate a validator.
     let url = super::config::validate_url(url)?;
+    check_dns_ssrf(&url).await?;
     for (k, v) in headers {
         super::config::validate_header_name(k)?;
         super::config::validate_header_value(v)?;
@@ -472,27 +518,109 @@ pub fn sms_key(sender: &str, timestamp: &str, text: &str) -> String {
     hex::encode(&h.finalize()[..12])
 }
 
+/// High-water-mark timestamp (`YYYY-MM-DD hh:mm:ss`) of messages evicted from
+/// `sms_seen` (or already observed during initialization) so bursts exceeding
+/// [`SMS_SEEN_CAP`] never replay older inbox messages.
+static SMS_WATERMARK: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SMS_POLL_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// Which of `keys` are new. The first poll after enabling only learns what
 /// is already in the inbox (no flood of old messages).
+#[cfg(test)]
 pub fn sms_new(seen: &mut VecDeque<String>, initialized: &mut bool, keys: &[String]) -> Vec<usize> {
+    let mut seen_set: HashSet<String> = seen.iter().cloned().collect();
     let mut new = Vec::new();
     for (i, k) in keys.iter().enumerate() {
-        if seen.contains(k) {
+        if seen_set.contains(k) {
             continue;
         }
         if *initialized {
             new.push(i);
         }
-        if seen.len() >= SMS_SEEN_CAP {
-            seen.pop_front();
+        if seen.len() >= SMS_SEEN_CAP
+            && let Some(evicted) = seen.pop_front()
+        {
+            seen_set.remove(&evicted);
         }
         seen.push_back(k.clone());
+        seen_set.insert(k.clone());
     }
     *initialized = true;
     new
 }
 
+/// Watermark-assisted SMS dedup: uses `seen` (bounded to [`SMS_SEEN_CAP`]) AND
+/// tracks the highest valid SCTS timestamp (`YYYY-MM-DD hh:mm:ss`) observed so
+/// bursts > [`SMS_SEEN_CAP`] cannot cause older inbox messages to replay once
+/// their keys are evicted from `seen`.
+///
+/// Expects `items` as `(key, timestamp)` pairs in chronological (oldest-first) order.
+pub fn sms_new_with_watermark(
+    seen: &mut VecDeque<String>,
+    initialized: &mut bool,
+    watermark: &mut Option<String>,
+    items: &[(String, String)],
+) -> Vec<usize> {
+    let mut seen_set: HashSet<String> = seen.iter().cloned().collect();
+    let prev_watermark = watermark.clone();
+    let mut new = Vec::new();
+    for (i, (k, ts)) in items.iter().enumerate() {
+        let valid_ts = crate::sms::is_valid_sms_timestamp(ts);
+        let already_seen = seen_set.contains(k)
+            || (valid_ts
+                && prev_watermark
+                    .as_deref()
+                    .is_some_and(|wm| ts.as_str() < wm));
+        if valid_ts
+            && watermark
+                .as_deref()
+                .is_none_or(|wm| ts.as_str() > wm)
+        {
+            *watermark = Some(ts.clone());
+        }
+        if already_seen {
+            continue;
+        }
+        if *initialized {
+            new.push(i);
+        }
+        if seen.len() >= SMS_SEEN_CAP
+            && let Some(evicted) = seen.pop_front()
+        {
+            seen_set.remove(&evicted);
+        }
+        seen.push_back(k.clone());
+        seen_set.insert(k.clone());
+    }
+    *initialized = true;
+    new
+}
+
+/// Schedule an SMS inbox poll on a detached background task so slow AT reads
+/// (`AT+CMGL=4`) never stall the 1 Hz failover/usage loop.
 pub async fn sms_forward_tick(state: &AppState) {
+    if SMS_POLL_INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let st = state.clone();
+    tokio::spawn(async move {
+        struct InflightGuard;
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                SMS_POLL_INFLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _guard = InflightGuard;
+        sms_forward_poll_once(&st).await;
+    });
+}
+
+/// Perform one SMS inbox poll over SMD and emit `EventKind::SmsReceived` for
+/// newly arrived messages (oldest-first for watermark stability, capped per tick).
+pub async fn sms_forward_poll_once(state: &AppState) {
     let cmds = vec![
         ("AT+CMGF=0".into(), std::time::Duration::from_secs(4)),
         ("AT+CPMS=\"ME\",\"ME\",\"ME\"".into(), std::time::Duration::from_secs(4)),
@@ -504,17 +632,27 @@ pub async fn sms_forward_tick(state: &AppState) {
     let Some(Ok(cmgl)) = res.get(2) else {
         return;
     };
-    let msgs = crate::sms::parse_cmgl_response(&cmgl.body);
-    let keys: Vec<String> = msgs.iter().map(|m| sms_key(&m.sender, &m.timestamp, &m.text)).collect();
+    // parse_cmgl_response sorts newest-first; iterate oldest-first so oldest keys
+    // evict first if the ring ever fills, and watermark advances monotonically.
+    let mut msgs = crate::sms::parse_cmgl_response(&cmgl.body);
+    msgs.reverse();
+    let items: Vec<(String, String)> = msgs
+        .iter()
+        .map(|m| (sms_key(&m.sender, &m.timestamp, &m.text), m.timestamp.clone()))
+        .collect();
     let new = {
         let mut p = lock(&obs().persisted);
+        let mut wm = lock(&SMS_WATERMARK);
         let mut init = p.sms_seen_initialized;
-        let n = sms_new(&mut p.sms_seen, &mut init, &keys);
+        let n = sms_new_with_watermark(&mut p.sms_seen, &mut init, &mut wm, &items);
         p.sms_seen_initialized = init;
         n
     };
-    for i in new {
-        let m = &msgs[i];
+    // Emit at most MAX_SMS_EMIT_PER_TICK newest messages per poll tick so a
+    // massive SMS burst cannot saturate the notifier queue.
+    let start = new.len().saturating_sub(MAX_SMS_EMIT_PER_TICK);
+    for i in &new[start..] {
+        let m = &msgs[*i];
         let text: String = m.text.chars().take(480).collect();
         emit(
             EventKind::SmsReceived,
@@ -529,6 +667,7 @@ pub async fn sms_forward_tick(state: &AppState) {
 pub fn sms_forward_enabled_changed(enabled: bool) {
     if enabled {
         lock(&obs().persisted).sms_seen_initialized = false;
+        *lock(&SMS_WATERMARK) = None;
     }
 }
 
@@ -696,5 +835,101 @@ mod tests {
             sms_new(&mut seen, &mut init, &[k(&i.to_string())]);
         }
         assert!(seen.len() <= SMS_SEEN_CAP);
+    }
+
+    #[test]
+    fn sms_flood_rate_limit_is_isolated_from_failover_and_critical_alerts() {
+        let mut g = Gate::default();
+        let c = cfg(); // rate_per_hour = 3
+        // Exhaust the SMS rate-limit bucket with 3 SMS messages.
+        for i in 0..3 {
+            assert_eq!(
+                g.decide(&c, EventKind::SmsReceived, Severity::Info, &format!("SMS {i}"), i * 10, 600),
+                Ok(())
+            );
+        }
+        // 4th SMS is rate-limited.
+        assert_eq!(
+            g.decide(&c, EventKind::SmsReceived, Severity::Info, "SMS 3", 30, 600),
+            Err(Suppress::Rate)
+        );
+        // Critical failover and registration alerts STILL pass unimpeded!
+        assert_eq!(
+            g.decide(&c, EventKind::FailoverStart, Severity::Warning, "failover", 31, 600),
+            Ok(())
+        );
+        assert_eq!(
+            g.decide(&c, EventKind::RegistrationLost, Severity::Critical, "reg lost", 32, 600),
+            Ok(())
+        );
+        assert_eq!(
+            g.decide(&c, EventKind::FailoverEnd, Severity::Info, "failover end", 33, 600),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sms_watermark_prevents_replaying_old_messages_after_burst_exceeds_seen_cap() {
+        let mut seen = VecDeque::new();
+        let mut init = false;
+        let mut wm = None;
+        let make = |n: usize| {
+            let secs = n % 60;
+            let mins = (n / 60) % 60;
+            let hrs = (n / 3600) % 24;
+            let ts = format!("2026-11-23 {hrs:02}:{mins:02}:{secs:02}");
+            let key = sms_key("+15550001", &ts, &format!("msg-{n}"));
+            (key, ts)
+        };
+        let old = make(1);
+        // Initial poll learns old message.
+        assert!(sms_new_with_watermark(&mut seen, &mut init, &mut wm, std::slice::from_ref(&old)).is_empty());
+        // Flood SMS_SEEN_CAP + 50 newer messages to completely evict `old` from `seen`.
+        let burst: Vec<(String, String)> = (2..=(SMS_SEEN_CAP + 51)).map(make).collect();
+        let reported = sms_new_with_watermark(&mut seen, &mut init, &mut wm, &burst);
+        assert_eq!(reported.len(), burst.len());
+        assert!(!seen.contains(&old.0), "old key should have been evicted from seen ring");
+        // Next poll still sees `old` in the inbox alongside one brand-new message:
+        // `old` must NOT replay because its timestamp is below the watermark!
+        let newest = make(SMS_SEEN_CAP + 52);
+        let next_poll = vec![old.clone(), newest.clone()];
+        let replayed = sms_new_with_watermark(&mut seen, &mut init, &mut wm, &next_poll);
+        assert_eq!(replayed, vec![1], "only the genuinely new message should be reported");
+    }
+
+    #[test]
+    fn resolved_webhook_ip_ssrf_check_blocks_loopback_and_metadata() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert!(check_resolved_webhook_ips(&[IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]).is_err());
+        assert!(check_resolved_webhook_ips(&[IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]).is_err());
+        assert!(check_resolved_webhook_ips(&[IpAddr::V6(Ipv6Addr::LOCALHOST)]).is_err());
+        assert!(check_resolved_webhook_ips(&[IpAddr::V4(Ipv4Addr::new(192, 168, 120, 10))]).is_ok());
+        assert!(check_resolved_webhook_ips(&[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sms_forward_tick_returns_immediately_without_blocking_on_slow_smd() {
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        let fd_slot = std::sync::Mutex::new(Some(a.into_raw_fd()));
+        let smd = crate::smd::SmdClient::spawn_with_opener(Box::new(move || {
+            fd_slot.lock().unwrap().take().ok_or_else(|| "closed".into())
+        }));
+        let dir = std::env::temp_dir().join(format!("qm-sms-nonblock-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let auth = crate::auth::AuthStore::new(dir.join("sessions"));
+        let app = AppState::for_tests_with_smd(dir.clone(), auth, smd);
+
+        // Even though the peer never answers AT+CMGF=0/AT+CMGL=4, sms_forward_tick spawns
+        // asynchronously and returns well under 100 ms so the 1 Hz failover loop never stalls.
+        let t0 = std::time::Instant::now();
+        sms_forward_tick(&app).await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(100),
+            "sms_forward_tick blocked caller for {:?}",
+            t0.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

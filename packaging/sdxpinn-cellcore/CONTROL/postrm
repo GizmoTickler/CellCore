@@ -1,7 +1,25 @@
 #!/bin/ash
 
-# Restore original LuCI index.html and clean runtime cache only on actual removal (not upgrade)
-if [ ! -x /usr/sbin/cellcored ]; then
+# Restore stock WAN dataplane, original LuCI index.html, and clean runtime cache
+# only on actual package removal (never during opkg upgrade).
+is_upgrade=0
+if [ "${PKG_UPGRADE:-0}" = "1" ] || [ "${1:-}" = "upgrade" ]; then
+    is_upgrade=1
+fi
+
+if [ "$is_upgrade" -eq 0 ] && [ ! -x /usr/sbin/cellcored ]; then
+    if [ -x /usr/bin/cellctl ]; then
+        /usr/bin/cellctl dataplane-restore 2>/dev/null || true
+    fi
+
+    # Ensure stock Qualcomm WAN / connection manager and mwan3 services are re-enabled and started
+    for svc in netmgrd QCMAP_ConnectionManagerd.init QCMAP_ConnectionManager mwan3; do
+        if [ -x "/etc/init.d/$svc" ]; then
+            "/etc/init.d/$svc" enable 2>/dev/null || true
+            "/etc/init.d/$svc" start 2>/dev/null || true
+        fi
+    done
+
     [ -f /www/index.html.old ] && mv -f /www/index.html.old /www/index.html 2>/dev/null || true
     rm -rf /tmp/cellcore
 fi

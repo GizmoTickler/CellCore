@@ -276,6 +276,21 @@ fn decode_address(bytes: &[u8], digit_len: usize, toa: u8) -> String {
     }
 }
 
+/// True when `ts` is a valid decoded SCTS timestamp (`YYYY-MM-DD hh:mm:ss`),
+/// which sorts chronologically in lexicographical order.
+pub fn is_valid_sms_timestamp(ts: &str) -> bool {
+    let b = ts.as_bytes();
+    b.len() == 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b' '
+        && b[13] == b':'
+        && b[16] == b':'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .into_iter()
+            .all(|i| b[i].is_ascii_digit())
+}
+
 /// TP-SCTS: seven semi-octets (swapped BCD) YY MM DD hh mm ss TZ. Returns "YYYY-MM-DD hh:mm:ss",
 /// or an empty string when any digit is not BCD (0xF filler, corrupt PDU) or a field is out of
 /// range: an invalid stamp must read as "unknown", never as a made-up date like 20165-165-165.
@@ -586,5 +601,13 @@ mod tests {
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["indices", "rawPdu", "receivedParts", "reference", "sender", "text", "timestamp", "totalParts"]);
+    }
+
+    #[test]
+    fn sms_timestamp_validator_accepts_decoded_scts_only() {
+        assert!(is_valid_sms_timestamp("2026-11-23 21:15:00"));
+        assert!(!is_valid_sms_timestamp(""));
+        assert!(!is_valid_sms_timestamp("Sent"));
+        assert!(!is_valid_sms_timestamp("2026/11/23 21:15:00"));
     }
 }

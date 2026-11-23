@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.8.0 — Independent Security, Failover-Reliability & Daemon-Stability Hardening
+
+- **Supply Chain, Backup & Access Hardening (`bootstrap.sh`, `scripts/release.sh`, `ota.rs`, `admin/backup.rs`, `http.rs`, `tokens.rs`, `handlers.rs`, `atguard.rs`, `vpn/cloudflared.rs`, `vpn/warp.rs`):**
+  - `bootstrap.sh` now verifies `Packages.sig` via `usign` against `feed/usign.pub` plus `.ipk` SHA-256 locally and on-device, enforces `option check_signature`, drops unmanaged `/usrdata/bin` shadow installs by default, and switches SSH to `StrictHostKeyChecking=accept-new` (alongside `scripts/release.sh`).
+  - `ota.rs` fails closed unless `signatureVerified == Some(true)`, enforces `option check_signature`, and downloads/verifies SHA-256 of the pinned `.ipk` directly from the signed CellCore feed instead of running a cross-feed `opkg upgrade`.
+  - `admin/backup.rs` runs `tar -tvzf` and fails closed on truncated output (`out.truncated`), caps archive entries at `5000`, rejects device/FIFO/socket/symlink-escape entries, and returns SHA-256 integrity digests.
+  - `http.rs` disables the same-origin LuCI proxy by default (`CELLCORE_ENABLE_LUCI_PROXY=1` opt-in with strict CSP + `X-Frame-Options: DENY`), blocks `/cgi-bin/luci` referers on `/api/v1/auth/status`, enforces 64 KiB WebSocket frame/message limits, and adds HTTP/2 idle timeouts.
+  - `tokens.rs` + `handlers.rs` + `atguard.rs`: expanded `READ_DENY` to block `/api/v1/events` (SMS bodies), `/api/v1/notify`, `rc-local`, feeds, and admin/system secrets; defaulted `rw` tokens to 90-day expiry; revoked all API tokens on root password change; blocked `AT+EGMR` (write), `AT+QPRTPARA`, `AT+QFOTADL`, `AT&F`, `AT+CMGS`, and `AT+CMGW` from raw AT console execution.
+  - `vpn/cloudflared.rs` verifies GitHub release SHA-256 + ELF64 `aarch64` headers before installing via durable `state::atomic_rename_file`; `vpn/warp.rs` tightens `/etc/config/network` to `0600` after writing the private key and eliminates idle/steady-state subprocess churn; `obs/config.rs` + `obs/notify.rs` enforce webhook SSRF IP/DNS guards; `admin/diag.rs` prevents deleting running jobs from bypassing the process concurrency cap.
+- **Failover & Native Dataplane Reliability (`dataplane.rs`, `ipc.rs`, `cli.rs`, `main.rs`, `hardening.rs`, `reconcile.rs`, `acme/mod.rs`, `overlay.rs`, `packaging/sdxpinn-cellcore/CONTROL/*`):**
+  - Persisted Native handoff state and pre-tuning kernel sysctl/IRQ/ethtool baselines to `/var/run/cellcore-native-state.json`; clean `SIGTERM` shutdown and `cellctl dataplane-restore` (`postrm` on real `opkg remove`) restore `netmgrd`/QCMAP, `mwan3`, and original sysctls; fixed `prerm` not to disable `cellcored` during `opkg upgrade`.
+  - Immediately flushes stale `rmnet` IPs/routes on QMI WDS disconnect and gates `r10-modem-ctl` `wan_up=1` on live QMI WDS connected state in Native mode.
+  - Removed `0.0.0.0` listener fallback in `main.rs` (retries `br-lan`, falls back to loopback/mgmt only) and added explicit `rmnet+`/`wwan+` TCP `80/443` DROP rules in `hardening.rs`; stopped Dropbear watchdog from clobbering user `Interface` settings or triggering redundant `fw4 reload` wipes.
+  - Added APN `profile_index` + `ip_family` change detection, concurrent 30 s-bounded dual-stack WDS starts, 300 ms QMI indication debouncing, `spawn_blocking` offloads, explicit timeouts on vendor boot scripts in `reconcile.rs`, locked ACME config updates (`acme/mod.rs`), and fail-closed mount-move + deferred upperdir purge in `overlay.rs`.
+- **Daemon Crash Prevention & Packaging (`smd.rs`, `atguard.rs`, `telemetry.rs`, `obs/notify.rs`, `sms.rs`, `feed/`):**
+  - Fixed non-ASCII UTF-8 slicing panics in `smd.rs`, `atguard.rs`, and `handlers.rs` (zero `panic = "abort"` exposure over HTTP/IPC).
+  - Bounded console AT timeouts (`30 s` default, `60 s` confirmed scan), granted bounded RF liveness watchdog grace for in-flight console AT commands, and enabled `Emergency` preemption of mid-batch `Interactive` console commands.
+  - Decoupled SMS polling from the 1 Hz failover loop, preserved last known SIM slot on failed `QUIMSLOT?`, isolated SMS forwarding rate limits + queue reserve from critical failover alerts, and added watermark-based SMS dedup.
+  - Made `ookla-speedtest` optional in `CONTROL/control`, removed the broken `kmod-wireguard_1_sdxpinn.ipk` stub, added `feed/PROVENANCE.md`, and scrubbed private test domain fixtures from `acme/dns.rs`.
+
 ## 1.7.0 — Native UI-Managed Cloudflare Tunnel (`cloudflared`) & Unified `Network → Cloudflare` Hub
 
 - **Full Cloudflare Tunnel (`cloudflared`) Backend (`crates/cellcored/src/vpn/cloudflared.rs`, `vpn/mod.rs`, `audit.rs`):**

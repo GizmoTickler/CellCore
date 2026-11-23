@@ -215,13 +215,15 @@ def main():
     ap.add_argument("ipks", nargs="*")
     ap.add_argument("--remove-package", action="append", default=[], metavar="NAME",
                     help="drop this package's stanza and ipk(s) from the feed")
+    ap.add_argument("--prune-missing", action="store_true",
+                    help="drop index stanzas whose Filename .ipk is missing from feed_dir")
     ap.add_argument("--changes", help="write one line per action here")
     ap.add_argument("--bumps", help="plan_build.py bumps.txt (marks auto-bumps)")
     ap.add_argument("--summary", help="write a unified diff of Packages here")
     ap.add_argument("--export", help="copy the signer's inputs into this dir")
     args = ap.parse_args()
-    if not args.ipks and not args.remove_package:
-        fail("nothing to do: give ipks and/or --remove-package")
+    if not args.ipks and not args.remove_package and not args.prune_missing:
+        fail("nothing to do: give ipks, --remove-package, and/or --prune-missing")
     to_remove = set(args.remove_package)
 
     feed = args.feed_dir
@@ -262,6 +264,12 @@ def main():
             dropped.append((name, field_value(old_fields, "Version")))
             continue
         if name is None or name not in new:
+            if args.prune_missing and name is not None:
+                old_fields = parse_fields(chunk.decode("utf-8", "surrogateescape"))
+                fn = field_value(old_fields, "Filename")
+                if fn and not os.path.exists(os.path.join(feed, fn)):
+                    dropped.append((name, field_value(old_fields, "Version")))
+                    continue
             result.append((name, chunk))
             continue
         info = new[name]

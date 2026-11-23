@@ -232,6 +232,11 @@ pub struct AtExecReq {
     confirm: bool,
 }
 
+/// Maximum timeout (seconds) for standard raw AT console commands.
+pub const MAX_CONSOLE_AT_TIMEOUT_SECS: u64 = 30;
+/// Maximum timeout (seconds) for confirmed long-blocking RF scan commands (`AT+COPS=?`, `AT+QSCAN`).
+pub const MAX_CONSOLE_SCAN_TIMEOUT_SECS: u64 = 60;
+
 pub async fn post_modem_at(
     State(ctx): State<HttpCtx>,
     who: Option<axum::Extension<crate::http::AuthCtx>>,
@@ -243,16 +248,30 @@ pub async fn post_modem_at(
     };
     // The raw command never reaches the audit log: names, form and class only.
     let note = crate::audit::AuditNote(crate::atguard::audit_summary(&verdict));
-    if verdict.class == crate::atguard::AtClass::Dangerous {
+    if verdict.class == crate::atguard::AtClass::Blocked {
+        let mut resp = err_resp(
+            StatusCode::FORBIDDEN,
+            format!("Blocked AT command: {}", verdict.reason),
+        );
+        resp.extensions_mut().insert(note);
+        return resp;
+    }
+    let is_scan = crate::atguard::is_long_blocking_scan(&verdict);
+    if verdict.class == crate::atguard::AtClass::Dangerous || is_scan {
         // Any authenticated caller that reached this POST (sessions and rw
         // tokens; read tokens never get here) may confirm.
         let may_operate = who.is_some();
         if !body.confirm || !may_operate {
+            let label = if verdict.class == crate::atguard::AtClass::Dangerous {
+                "Dangerous AT command"
+            } else {
+                "Long-blocking scan AT command"
+            };
             let mut resp = (
                 StatusCode::PRECONDITION_REQUIRED,
                 Json(serde_json::json!({
                     "status": "error",
-                    "error": format!("Dangerous AT command: {}. Resend with confirm=true to run it.", verdict.reason),
+                    "error": format!("{label}: {}. Resend with confirm=true to run it.", verdict.reason),
                     "classification": verdict,
                 })),
             )
@@ -261,7 +280,13 @@ pub async fn post_modem_at(
             return resp;
         }
     }
-    let dur = Duration::from_secs(body.timeout_secs.unwrap_or(12).clamp(1, 180));
+    let (default_secs, max_secs) = if is_scan {
+        (30, MAX_CONSOLE_SCAN_TIMEOUT_SECS)
+    } else {
+        (12, MAX_CONSOLE_AT_TIMEOUT_SECS)
+    };
+    let dur = Duration::from_secs(body.timeout_secs.unwrap_or(default_secs).clamp(1, max_secs));
+    let _console_guard = ctx.app.begin_console_at(dur);
     let deadline = tokio::time::Instant::now() + dur;
     // The console may change the mode behind the band-lock checks' back
     // (before: a band write reading the cache meanwhile; after: one that
@@ -1174,7 +1199,9 @@ pub async fn get_mode(State(ctx): State<HttpCtx>) -> Response {
         .find_map(|l| l.split(',').nth(1))
         .and_then(|s| s.trim().parse::<i32>().ok())
         .unwrap_or(0);
-    let sim_slot = parse_scalar_at_value(b(2), "+QUIMSLOT:").parse::<i32>().unwrap_or(1);
+    let cached_slot = ctx.app.modem.read().await.identity.sim_slot;
+    let sim_slot = crate::telemetry::parse_quimslot_reply(b(2))
+        .unwrap_or(if (1..=2).contains(&cached_slot) { cached_slot } else { 1 });
     let ok = |i: usize| res.get(i).is_some_and(|r| r.as_ref().is_ok_and(|r| r.ok));
     match (ok(0).then(|| parse_mode_pref(b(0))).flatten(), ok(1).then(|| parse_nr5g_disable(b(1))).flatten()) {
         (Some(m), Some(d)) => note_mode(&ctx.app, m, d),
@@ -1593,8 +1620,8 @@ pub struct RatQuery {
 pub(crate) fn qnwlock_is_unlocked(body: &str, key: &str) -> bool {
     for line in body.lines() {
         let t = line.trim();
-        if t.len() >= 9 && t[..9].eq_ignore_ascii_case("+QNWLOCK:") {
-            let mut parts = t[9..].split(',').map(|s| s.trim().trim_matches('"'));
+        if t.get(..9).is_some_and(|p| p.eq_ignore_ascii_case("+QNWLOCK:")) {
+            let mut parts = t.get(9..).unwrap_or("").split(',').map(|s| s.trim().trim_matches('"'));
             if let (Some(k), Some(val)) = (parts.next(), parts.next())
                 && k.eq_ignore_ascii_case(key)
             {
@@ -2546,8 +2573,8 @@ async fn run_qcmap_cli_create_wwan_policy(umts: u32, timeout: Duration) -> Resul
 
 fn parse_qmap_csv(line: &str) -> Option<Vec<&str>> {
     let t = line.trim();
-    if t.len() >= 6 && t[..6].eq_ignore_ascii_case("+QMAP:") {
-        Some(t[6..].trim().split(',').map(|s| s.trim().trim_matches('"')).collect())
+    if t.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("+QMAP:")) {
+        Some(t.get(6..).unwrap_or("").trim().split(',').map(|s| s.trim().trim_matches('"')).collect())
     } else {
         None
     }
@@ -4001,14 +4028,28 @@ pub async fn post_change_password(
     }
     let cur = body.current_password.clone();
     let new_p = body.new_password.clone();
-    let res = tokio::task::spawn_blocking(move || update_shadow_password("root", &cur, &new_p))
+    let res = crate::paths::spawn_blocking(move || update_shadow_password("root", &cur, &new_p))
         .await
         .unwrap_or_else(|e| Err(format!("Task failed: {e}")));
     match res {
         Ok(()) => {
             let keep = extract_session_token(&headers);
             ctx.app.auth.revoke_except(keep.as_deref()).await;
-            Json(serde_json::json!({ "status": "success" })).into_response()
+            let revoked_tokens = match ctx.app.tokens.revoke_all() {
+                Ok(n) => n,
+                Err(e) => {
+                    ctx.app.push_daemon_log(format!(
+                        "Root password changed, but failed to persist API token revocation: {e}"
+                    ));
+                    0
+                }
+            };
+            if revoked_tokens > 0 {
+                ctx.app.push_daemon_log(format!(
+                    "Root password changed: revoked {revoked_tokens} API token(s) and other sessions"
+                ));
+            }
+            Json(serde_json::json!({ "status": "success", "revokedTokens": revoked_tokens })).into_response()
         }
         Err(e) => err_resp(StatusCode::BAD_REQUEST, e),
     }
@@ -5084,6 +5125,141 @@ qcmap_lan.@profile[3].ippt_mac_addr='02:00:5e:10:00:01'\n";
                 )
                 .await;
                 assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn post_modem_at_blocks_egmr_cmgs_qprtpara_qfotadl_andf_and_requires_confirm_for_scans() {
+        let env = crate::paths::TestSandbox::new("at-console-guard");
+        let (ctx, seen) = spawn_fake_modem_ctx(&env.root, |_| "\r\nOK\r\n".into());
+        let auth_ext = Some(axum::Extension(crate::http::AuthCtx {
+            token: Some(crate::tokens::TokenAuth {
+                id: "0123456789abcdef".into(),
+                name: "ops".into(),
+                kind: crate::tokens::TokenKind::Rw,
+            }),
+            peer: None,
+        }));
+
+        // Even with confirm=true and an rw token, blocked commands are 403 and NEVER reach SMD.
+        for cmd in [
+            "AT+EGMR=1,7,\"356938035643809\"",
+            "AT+QPRTPARA=1",
+            "AT+QFOTADL=\"http://example.com/fw.zip\"",
+            "AT&F",
+            "AT&F0",
+            "AT+CMGS=20",
+            "AT+CMGW=20",
+        ] {
+            let resp = post_modem_at(
+                State(ctx.clone()),
+                auth_ext.clone(),
+                Json(AtExecReq {
+                    command: cmd.into(),
+                    timeout_secs: Some(10),
+                    confirm: true,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "expected 403 for {cmd}");
+        }
+
+        // Long-blocking scan commands require confirm=true (428 without confirm).
+        for scan in ["AT+COPS=?", "AT+QSCAN=3,1"] {
+            let resp = post_modem_at(
+                State(ctx.clone()),
+                auth_ext.clone(),
+                Json(AtExecReq {
+                    command: scan.into(),
+                    timeout_secs: Some(180),
+                    confirm: false,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED, "expected 428 for {scan}");
+        }
+
+        // Non-ASCII AT input returns 400 Bad Request cleanly without panicking.
+        let non_ascii = post_modem_at(
+            State(ctx.clone()),
+            auth_ext.clone(),
+            Json(AtExecReq {
+                command: "ATé".into(),
+                timeout_secs: Some(5),
+                confirm: true,
+            }),
+        )
+        .await;
+        assert_eq!(non_ascii.status(), StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty(), "blocked/unconfirmed/non-ASCII commands must never reach SMD");
+
+        // Confirmed AT+COPS=? executes cleanly and clears console_at_window on completion.
+        let confirmed_scan = post_modem_at(
+            State(ctx.clone()),
+            auth_ext,
+            Json(AtExecReq {
+                command: "AT+COPS=?".into(),
+                timeout_secs: Some(180),
+                confirm: true,
+            }),
+        )
+        .await;
+        assert_eq!(confirmed_scan.status(), StatusCode::OK);
+        assert_eq!(ctx.app.console_at_window(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn post_change_password_revokes_all_api_tokens_and_other_sessions() {
+        let env = crate::paths::TestSandbox::new("pw-revoke-tokens");
+        let old_pw = "OldPassword!23";
+        let new_pw = "NewPassword!45";
+        let old_hash = crate::auth::sha512_crypt(old_pw.as_bytes(), "saltsalt12345678", Some(1000));
+        env.write("/etc/shadow", format!("root:{old_hash}:20000:0:99999:7:::\n"));
+
+        let ctx = HttpCtx::for_tests(&env.root);
+        let sess_keep = ctx.app.auth.create_session().await.unwrap();
+        let sess_other = ctx.app.auth.create_session().await.unwrap();
+        let (_, rw_tok) = ctx.app.tokens.create("ops", crate::tokens::TokenKind::Rw, None).unwrap();
+        let (_, rd_tok) = ctx.app.tokens.create("mon", crate::tokens::TokenKind::Read, None).unwrap();
+
+        let peer = SocketAddr::from(([192, 168, 224, 50], 40000));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", sess_keep.token)).unwrap(),
+        );
+
+        crate::paths::TEST_ENV
+            .scope(env.env(), async {
+                let resp = post_change_password(
+                    State(ctx.clone()),
+                    ConnectInfo(peer),
+                    headers,
+                    Json(PasswordChangeReq {
+                        current_password: old_pw.into(),
+                        new_password: new_pw.into(),
+                    }),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(v["revokedTokens"], 2);
+
+                // All API tokens are revoked immediately.
+                assert!(ctx.app.tokens.list().is_empty());
+                assert_eq!(
+                    ctx.app.tokens.authenticate(&rw_tok, peer.ip()),
+                    Err(crate::tokens::TokenError::Invalid)
+                );
+                assert_eq!(
+                    ctx.app.tokens.authenticate(&rd_tok, peer.ip()),
+                    Err(crate::tokens::TokenError::Invalid)
+                );
+                // Other sessions are revoked while the caller's session remains valid.
+                assert!(ctx.app.auth.validate_token(&sess_other.token, false).await.is_none());
+                assert!(ctx.app.auth.validate_token(&sess_keep.token, false).await.is_some());
             })
             .await;
     }

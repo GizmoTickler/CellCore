@@ -15,7 +15,11 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Semaphore, oneshot},
+};
 
 use super::{bad, conflict, fail, ok, server, validate::is_net_target};
 
@@ -77,6 +81,13 @@ pub fn build_argv(r: &RunReq) -> Result<(String, Vec<String>), String> {
 }
 
 fn resolve(prog: &str) -> String {
+    #[cfg(test)]
+    {
+        let mapped = crate::paths::program(prog);
+        if std::path::Path::new(&mapped).is_file() {
+            return mapped;
+        }
+    }
     for dir in ["/bin", "/usr/bin", "/sbin", "/usr/sbin"] {
         let p = format!("{dir}/{prog}");
         if std::path::Path::new(&p).exists() {
@@ -95,14 +106,24 @@ struct Job {
     done: bool,
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 type Jobs = Mutex<HashMap<u64, Arc<Mutex<Job>>>>;
 static JOBS: OnceLock<Jobs> = OnceLock::new();
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Independent process-slot semaphore so deleting a job record can never bypass
+/// `MAX_RUNNING`: a permit is held until the child process actually exits or is
+/// killed and reaped.
+static ACTIVE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn jobs() -> &'static Jobs {
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_slots() -> &'static Arc<Semaphore> {
+    ACTIVE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_RUNNING)))
 }
 
 fn prune(map: &mut HashMap<u64, Arc<Mutex<Job>>>) {
@@ -127,6 +148,10 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
         Ok(x) => x,
         Err(e) => return bad(e),
     };
+    let Ok(permit) = active_slots().clone().try_acquire_owned() else {
+        return conflict("Two diagnostics are already running; wait for one to finish");
+    };
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let job = Arc::new(Mutex::new(Job {
         tool: req.tool.clone(),
         host: req.host.trim().to_string(),
@@ -136,14 +161,12 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
         done: false,
         exit_code: None,
         timed_out: false,
+        cancelled: false,
+        cancel: Some(cancel_tx),
     }));
     let id = {
         let Ok(mut map) = jobs().lock() else { return server("lock poisoned") };
         prune(&mut map);
-        let running = map.values().filter(|j| j.lock().map(|j| !j.done).unwrap_or(false)).count();
-        if running >= MAX_RUNNING {
-            return conflict("Two diagnostics are already running; wait for one to finish");
-        }
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         map.insert(id, Arc::clone(&job));
         id
@@ -156,8 +179,10 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
         Err(e) => {
             if let Ok(mut j) = job.lock() {
                 j.done = true;
+                j.cancel = None;
                 j.output = format!("failed to start {prog}: {e}").into_bytes();
             }
+            drop(permit);
             return server(format!("failed to start {prog}"));
         }
     };
@@ -183,14 +208,23 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
     let se = child.stderr.take().map(|s| tokio::spawn(pump(Box::new(s), Arc::clone(&job))));
     let job2 = Arc::clone(&job);
     tokio::spawn(async move {
-        let res = tokio::time::timeout(MAX_RUNTIME, child.wait()).await;
-        let (code, timed_out) = match res {
-            Ok(Ok(st)) => (st.code(), false),
-            Ok(Err(_)) => (None, false),
-            Err(_) => {
+        let _permit = permit;
+        let (code, timed_out, cancelled) = tokio::select! {
+            res = tokio::time::timeout(MAX_RUNTIME, child.wait()) => {
+                match res {
+                    Ok(Ok(st)) => (st.code(), false, false),
+                    Ok(Err(_)) => (None, false, false),
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        (None, true, false)
+                    }
+                }
+            }
+            _ = cancel_rx => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                (None, true)
+                (None, false, true)
             }
         };
         for h in [so, se].into_iter().flatten() {
@@ -200,7 +234,10 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
             j.done = true;
             j.exit_code = code;
             j.timed_out = timed_out;
+            j.cancelled |= cancelled;
+            j.cancel = None;
         }
+        // `_permit` is dropped here only after the child is dead and reaped.
     });
     ok(serde_json::json!({ "id": id, "argv": std::iter::once(prog).chain(args).collect::<Vec<_>>() }))
 }
@@ -227,16 +264,22 @@ pub async fn get_job(Path(id): Path<u64>, Query(q): Query<OffsetQ>) -> Response 
         "done": j.done,
         "exitCode": j.exit_code,
         "timedOut": j.timed_out,
+        "cancelled": j.cancelled,
         "truncated": j.truncated,
         "elapsedMs": j.started.elapsed().as_millis() as u64,
     }))
 }
 
-/// Forget a job's output. A still-running process keeps its runtime bound and
-/// is reaped by its waiter task.
+/// Remove a job record and immediately kill any still-running child process.
+/// The concurrency slot stays held until the child is actually reaped.
 pub async fn delete_job(Path(id): Path<u64>) -> Response {
-    if let Ok(mut m) = jobs().lock() {
-        m.remove(&id);
+    let removed = jobs().lock().ok().and_then(|mut m| m.remove(&id));
+    if let Some(job) = removed
+        && let Ok(mut j) = job.lock()
+        && let Some(tx) = j.cancel.take()
+    {
+        j.cancelled = true;
+        let _ = tx.send(());
     }
     ok(serde_json::json!({ "status": "ok" }))
 }
@@ -278,5 +321,79 @@ mod tests {
         let mut ns = req("nslookup", "example.com", "");
         ns.server = Some("-port=1".into());
         assert!(build_argv(&ns).is_err());
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'),
+            Err(_) => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_running_job_kills_child_and_enforces_process_cap() {
+        let env = crate::paths::TestSandbox::new("diag-cap");
+        let pids_file = env.root.join("pids");
+        env.write_exec(
+            "/bin/ping",
+            &format!("#!/bin/sh\necho $$ >> {}\nexec sleep 30\n", pids_file.display()),
+        );
+
+        crate::paths::TEST_ENV
+            .scope(env.env(), async {
+                let r1 = post_run(Json(req("ping", "1.1.1.1", "ipv4"))).await;
+                assert_eq!(r1.status(), axum::http::StatusCode::OK);
+                let b1: serde_json::Value =
+                    serde_json::from_slice(&axum::body::to_bytes(r1.into_body(), 4096).await.unwrap()).unwrap();
+                let id1 = b1["id"].as_u64().unwrap();
+
+                let r2 = post_run(Json(req("ping", "1.0.0.1", "ipv4"))).await;
+                assert_eq!(r2.status(), axum::http::StatusCode::OK);
+                let b2: serde_json::Value =
+                    serde_json::from_slice(&axum::body::to_bytes(r2.into_body(), 4096).await.unwrap()).unwrap();
+                let id2 = b2["id"].as_u64().unwrap();
+
+                // Cap reached: 3rd job must be rejected with 409 Conflict.
+                let r3 = post_run(Json(req("ping", "8.8.8.8", "ipv4"))).await;
+                assert_eq!(r3.status(), axum::http::StatusCode::CONFLICT);
+                assert_eq!(active_slots().available_permits(), 0);
+
+                // Wait until both mock children have recorded their PIDs.
+                let mut pids = Vec::new();
+                for _ in 0..100 {
+                    if let Ok(s) = std::fs::read_to_string(&pids_file) {
+                        pids = s.lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect();
+                        if pids.len() >= 2 {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(pids.len(), 2, "expected 2 spawned child PIDs");
+
+                // Simulate direct map removal without killing (the old bypass): the independent
+                // semaphore MUST still block spawning a 3rd child while both processes live.
+                let saved1 = jobs().lock().unwrap().remove(&id1).unwrap();
+                let r_bypass = post_run(Json(req("ping", "8.8.4.4", "ipv4"))).await;
+                assert_eq!(r_bypass.status(), axum::http::StatusCode::CONFLICT);
+                jobs().lock().unwrap().insert(id1, saved1);
+
+                // Deleting both running jobs must kill and reap their child processes and
+                // release both semaphore permits.
+                assert_eq!(delete_job(Path(id1)).await.status(), axum::http::StatusCode::OK);
+                assert_eq!(delete_job(Path(id2)).await.status(), axum::http::StatusCode::OK);
+
+                for _ in 0..100 {
+                    if active_slots().available_permits() == MAX_RUNNING && pids.iter().all(|&p| !pid_alive(p)) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(active_slots().available_permits(), MAX_RUNNING);
+                for p in pids {
+                    assert!(!pid_alive(p), "child pid {p} was not killed on delete_job");
+                }
+            })
+            .await;
     }
 }

@@ -28,6 +28,7 @@ pub const OVERLAY_LOG_MAX_BYTES: u64 = 64 * 1024;
 pub const REAL_ROOTFS: &str = "/real_rootfs";
 pub const NEW_ROOTFS: &str = "/rootfs";
 pub const MIN_BACKING_FREE_MIB: u64 = 32;
+pub const PENDING_PURGE_MARKER: &str = ".cellcore-overlay-purge-pending";
 
 /// Platform/virtual mountpoints moved across `pivot_root` when present in `/proc/mounts`.
 const MOVE_MOUNTS: &[&str] = &[
@@ -366,6 +367,136 @@ fn sys_pivot_root(new_root: &str, put_old: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn move_mounts_with<F>(targets: &[&str], mut mover: F) -> Result<(), String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    for &target in targets {
+        let src = format!("{REAL_ROOTFS}{target}");
+        if let Err(e) = mover(&src, target) {
+            let msg = format!("mount --move {src} -> {target} failed: {e}");
+            log_line(&format!("error: {msg}"));
+            return Err(msg);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertPlan {
+    pub base_root: PathBuf,
+    pub hook_paths: Vec<PathBuf>,
+    pub extra_rcd_hooks: Vec<PathBuf>,
+    /// Unmounted directories safe to delete immediately.
+    pub immediate_purge_dirs: Vec<PathBuf>,
+    /// Live mounted overlayfs upperdir/workdir that MUST NOT be deleted in place;
+    /// staged via `purge_marker_path` for clean removal after reboot into stock rootfs.
+    pub deferred_purge_dirs: Vec<PathBuf>,
+    pub purge_marker_path: Option<PathBuf>,
+    pub needs_real_rootfs_remount: bool,
+}
+
+pub fn plan_revert(st: &OverlayStatus, purge: bool) -> RevertPlan {
+    let base_root = if st.pivoted {
+        PathBuf::from(REAL_ROOTFS)
+    } else {
+        PathBuf::from("/")
+    };
+    let hook_paths = vec![
+        base_root.join("etc/rc.d/S03cellcore-overlay"),
+        base_root.join("etc/rc.d/S13cellcore-overlay-rw"),
+        base_root.join("etc/init.d/cellcore-overlay"),
+        base_root.join("etc/init.d/cellcore-overlay-rw"),
+    ];
+    let extra_rcd_hooks = if st.pivoted {
+        vec![
+            PathBuf::from("/etc/rc.d/S03cellcore-overlay"),
+            PathBuf::from("/etc/rc.d/S13cellcore-overlay-rw"),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
+    if purge {
+        if let Some(u) = st.upper_dir.as_deref() {
+            candidate_dirs.push(PathBuf::from(u));
+        }
+        if let Some(w) = st.work_dir.as_deref() {
+            let wp = PathBuf::from(w);
+            if !candidate_dirs.contains(&wp) {
+                candidate_dirs.push(wp);
+            }
+        }
+        if let Some(backing) = st.backing_dir.as_deref() {
+            for name in ["cellcore-rootfs", "cellcore-rootfs-work"] {
+                let p = PathBuf::from(format!("{backing}/{name}"));
+                if !candidate_dirs.contains(&p) {
+                    candidate_dirs.push(p);
+                }
+            }
+        }
+    }
+
+    let (immediate_purge_dirs, deferred_purge_dirs) = if st.pivoted {
+        // NEVER rm -rf a live mounted overlayfs upperdir/workdir in place!
+        (Vec::new(), candidate_dirs)
+    } else {
+        (candidate_dirs, Vec::new())
+    };
+    let purge_marker_path = st
+        .backing_dir
+        .as_deref()
+        .map(|b| PathBuf::from(format!("{b}/{PENDING_PURGE_MARKER}")));
+
+    RevertPlan {
+        base_root,
+        hook_paths,
+        extra_rcd_hooks,
+        immediate_purge_dirs,
+        deferred_purge_dirs,
+        purge_marker_path,
+        needs_real_rootfs_remount: st.pivoted,
+    }
+}
+
+pub fn execute_revert_plan(plan: &RevertPlan) -> Result<Vec<String>, String> {
+    let mut actions = Vec::new();
+    for t in plan.hook_paths.iter().chain(plan.extra_rcd_hooks.iter()) {
+        if t.exists() || t.symlink_metadata().is_ok() {
+            fs::remove_file(t).map_err(|e| format!("remove {}: {e}", t.display()))?;
+            actions.push(format!("removed {}", t.display()));
+        }
+    }
+    for dir in &plan.immediate_purge_dirs {
+        if dir.exists() {
+            fs::remove_dir_all(dir).map_err(|e| format!("purge {}: {e}", dir.display()))?;
+            actions.push(format!("purged {}", dir.display()));
+        }
+    }
+    if !plan.deferred_purge_dirs.is_empty() {
+        if let Some(marker) = &plan.purge_marker_path {
+            let mut body = String::from("# CellCore overlay purge staged (live upperdir not deleted in place)\n");
+            for d in &plan.deferred_purge_dirs {
+                body.push_str(&d.display().to_string());
+                body.push('\n');
+            }
+            crate::state::atomic_write(marker, body.as_bytes(), 0o600)?;
+            actions.push(format!(
+                "staged deferred purge marker {} (reboot into stock rootfs before removing live upperdir)",
+                marker.display()
+            ));
+        }
+    } else if let Some(marker) = &plan.purge_marker_path
+        && marker.exists()
+    {
+        let _ = fs::remove_file(marker);
+        actions.push(format!("cleared purge marker {}", marker.display()));
+    }
+    Ok(actions)
+}
+
 /// Execute idempotent overlayfs + pivot_root (or dry-run plan).
 pub fn run_pivot(dry_run: bool) -> Result<(), String> {
     let raw = fs::read_to_string(crate::paths::p("/proc/mounts"))
@@ -380,6 +511,15 @@ pub fn run_pivot(dry_run: bool) -> Result<(), String> {
     if st.pivoted {
         log_line("already pivoted (/real_rootfs active); nothing to do");
         return Ok(());
+    }
+    if let Some(backing) = st.backing_dir.as_deref() {
+        let marker = PathBuf::from(crate::paths::p(&format!("{backing}/{PENDING_PURGE_MARKER}")));
+        if marker.exists() {
+            return Err(format!(
+                "refusing to pivot while revert purge marker {} is pending; run `cellctl overlay revert --yes --purge` in stock rootfs to finish cleanup",
+                marker.display()
+            ));
+        }
     }
     if !st.safe_to_pivot {
         return Err(format!("refusing to pivot: {}", st.reason));
@@ -443,23 +583,22 @@ pub fn run_pivot(dry_run: bool) -> Result<(), String> {
         return Err(e);
     }
 
-    for target in active_move_targets {
-        let src = format!("{REAL_ROOTFS}{target}");
-        let _ = fs::create_dir_all(target);
-        if let Err(e) = sys_mount(Some(&src), target, None, libc::MS_MOVE, None) {
-            log_line(&format!("warn: mount --move {src} -> {target} failed: {e}"));
-        }
-    }
+    move_mounts_with(&active_move_targets, |src, target| {
+        fs::create_dir_all(target).map_err(|e| format!("mkdir {target}: {e}"))?;
+        sys_mount(Some(src), target, None, libc::MS_MOVE, None)
+    })?;
 
     // Bind original /etc/rc.d so init script enable/disable state persists on the base root.
     let old_rcd = format!("{REAL_ROOTFS}/etc/rc.d");
     if Path::new(&old_rcd).is_dir() {
-        let _ = fs::create_dir_all("/etc/rc.d");
-        if let Err(e) = sys_mount(Some(&old_rcd), "/etc/rc.d", None, libc::MS_BIND, None) {
-            log_line(&format!("warn: bind {old_rcd} -> /etc/rc.d failed: {e}"));
-        } else {
-            let _ = sys_mount(None, "/etc/rc.d", None, libc::MS_REMOUNT | libc::MS_BIND, None);
-        }
+        fs::create_dir_all("/etc/rc.d").map_err(|e| format!("mkdir /etc/rc.d: {e}"))?;
+        sys_mount(Some(&old_rcd), "/etc/rc.d", None, libc::MS_BIND, None)
+            .map_err(|e| {
+                let msg = format!("bind {old_rcd} -> /etc/rc.d failed: {e}");
+                log_line(&format!("error: {msg}"));
+                msg
+            })?;
+        let _ = sys_mount(None, "/etc/rc.d", None, libc::MS_REMOUNT | libc::MS_BIND, None);
     }
 
     // Keep base factory root read-only to protect factory UBIFS integrity.
@@ -487,6 +626,7 @@ pub fn run_remount_rw() -> Result<(), String> {
 
 /// Cleanly disable the CellCore early-boot overlay hooks so the next reboot restores
 /// 100% stock factory rootfs without touching any factory binaries.
+#[cfg(test)]
 pub fn disable_overlay_hooks_in(base_root: &Path, purge_dirs: &[PathBuf]) -> Result<Vec<String>, String> {
     let mut actions = Vec::new();
     let targets = [
@@ -518,23 +658,16 @@ pub fn run_revert(yes: bool, purge: bool) -> Result<(), String> {
         );
     }
     let st = probe_status()?;
-    let base = if st.pivoted {
+    let plan = plan_revert(&st, purge);
+    if plan.needs_real_rootfs_remount {
         // Temporarily remount /real_rootfs rw to remove only our two init scripts/symlinks.
         sys_mount(None, REAL_ROOTFS, None, libc::MS_REMOUNT, None)?;
-        PathBuf::from(REAL_ROOTFS)
     } else {
         let _ = sys_mount(None, "/", None, libc::MS_REMOUNT, None);
-        PathBuf::from("/")
-    };
-
-    let mut purge_dirs = Vec::new();
-    if purge && let Some(backing) = st.backing_dir.as_deref() {
-        purge_dirs.push(PathBuf::from(format!("{backing}/cellcore-rootfs")));
-        purge_dirs.push(PathBuf::from(format!("{backing}/cellcore-rootfs-work")));
     }
 
-    let res = disable_overlay_hooks_in(&base, &purge_dirs);
-    if st.pivoted {
+    let res = execute_revert_plan(&plan);
+    if plan.needs_real_rootfs_remount {
         let _ = sys_mount(
             None,
             REAL_ROOTFS,
@@ -551,7 +684,13 @@ pub fn run_revert(yes: bool, purge: bool) -> Result<(), String> {
             println!("ok: {a}");
         }
     }
-    println!("Revert staged cleanly. Run `reboot` to boot back into stock factory rootfs.");
+    if !plan.deferred_purge_dirs.is_empty() {
+        println!(
+            "Revert staged cleanly without deleting the live mounted overlay upperdir. Reboot into stock factory rootfs, then re-run `cellctl overlay revert --yes --purge` to reclaim backing space."
+        );
+    } else {
+        println!("Revert staged cleanly. Run `reboot` to boot back into stock factory rootfs.");
+    }
     Ok(())
 }
 
@@ -727,5 +866,103 @@ overlay /etc overlay rw,relatime 0 0
         let after = fs::read_to_string(&log_path).unwrap();
         assert!(after.len() < OVERLAY_LOG_MAX_BYTES as usize);
         assert!(after.contains("fresh-entry-after-rotate"));
+    }
+
+    #[test]
+    fn move_mounts_fails_closed_when_any_mount_move_fails() {
+        let mut seen = Vec::new();
+        let err = move_mounts_with(&["/proc", "/sys", "/dev"], |src, tgt| {
+            seen.push((src.to_string(), tgt.to_string()));
+            if tgt == "/sys" {
+                Err("EBUSY".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("mount --move /real_rootfs/sys -> /sys failed: EBUSY"), "{err}");
+        assert_eq!(seen.len(), 2, "must stop immediately on first failed move");
+    }
+
+    #[test]
+    fn revert_plan_defers_live_upperdir_purge_when_pivoted_and_purges_when_unpivoted() {
+        let sbx = crate::paths::TestSandbox::new("overlay-revert-plan");
+
+        // Case 1: Pivoted (live overlayfs mounted) with --purge -> NEVER deletes live upperdir in place!
+        let m_pivoted = parse_proc_mounts(MOUNTS_ALREADY_PIVOTED);
+        let st_pivoted = analyze_mounts(&m_pivoted, |_| Some(200), |p| p == "/usrdata/rootfs");
+        let plan_piv = plan_revert(&st_pivoted, true);
+        assert!(plan_piv.needs_real_rootfs_remount);
+        assert!(
+            plan_piv.immediate_purge_dirs.is_empty(),
+            "live mounted overlayfs upperdir must NEVER be in immediate_purge_dirs: {:?}",
+            plan_piv.immediate_purge_dirs
+        );
+        assert!(plan_piv.deferred_purge_dirs.contains(&PathBuf::from("/usrdata/rootfs")));
+        assert!(plan_piv.deferred_purge_dirs.contains(&PathBuf::from("/usrdata/rootfs-workdir")));
+        assert_eq!(
+            plan_piv.purge_marker_path,
+            Some(PathBuf::from(format!("/usrdata/{PENDING_PURGE_MARKER}")))
+        );
+        assert!(plan_piv.extra_rcd_hooks.contains(&PathBuf::from("/etc/rc.d/S03cellcore-overlay")));
+
+        // Execute pivoted revert plan against sandboxed paths and confirm upperdir survives + marker written!
+        let real_root = sbx.root.join("real_rootfs");
+        let live_rcd = sbx.root.join("live_etc_rcd");
+        let upper = sbx.root.join("usrdata/cellcore-rootfs");
+        let work = sbx.root.join("usrdata/cellcore-rootfs-work");
+        let marker = sbx.root.join(format!("usrdata/{PENDING_PURGE_MARKER}"));
+        fs::create_dir_all(real_root.join("etc/init.d")).unwrap();
+        fs::create_dir_all(real_root.join("etc/rc.d")).unwrap();
+        fs::create_dir_all(&live_rcd).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::write(real_root.join("etc/init.d/cellcore-overlay"), b"#!/bin/sh\n").unwrap();
+        fs::write(real_root.join("etc/rc.d/S03cellcore-overlay"), b"link").unwrap();
+        fs::write(live_rcd.join("S03cellcore-overlay"), b"link").unwrap();
+        fs::write(upper.join("live-file"), b"still mounted").unwrap();
+
+        let sbx_piv_plan = RevertPlan {
+            base_root: real_root.clone(),
+            hook_paths: vec![
+                real_root.join("etc/rc.d/S03cellcore-overlay"),
+                real_root.join("etc/init.d/cellcore-overlay"),
+            ],
+            extra_rcd_hooks: vec![live_rcd.join("S03cellcore-overlay")],
+            immediate_purge_dirs: Vec::new(),
+            deferred_purge_dirs: vec![upper.clone(), work.clone()],
+            purge_marker_path: Some(marker.clone()),
+            needs_real_rootfs_remount: true,
+        };
+        let actions = execute_revert_plan(&sbx_piv_plan).unwrap();
+        assert!(actions.iter().any(|a| a.contains("staged deferred purge marker")), "{actions:?}");
+        assert!(!real_root.join("etc/rc.d/S03cellcore-overlay").exists());
+        assert!(!live_rcd.join("S03cellcore-overlay").exists());
+        assert!(upper.join("live-file").exists(), "live upperdir MUST NOT be deleted in place!");
+        assert!(marker.exists(), "deferred purge marker must be written");
+
+        // Case 2: Unpivoted (stock rootfs after reboot) with --purge -> safe to purge immediately & clear marker!
+        let m_stock = parse_proc_mounts(MOUNTS_STOCK_R02);
+        let st_stock = analyze_mounts(&m_stock, |_| Some(200), |_| false);
+        let plan_stock = plan_revert(&st_stock, true);
+        assert!(!plan_stock.needs_real_rootfs_remount);
+        assert!(plan_stock.deferred_purge_dirs.is_empty());
+        assert!(plan_stock.immediate_purge_dirs.contains(&PathBuf::from("/usrdata/cellcore-rootfs")));
+        assert!(plan_stock.immediate_purge_dirs.contains(&PathBuf::from("/usrdata/cellcore-rootfs-work")));
+
+        let sbx_stock_plan = RevertPlan {
+            base_root: real_root.clone(),
+            hook_paths: Vec::new(),
+            extra_rcd_hooks: Vec::new(),
+            immediate_purge_dirs: vec![upper.clone(), work.clone()],
+            deferred_purge_dirs: Vec::new(),
+            purge_marker_path: Some(marker.clone()),
+            needs_real_rootfs_remount: false,
+        };
+        let actions2 = execute_revert_plan(&sbx_stock_plan).unwrap();
+        assert!(actions2.iter().any(|a| a.contains("purged")), "{actions2:?}");
+        assert!(!upper.exists(), "unmounted upperdir must be purged cleanly");
+        assert!(!work.exists(), "unmounted workdir must be purged cleanly");
+        assert!(!marker.exists(), "purge marker must be cleared after purge");
     }
 }

@@ -7,19 +7,24 @@
 //! argv or GET responses).
 
 use std::{
+    io::{Read, Write},
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use axum::{Json, extract::State, response::Response};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::paths;
 use crate::{
     admin::{
         audit, bad,
-        exec::{KIB, run, run_ok},
+        exec::{ExecOpts, KIB, MIB, run, run_ok},
         mutate_lock, ok, require_confirm, server,
     },
     auth::now_secs,
@@ -31,8 +36,13 @@ const INIT_PATH: &str = "/etc/init.d/cloudflared";
 const TOKEN_DIR: &str = "/etc/cloudflared";
 const TOKEN_PATH: &str = "/etc/cloudflared/token";
 const DEFAULT_METRICS_PORT: u16 = 20241;
-const RELEASE_URL_ARM64: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
+const GITHUB_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
+const ASSET_NAME_ARM64: &str = "cloudflared-linux-arm64";
+const EXPECTED_DOWNLOAD_PREFIX: &str =
+    "https://github.com/cloudflare/cloudflared/releases/download/";
+
+static INSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
@@ -125,9 +135,16 @@ fn pid_alive(pid: u32) -> bool {
 
 pub fn read_job() -> Option<InstallJob> {
     let mut j: InstallJob = serde_json::from_slice(&std::fs::read(job_file()).ok()?).ok()?;
-    if j.state == "running" && j.pid.is_some() && !j.pid.is_some_and(pid_alive) {
-        j.state = "failed".into();
-        j.message = Some("Installer stopped before reporting a result".into());
+    if j.state == "running" {
+        let alive = match j.pid {
+            Some(pid) if pid == std::process::id() => INSTALL_IN_PROGRESS.load(Ordering::Acquire),
+            Some(pid) => pid_alive(pid),
+            None => INSTALL_IN_PROGRESS.load(Ordering::Acquire),
+        };
+        if !alive {
+            j.state = "failed".into();
+            j.message = Some("Installer stopped before reporting a result".into());
+        }
     }
     Some(j)
 }
@@ -669,42 +686,281 @@ pub async fn post_service(State(ctx): State<HttpCtx>, Json(req): Json<ServiceReq
     }
 }
 
-const INSTALL_SCRIPT: &str = r#"
-status="$1"; url="$2"; bin="$3"; started="$4"; action="$5"
-tmp="${bin}.new.$$"
-echo "[$(date)] Downloading cloudflared-linux-arm64 from GitHub..."
-curl -fsSL --connect-timeout 15 --max-time 240 -o "$tmp" "$url"
-rc=$?
-ver=""
-if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
-  chmod 0755 "$tmp"
-  ver=$("$tmp" --version 2>&1 | head -n 1 | sed -n 's/^cloudflared version \([^ ]*\).*/\1/p')
-  if [ -n "$ver" ]; then
-    mv -f "$tmp" "$bin"
-    chmod 0755 "$bin"
-    sync
-    echo "[$(date)] Installed cloudflared $ver"
-    if [ -x /etc/init.d/cloudflared ] && [ -s /etc/cloudflared/token ]; then
-      echo "[$(date)] Restarting cloudflared service..."
-      /etc/init.d/cloudflared restart || true
-    fi
-  else
-    echo "[$(date)] Downloaded binary failed --version check"
-    rm -f "$tmp"
-    rc=1
-  fi
-else
-  echo "[$(date)] Download failed (rc=$rc)"
-  rm -f "$tmp"
-fi
-st=failed; if [ "$rc" -eq 0 ] && [ -n "$ver" ]; then st=succeeded; fi
-printf '{"state":"%s","action":"%s","startedAt":%s,"finishedAt":%s,"exitCode":%s,"versionAfter":"%s"}\n' \
-  "$st" "$action" "$started" "$(date +%s)" "$rc" "$ver" > "${status}.tmp" && mv "${status}.tmp" "$status"
-"#;
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Extract the `cloudflared-linux-arm64` download URL and pinned SHA-256 digest
+/// from a GitHub Releases API JSON response. Fails closed if no valid 64-hex
+/// SHA-256 checksum is published or if the download URL is outside the expected
+/// GitHub release download prefix.
+pub fn parse_release_arm64_asset(release_json: &str) -> Result<(String, String), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(release_json).map_err(|e| format!("parse GitHub release JSON: {e}"))?;
+    let assets = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .ok_or("GitHub release metadata missing assets array")?;
+    let asset = assets
+        .iter()
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(ASSET_NAME_ARM64))
+        .ok_or("GitHub release missing cloudflared-linux-arm64 asset")?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(|u| u.as_str())
+        .map(str::trim)
+        .filter(|u| u.starts_with(EXPECTED_DOWNLOAD_PREFIX))
+        .ok_or("cloudflared asset download URL is missing or outside trusted GitHub release prefix")?
+        .to_string();
+
+    if let Some(raw_digest) = asset.get("digest").and_then(|d| d.as_str()) {
+        let cand = raw_digest
+            .trim()
+            .strip_prefix("sha256:")
+            .unwrap_or(raw_digest.trim());
+        if is_sha256_hex(cand) {
+            return Ok((url, cand.to_ascii_lowercase()));
+        }
+    }
+
+    if let Some(body) = v.get("body").and_then(|b| b.as_str()) {
+        for line in body.lines() {
+            if !line.contains(ASSET_NAME_ARM64) {
+                continue;
+            }
+            for tok in line.split(|c: char| c.is_whitespace() || matches!(c, ':' | '|' | '`' | ',' | ';')) {
+                let cand = tok.strip_prefix("sha256:").unwrap_or(tok);
+                if is_sha256_hex(cand) {
+                    return Ok((url, cand.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+
+    Err("GitHub release metadata did not include a verifiable SHA-256 checksum for cloudflared-linux-arm64".into())
+}
+
+/// Verify ELF64 little-endian `EM_AARCH64` (183) header before chmod/exec.
+pub fn verify_aarch64_elf_header(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 20 {
+        return Err("downloaded cloudflared binary is truncated (< 20 bytes)".into());
+    }
+    if &bytes[0..4] != b"\x7fELF" {
+        return Err("downloaded cloudflared file is not an ELF binary".into());
+    }
+    if bytes[4] != 2 {
+        return Err(format!("expected ELF64 binary (EI_CLASS=2), got {}", bytes[4]));
+    }
+    if bytes[5] != 1 {
+        return Err(format!("expected little-endian ELF (EI_DATA=1), got {}", bytes[5]));
+    }
+    let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if e_machine != 183 {
+        return Err(format!("expected EM_AARCH64 (183) binary, got e_machine={e_machine}"));
+    }
+    Ok(())
+}
+
+/// Stream-verify a downloaded binary's ELF64 aarch64 header AND SHA-256 digest
+/// BEFORE marking executable, running `--version`, or moving into place.
+pub fn verify_downloaded_binary(path: &Path, expected_sha256: &str) -> Result<String, String> {
+    let want = expected_sha256.trim().to_ascii_lowercase();
+    if !is_sha256_hex(&want) {
+        return Err("expected SHA-256 checksum is invalid".into());
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open downloaded binary: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut header = Vec::with_capacity(64);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("read downloaded binary: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if header.len() < 64 {
+            let take = (64 - header.len()).min(n);
+            header.extend_from_slice(&buf[..take]);
+        }
+        hasher.update(&buf[..n]);
+    }
+    verify_aarch64_elf_header(&header)?;
+    let actual = hex::encode(hasher.finalize());
+    if actual != want {
+        return Err(format!("SHA-256 checksum mismatch: expected {want}, got {actual}"));
+    }
+    Ok(actual)
+}
+
+fn append_job_log(line: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file())
+    {
+        let _ = writeln!(f, "[{}] {line}", now_secs());
+    }
+}
+
+fn save_job(job: &InstallJob) {
+    let _ = crate::state::atomic_write(
+        &job_file(),
+        &serde_json::to_vec(job).unwrap_or_default(),
+        0o644,
+    );
+}
+
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+async fn run_verified_install(action: String, started: u64) {
+    let _guard = InstallGuard;
+    let bp = bin_path();
+    let tmp = PathBuf::from(format!("{}.new.{}", bp.display(), std::process::id()));
+
+    let outcome: Result<String, String> = async {
+        append_job_log("Fetching latest cloudflared release metadata and SHA-256 checksum from GitHub...");
+        let meta = run(
+            "curl",
+            &[
+                "-fsSL",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "30",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "User-Agent: CellCore",
+                GITHUB_RELEASE_API_URL,
+            ],
+            ExecOpts::new(35, MIB),
+        )
+        .await?;
+        if !meta.ok() {
+            return Err(format!("fetch GitHub release metadata: {}", meta.err_summary("curl")));
+        }
+        let (download_url, expected_sha) = parse_release_arm64_asset(&meta.stdout_str())?;
+        append_job_log(&format!(
+            "Downloading {ASSET_NAME_ARM64} (expected SHA-256: {expected_sha})..."
+        ));
+
+        let tmp_s = tmp.display().to_string();
+        let dl = run(
+            "curl",
+            &[
+                "-fsSL",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "15",
+                "--max-time",
+                "240",
+                "-o",
+                &tmp_s,
+                &download_url,
+            ],
+            ExecOpts::new(250, 64 * KIB),
+        )
+        .await?;
+        if !dl.ok() {
+            return Err(format!("download cloudflared: {}", dl.err_summary("curl")));
+        }
+
+        // Verify SHA-256 and ELF64 aarch64 header BEFORE chmod +x or executing as root.
+        let tmp_chk = tmp.clone();
+        let sha_chk = expected_sha.clone();
+        tokio::task::spawn_blocking(move || verify_downloaded_binary(&tmp_chk, &sha_chk))
+            .await
+            .map_err(|e| format!("verification task panicked: {e}"))??;
+        append_job_log("Verified SHA-256 checksum and ELF64 aarch64 header");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod downloaded binary: {e}"))?;
+        }
+
+        let ver_out = run_ok(&tmp_s, &["--version"], 10, 8 * KIB)
+            .await
+            .map_err(|e| format!("downloaded binary failed --version check: {e}"))?;
+        let ver = ver_out
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .strip_prefix("cloudflared version ")
+            .unwrap_or_else(|| ver_out.lines().next().unwrap_or("").trim())
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if ver.is_empty() {
+            return Err("downloaded binary returned empty --version output".into());
+        }
+
+        if let Some(parent) = bp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        crate::state::atomic_rename_file(&tmp, &bp)
+            .map_err(|e| format!("install binary to {}: {e}", bp.display()))?;
+        if let Ok(mut g) = VERSION_CACHE.lock() {
+            *g = None;
+        }
+        let _ = run("sync", &[], ExecOpts::new(10, 4 * KIB)).await;
+        append_job_log(&format!("Installed verified cloudflared {ver}"));
+
+        if init_path().is_file()
+            && std::fs::metadata(token_path()).is_ok_and(|m| m.is_file() && m.len() > 0)
+        {
+            append_job_log("Restarting cloudflared service...");
+            let init_s = init_path().display().to_string();
+            let _ = run(&init_s, &["restart"], ExecOpts::new(20, 16 * KIB)).await;
+        }
+        Ok(ver)
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&tmp);
+    let finished = now_secs();
+    let job = match outcome {
+        Ok(ver) => InstallJob {
+            state: "succeeded".into(),
+            action,
+            started_at: started,
+            finished_at: Some(finished),
+            exit_code: Some(0),
+            pid: Some(std::process::id()),
+            version_after: Some(ver),
+            message: None,
+        },
+        Err(e) => {
+            append_job_log(&format!("FAILED: {e}"));
+            InstallJob {
+                state: "failed".into(),
+                action,
+                started_at: started,
+                finished_at: Some(finished),
+                exit_code: Some(1),
+                pid: Some(std::process::id()),
+                version_after: None,
+                message: Some(e),
+            }
+        }
+    };
+    save_job(&job);
+}
 
 pub async fn post_install(State(ctx): State<HttpCtx>) -> Response {
     let _g = mutate_lock().await;
-    if read_job().is_some_and(|j| j.state == "running") {
+    if INSTALL_IN_PROGRESS.load(Ordering::Acquire) || read_job().is_some_and(|j| j.state == "running") {
         return crate::admin::conflict("A cloudflared install/update job is already running");
     }
     if crate::ota::upgrade_running() {
@@ -716,10 +972,11 @@ pub async fn post_install(State(ctx): State<HttpCtx>) -> Response {
         "install"
     };
     let started = now_secs();
-    let mut job = InstallJob {
+    let job = InstallJob {
         state: "running".into(),
         action: action.into(),
         started_at: started,
+        pid: Some(std::process::id()),
         ..Default::default()
     };
     let _ = std::fs::create_dir_all(paths().run);
@@ -731,27 +988,13 @@ pub async fn post_install(State(ctx): State<HttpCtx>) -> Response {
     ) {
         return server(e);
     }
-    let jf = job_file().display().to_string();
-    let bp = bin_path().display().to_string();
-    match crate::ota::spawn_detached(
-        INSTALL_SCRIPT,
-        &[&jf, RELEASE_URL_ARM64, &bp, &started.to_string(), action],
-        Path::new(&log_file()),
-    ) {
-        Ok(pid) => {
-            job.pid = Some(pid);
-            if read_job().is_some_and(|j| j.state == "running") {
-                let _ = crate::state::atomic_write(
-                    &job_file(),
-                    &serde_json::to_vec(&job).unwrap_or_default(),
-                    0o644,
-                );
-            }
-            audit(&ctx, format!("vpn: cloudflared {action} started"));
-            ok(serde_json::json!({ "job": job }))
-        }
-        Err(e) => server(format!("start cloudflared {action}: {e}")),
-    }
+    INSTALL_IN_PROGRESS.store(true, Ordering::Release);
+    let act_owned = action.to_string();
+    tokio::spawn(async move {
+        run_verified_install(act_owned, started).await;
+    });
+    audit(&ctx, format!("vpn: cloudflared {action} started"));
+    ok(serde_json::json!({ "job": job }))
 }
 
 #[derive(Deserialize, Default)]
@@ -879,5 +1122,83 @@ cloudflared_tunnel_server_locations{connection_id=\"3\",edge_location=\"ord02\"}
     #[test]
     fn tunnel_token_is_redacted_by_audit() {
         assert!(crate::audit::key_is_secret("tunnelToken"));
+    }
+
+    #[test]
+    fn parses_release_checksum_and_fails_closed_when_missing_or_untrusted() {
+        let sha = "a".repeat(64);
+        let with_digest = serde_json::json!({
+            "assets": [{
+                "name": "cloudflared-linux-arm64",
+                "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.5.0/cloudflared-linux-arm64",
+                "digest": format!("sha256:{sha}")
+            }]
+        })
+        .to_string();
+        let (url, got) = parse_release_arm64_asset(&with_digest).unwrap();
+        assert!(url.ends_with("/cloudflared-linux-arm64"));
+        assert_eq!(got, sha);
+
+        let sha_body = "0123456789abcdef".repeat(4);
+        let with_body = serde_json::json!({
+            "body": format!("Checksums:\ncloudflared-linux-arm64: {sha_body}\n"),
+            "assets": [{
+                "name": "cloudflared-linux-arm64",
+                "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.5.0/cloudflared-linux-arm64"
+            }]
+        })
+        .to_string();
+        let (_, got2) = parse_release_arm64_asset(&with_body).unwrap();
+        assert_eq!(got2, sha_body);
+
+        // Missing checksum MUST fail closed.
+        let missing = serde_json::json!({
+            "body": "No checksums here",
+            "assets": [{
+                "name": "cloudflared-linux-arm64",
+                "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.5.0/cloudflared-linux-arm64"
+            }]
+        })
+        .to_string();
+        assert!(parse_release_arm64_asset(&missing).is_err());
+
+        // Untrusted URL MUST fail closed.
+        let evil = serde_json::json!({
+            "assets": [{
+                "name": "cloudflared-linux-arm64",
+                "browser_download_url": "https://evil.example/cloudflared-linux-arm64",
+                "digest": format!("sha256:{sha}")
+            }]
+        })
+        .to_string();
+        assert!(parse_release_arm64_asset(&evil).is_err());
+    }
+
+    #[test]
+    fn verifies_elf64_aarch64_header_and_sha256_before_exec() {
+        let mut good_elf = vec![0u8; 64];
+        good_elf[0..4].copy_from_slice(b"\x7fELF");
+        good_elf[4] = 2; // ELFCLASS64
+        good_elf[5] = 1; // ELFDATA2LSB
+        good_elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        assert!(verify_aarch64_elf_header(&good_elf).is_ok());
+
+        // Reject shell script, x86_64 ELF, truncated file.
+        assert!(verify_aarch64_elf_header(b"#!/bin/sh\necho pwned\n").is_err());
+        let mut x86_elf = good_elf.clone();
+        x86_elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        assert!(verify_aarch64_elf_header(&x86_elf).is_err());
+        assert!(verify_aarch64_elf_header(&good_elf[..10]).is_err());
+
+        let sbx = crate::paths::TestSandbox::new("cf-verify");
+        let bin = sbx.write("/tmp/cf-bin", &good_elf);
+        let digest = hex::encode(Sha256::digest(&good_elf));
+        assert_eq!(verify_downloaded_binary(&bin, &digest).unwrap(), digest);
+        // Checksum mismatch fails closed.
+        assert!(verify_downloaded_binary(&bin, &"f".repeat(64)).is_err());
+        // Wrong arch with matching checksum still fails closed.
+        let bad_bin = sbx.write("/tmp/cf-x86", &x86_elf);
+        let x86_digest = hex::encode(Sha256::digest(&x86_elf));
+        assert!(verify_downloaded_binary(&bad_bin, &x86_digest).is_err());
     }
 }

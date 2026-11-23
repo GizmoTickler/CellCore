@@ -1,7 +1,10 @@
 //! WARP handlers: consumer account (wgcf), Zero Trust enrollment, the native
 //! `proto wireguard` interface, and the routing policy + fail-back monitor.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axum::{Json, extract::State, response::Response};
 use serde::Deserialize;
@@ -99,20 +102,67 @@ pub async fn reconcile_rules(st: &WarpState) -> Result<policy::RuleDiff, String>
     Ok(diff)
 }
 
+static STEADY_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Restrict `/etc/config/network` to owner-only `0600` whenever it carries the
+/// WARP WireGuard `private_key` (OpenWrt `uci commit` otherwise leaves `0644`).
+pub(crate) fn tighten_network_config_perms() {
+    let p = PathBuf::from(crate::paths::p("/etc/config/network"));
+    if p.is_file() {
+        chmod_600(&p);
+    }
+}
+
+pub(crate) fn tick_needs_route_poll(
+    policy: Mode,
+    usable: bool,
+    was_usable: bool,
+    route_installed: bool,
+    steady_tick: u64,
+) -> bool {
+    if policy == Mode::Off {
+        return route_installed;
+    }
+    if !usable && !route_installed {
+        return false;
+    }
+    if usable && route_installed && was_usable {
+        // Steady-state healthy tunnel: re-verify kernel table every 6th tick (~30 s)
+        // instead of spawning `ip route show` every 5 s.
+        return steady_tick.is_multiple_of(6);
+    }
+    true
+}
+
 /// One monitor step: measure tunnel health and install / withdraw the
 /// table's default route. Returns the action taken.
 pub async fn tick(now: u64) -> RouteAction {
     let st = load_state();
-    // Never installed and nothing left behind: no process spawns every 5 s.
-    if !st.installed && st.policy == Mode::Off && !crate::obs::lock(&RUNTIME).route_installed && !device_present() {
+    let (was, route_installed) = {
+        let rt = crate::obs::lock(&RUNTIME);
+        (rt.usable, rt.route_installed)
+    };
+    // Disabled or unconfigured with no residual route: pure sysfs check, ZERO subprocess forks.
+    if st.policy == Mode::Off && !route_installed {
+        let present = device_present();
+        let mut rt = crate::obs::lock(&RUNTIME);
+        rt.device_present = present;
+        if !present {
+            rt.usable = false;
+            rt.handshake_age = None;
+        }
         return RouteAction::Keep;
     }
     let present = device_present();
     let latest = if present { latest_handshake().await } else { None };
     let age = policy::handshake_age(latest, now);
-    let was = crate::obs::lock(&RUNTIME).usable;
     let usable = policy::tunnel_usable(was, Health { device_present: present, handshake_age: age });
-    let route = route_present(st.table).await;
+    let steady = STEADY_TICKS.fetch_add(1, Ordering::Relaxed);
+    let route = if tick_needs_route_poll(st.policy, usable, was, route_installed, steady) {
+        route_present(st.table).await
+    } else {
+        route_installed
+    };
     let action = policy::route_action(st.policy, route, usable);
     let table = st.table.to_string();
     let mut err = None;
@@ -653,6 +703,7 @@ pub async fn post_install(
     if let Err(e) = ucicfg::apply("network", None, net_ops).await {
         return server(redact(&e, &[&profile.private_key]));
     }
+    tighten_network_config_perms();
     if let Err(e) = ucicfg::apply("firewall", None, firewall_ops()).await {
         if let Some(snap) = net_snapshot {
             let _ = ucicfg::restore_snapshot("network", &snap).await;
@@ -849,4 +900,42 @@ pub async fn post_remove(
     let _ = tick(now_secs()).await;
     audit(&ctx, format!("vpn: WARP removed (account deleted: {})", req.delete_account));
     ok(serde_json::json!({ "status": "ok", "errors": errors }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tightens_etc_config_network_to_0600_for_warp_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let sbx = crate::paths::TestSandbox::new("warp-net-perms");
+        let p = sbx.write("/etc/config/network", "config interface 'warp'\n\toption private_key 'secret'\n");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            tighten_network_config_perms();
+        });
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "/etc/config/network with WARP private_key must be 0600");
+    }
+
+    #[test]
+    fn warp_monitor_skips_route_subprocess_spam_when_off_down_or_steady() {
+        // Off + no installed route -> never poll `ip route`.
+        assert!(!tick_needs_route_poll(Mode::Off, false, false, false, 0));
+        // Off + residual route -> MUST poll to withdraw.
+        assert!(tick_needs_route_poll(Mode::Off, false, false, true, 1));
+        // Enabled + tunnel down + no route -> skip `ip route`.
+        assert!(!tick_needs_route_poll(Mode::Modem, false, false, false, 0));
+        // Transition to usable without route -> poll immediately to install.
+        assert!(tick_needs_route_poll(Mode::Modem, true, false, false, 1));
+        // Transition to unusable with route -> poll immediately to withdraw.
+        assert!(tick_needs_route_poll(Mode::Modem, false, true, true, 1));
+        // Steady healthy state -> only poll every 6th tick (~30 s).
+        assert!(tick_needs_route_poll(Mode::Lan, true, true, true, 0));
+        assert!(!tick_needs_route_poll(Mode::Lan, true, true, true, 1));
+        assert!(!tick_needs_route_poll(Mode::Lan, true, true, true, 5));
+        assert!(tick_needs_route_poll(Mode::Lan, true, true, true, 6));
+    }
 }

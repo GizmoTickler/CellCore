@@ -779,6 +779,56 @@ impl AppState {
             let _ = self.ws_tx.send(axum::extract::ws::Utf8Bytes::from(text));
         }
     }
+
+    /// Record an in-flight console AT command so the liveness watchdog grants
+    /// bounded grace on the RF loop for the command's duration. Cleared on drop.
+    pub fn begin_console_at(&self, timeout: std::time::Duration) -> ConsoleAtGuard {
+        use std::sync::atomic::Ordering;
+        let stats = self.smd.stats();
+        let now = mono_ms();
+        let timeout_ms = (timeout.as_millis() as u64).max(1);
+        let prev = stats.console_at_inflight.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
+            stats.console_at_started_ms.store(now, Ordering::Release);
+            stats.console_at_timeout_ms.store(timeout_ms, Ordering::Release);
+        } else {
+            stats.console_at_timeout_ms.fetch_max(timeout_ms, Ordering::AcqRel);
+        }
+        ConsoleAtGuard {
+            smd: self.smd.clone(),
+        }
+    }
+
+    /// Snapshot `(started_ms, timeout_ms)` for any in-flight console AT command
+    /// (`(0, 0)` when none is running).
+    pub fn console_at_window(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        let stats = self.smd.stats();
+        if stats.console_at_inflight.load(Ordering::Acquire) == 0 {
+            return (0, 0);
+        }
+        (
+            stats.console_at_started_ms.load(Ordering::Acquire),
+            stats.console_at_timeout_ms.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// RAII guard tracking an in-flight console AT command for the liveness watchdog.
+pub struct ConsoleAtGuard {
+    smd: SmdClient,
+}
+
+impl Drop for ConsoleAtGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let stats = self.smd.stats();
+        let prev = stats.console_at_inflight.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            stats.console_at_started_ms.store(0, Ordering::Release);
+            stats.console_at_timeout_ms.store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Load persisted JSON state.
@@ -843,6 +893,25 @@ fn fsync_dir(dir: &Path) {
 /// directory so the rename itself is durable.
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     atomic_write_inner(path, data, mode, true)
+}
+
+/// Durably replace `dst` with an already-written staging file `src`: fsyncs
+/// `src`, renames `src -> dst`, and fsyncs `dst`'s parent directory. Used for
+/// large verified binaries (such as `cloudflared`) without buffering them in RAM.
+pub fn atomic_rename_file(src: &Path, dst: &Path) -> Result<(), String> {
+    let parent = dst
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _ = fs::create_dir_all(parent);
+    if let Ok(f) = fs::File::open(src) {
+        let _ = f.sync_all();
+    }
+    fs::rename(src, dst).map_err(|e| format!("install {} -> {}: {e}", src.display(), dst.display()))?;
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Atomic rename-replace for volatile tmpfs files (`/tmp/*`): skips `fsync`
@@ -1517,5 +1586,29 @@ mod tests {
         assert_eq!(super::sanitize_antenna_label(&long).len(), 32);
         let cfg: super::DaemonSettings = serde_json::from_str("{}").expect("empty json defaults");
         assert_eq!(cfg.antenna_labels, ["", "", "", ""]);
+    }
+
+    #[tokio::test]
+    async fn console_at_guard_tracks_inflight_window_and_clears_on_drop() {
+        let d = tmpdir("console-guard");
+        let auth = crate::auth::AuthStore::new(d.join("sessions"));
+        let app = AppState::for_tests(d.clone(), auth);
+        assert_eq!(app.console_at_window(), (0, 0));
+
+        let g1 = app.begin_console_at(std::time::Duration::from_secs(30));
+        let (s1, t1) = app.console_at_window();
+        assert!(s1 > 0 && t1 == 30_000);
+
+        let g2 = app.begin_console_at(std::time::Duration::from_secs(60));
+        let (s2, t2) = app.console_at_window();
+        assert_eq!(s2, s1);
+        assert_eq!(t2, 60_000);
+
+        drop(g1);
+        assert!(app.console_at_window().0 > 0, "still in-flight while g2 lives");
+
+        drop(g2);
+        assert_eq!(app.console_at_window(), (0, 0), "cleared once last guard drops");
+        let _ = fs::remove_dir_all(&d);
     }
 }

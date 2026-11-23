@@ -236,10 +236,60 @@ const RESERVED_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
+/// SSRF IP guard for webhook and ntfy sinks.
+///
+/// Blocks loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0/8`, `::`),
+/// link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`), broadcast,
+/// multicast, and IPv4-mapped IPv6 equivalents (`::ffff:127.0.0.1`, etc.).
+/// RFC1918 LAN (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`) and IPv6 ULA
+/// (`fc00::/7`) are intentionally permitted so on-LAN Alertmanager, ntfy, and
+/// Home Assistant sinks work on this gateway.
+pub fn is_blocked_webhook_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_webhook_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_webhook_v4(mapped);
+            }
+            let seg0 = v6.segments()[0];
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || is_link_local
+        }
+    }
+}
+
+fn is_blocked_webhook_v4(v4: std::net::Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || oct[0] == 0
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+}
+
+/// Hostnames that resolve to loopback or cloud instance metadata services.
+pub fn is_blocked_webhook_hostname(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        h.as_str(),
+        "localhost"
+            | "localhost.localdomain"
+            | "ip6-localhost"
+            | "ip6-loopback"
+            | "metadata"
+            | "metadata.google.internal"
+            | "metadata.goog"
+            | "metadata.azure.com"
+            | "instance-data"
+    ) || h.ends_with(".localhost")
+}
+
 /// An http(s) URL with a plain host (DNS name or IP literal), optional port
 /// and a conservative path/query character set. No userinfo, no fragment,
 /// no whitespace, quotes, backslashes or control characters: the value ends
 /// up in a curl config line and must not be able to escape its quotes.
+/// Blocks loopback, unspecified, link-local, and cloud-metadata SSRF targets.
 pub fn validate_url(raw: &str) -> Result<String, String> {
     let url = raw.trim();
     if url.is_empty() {
@@ -263,12 +313,22 @@ pub fn validate_url(raw: &str) -> Result<String, String> {
         return Err("Credentials in the URL are not allowed; use a header or token".into());
     }
     let (host, port) = split_host_port(authority)?;
-    let host_ok = if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        v6.parse::<std::net::Ipv6Addr>().is_ok()
+    if let Some(v6_str) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        let v6 = v6_str
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| "URL host is not a valid host name or IP address".to_string())?;
+        if is_blocked_webhook_ip(std::net::IpAddr::V6(v6)) {
+            return Err("URL host targets a blocked loopback, unspecified, or link-local address".into());
+        }
+    } else if let Some(v4) = crate::admin::validate::parse_ipv4(host) {
+        if is_blocked_webhook_ip(std::net::IpAddr::V4(v4)) {
+            return Err("URL host targets a blocked loopback, unspecified, or link-local address".into());
+        }
+    } else if crate::admin::validate::is_hostname(host) {
+        if is_blocked_webhook_hostname(host) {
+            return Err("URL host targets a blocked local or metadata hostname".into());
+        }
     } else {
-        crate::admin::validate::parse_ipv4(host).is_some() || crate::admin::validate::is_hostname(host)
-    };
-    if !host_ok {
         return Err("URL host is not a valid host name or IP address".into());
     }
     if let Some(p) = port
@@ -283,6 +343,26 @@ pub fn validate_url(raw: &str) -> Result<String, String> {
         return Err("URL path contains characters that are not allowed".into());
     }
     Ok(format!("{}://{authority}{path}", scheme.to_ascii_lowercase()))
+}
+
+/// Extract `(host_without_brackets, port)` from an already-validated http(s) URL.
+pub(crate) fn extract_url_host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+    let authority = match rest.find(['/', '?']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let (host, port_opt) = split_host_port(authority).ok()?;
+    let port = match port_opt {
+        Some(p) => p.parse::<u16>().ok()?,
+        None => default_port,
+    };
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Some((bare_host.to_string(), port))
 }
 
 fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), String> {
@@ -383,6 +463,27 @@ mod tests {
             "https://host/`id`",
             "https://host/$(reboot)<",
             "//host/x",
+            // SSRF targets: loopback, unspecified, link-local / cloud metadata, IPv4-mapped IPv6
+            "http://127.0.0.1/hook",
+            "https://127.0.0.53:8080/hook",
+            "http://[::1]:8080/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+            "http://0.0.0.0/hook",
+            "http://0.1.2.3/hook",
+            "http://[::]/hook",
+            "http://[::ffff:0.0.0.0]/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[fe80::1]/hook",
+            "http://localhost/hook",
+            "https://LOCALHOST:443/hook",
+            "http://sub.localhost/hook",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata/hook",
+            "http://instance-data/latest/",
+            "http://255.255.255.255/hook",
+            "http://224.0.0.1/hook",
+            "http://[ff02::1]/hook",
         ] {
             assert!(validate_url(u).is_err(), "accepted {u:?}");
         }

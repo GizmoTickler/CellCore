@@ -503,8 +503,9 @@ pub fn run_cellctl(args: &[String]) -> i32 {
         "upgrade" => run_upgrade(&args[1..]),
         "acme" => crate::acme::run_cli(&args[1..]),
         "security" => crate::hardening::run_cli(&args[1..]),
+        "dataplane-restore" => crate::dataplane::run_dataplane_restore_cli(),
         _ => {
-            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|verify [--expect-wan 0|1]|upgrade [--check|--yes]|acme <status|config|issue|reset>|security <audit|harden>|overlay <status|pivot|remount-rw|revert>|speedtest|lan>");
+            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|dataplane-restore|verify [--expect-wan 0|1]|upgrade [--check|--yes]|acme <status|config|issue|reset>|security <audit|harden>|overlay <status|pivot|remount-rw|revert>|speedtest|lan>");
             2
         }
     }

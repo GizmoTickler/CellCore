@@ -16,7 +16,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -43,6 +46,12 @@ const ACME_HTTP_TIMEOUT_SECS: u64 = 25;
 static HTTP01_CHALLENGES: OnceLock<Arc<RwLock<HashMap<String, String>>>> = OnceLock::new();
 /// Prevents concurrent issuance runs from stepping on each other.
 static ISSUE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Serializes read-modify-write updates to `/etc/cellcore/acme.json` so background
+/// issuance never overwrites concurrent user config edits or resets.
+static CONFIG_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+/// Bumped by `reset_acme_cert_and_disable` so an in-flight issuance never resurrects
+/// a deleted certificate or re-enables ACME after a concurrent reset.
+static RESET_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// In-memory runtime progress / last error status.
 static RUNTIME_STATUS: OnceLock<RwLock<AcmeRunState>> = OnceLock::new();
 
@@ -64,6 +73,10 @@ pub async fn lookup_http01_token(token: &str) -> Option<String> {
 
 fn issue_lock() -> &'static Mutex<()> {
     ISSUE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn config_lock() -> &'static std::sync::Mutex<()> {
+    CONFIG_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 fn run_state() -> &'static RwLock<AcmeRunState> {
@@ -194,6 +207,37 @@ pub fn load_config() -> AcmeConfig {
 pub fn save_config(cfg: &AcmeConfig) -> Result<(), String> {
     let raw = serde_json::to_vec_pretty(cfg).map_err(|e| format!("serialize acme config: {e}"))?;
     atomic_write(Path::new(ACME_CONFIG_PATH), &raw, 0o600)
+}
+
+/// Atomically re-read `/etc/cellcore/acme.json` under `CONFIG_LOCK`, apply `f`, and save.
+pub(crate) fn update_config_locked<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut AcmeConfig) -> Result<R, String>,
+{
+    let _g = config_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = load_config();
+    let res = f(&mut cfg)?;
+    save_config(&cfg)?;
+    Ok(res)
+}
+
+/// Persist ONLY a single `account_urls` cache entry onto the latest on-disk config,
+/// never overwriting concurrent user edits or resets made while issuance was running.
+pub(crate) fn persist_account_url_update(
+    acct_cache_key: &str,
+    url: Option<&str>,
+) -> Result<(), String> {
+    update_config_locked(|cur| {
+        match url {
+            Some(u) => {
+                cur.account_urls.insert(acct_cache_key.to_string(), u.to_string());
+            }
+            None => {
+                cur.account_urls.remove(acct_cache_key);
+            }
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +764,8 @@ pub async fn issue_certificate(mut cfg: AcmeConfig) -> Result<String, String> {
         st.log.clear();
     }
 
-    let result = issue_inner(&mut cfg, &dir_url).await;
+    let start_reset_epoch = RESET_EPOCH.load(Ordering::Acquire);
+    let result = issue_inner(&mut cfg, &dir_url, start_reset_epoch).await;
     let mut st = run_state().write().await;
     st.running = false;
     match &result {
@@ -728,7 +773,6 @@ pub async fn issue_certificate(mut cfg: AcmeConfig) -> Result<String, String> {
             st.last_success_ts = Some(crate::auth::now_secs());
             st.last_error = None;
             st.last_message = Some(msg.clone());
-            let _ = save_config(&cfg);
         }
         Err(e) => {
             st.last_error = Some(e.clone());
@@ -776,11 +820,15 @@ async fn register_acme_account(
     }
     let loc = resp.location.ok_or("ACME newAccount missing Location header")?;
     cfg.account_urls.insert(acct_cache_key.to_string(), loc.clone());
-    let _ = save_config(cfg);
+    let _ = persist_account_url_update(acct_cache_key, Some(&loc));
     Ok(loc)
 }
 
-async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, String> {
+async fn issue_inner(
+    cfg: &mut AcmeConfig,
+    dir_url: &str,
+    start_reset_epoch: u64,
+) -> Result<String, String> {
     append_log(format!("Fetching ACME directory: {dir_url}")).await;
     let dir_resp = acme_http("GET", dir_url, None).await?;
     if dir_resp.status != 200 {
@@ -842,7 +890,7 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
     if used_cached_acct && is_acme_account_not_found(order_resp.status, &order_resp.body) {
         append_log("ACME server returned accountDoesNotExist; clearing cached account URL and re-registering").await;
         cfg.account_urls.remove(&acct_cache_key);
-        let _ = save_config(cfg);
+        let _ = persist_account_url_update(&acct_cache_key, None);
         kid = register_acme_account(
             cfg,
             &acct_key_path,
@@ -1015,6 +1063,11 @@ async fn issue_inner(cfg: &mut AcmeConfig, dir_url: &str) -> Result<String, Stri
         return Err(format!("Certificate download failed (HTTP {})", cert_resp.status));
     }
 
+    // Abort writing the cert if the user concurrently reset/deleted ACME while issuance was running.
+    if RESET_EPOCH.load(Ordering::Acquire) != start_reset_epoch {
+        return Err("ACME was reset while certificate issuance was in progress".into());
+    }
+
     // Persist atomically to /etc/ssl/acme/ (picked up automatically by http.rs TLS hot-reloader)
     let cert_path = PathBuf::from(crate::paths::p(ACME_CERT_PATH));
     let key_path = PathBuf::from(crate::paths::p(ACME_KEY_PATH));
@@ -1126,69 +1179,72 @@ pub struct PutAcmeReq {
 }
 
 pub async fn put_acme(State(ctx): State<HttpCtx>, Json(req): Json<PutAcmeReq>) -> Response {
-    let mut cfg = load_config();
-    if let Some(e) = req.enabled {
-        cfg.enabled = e;
-    }
-    if let Some(iss) = req.issuer {
-        cfg.issuer = iss;
-    }
-    if let Some(u) = req.custom_directory_url {
-        cfg.custom_directory_url = u.trim().to_string();
-    }
-    if let Some(em) = req.email {
-        cfg.email = em.trim().to_string();
-    }
-    if let Some(doms) = req.domains {
-        cfg.domains = doms
-            .into_iter()
-            .map(|d| d.trim().to_ascii_lowercase())
-            .filter(|d| !d.is_empty())
-            .collect();
-    }
-    if let Some(v) = req.validation {
-        cfg.validation = v;
-    }
-    if req.clear_eab {
-        cfg.eab_kid.clear();
-        cfg.eab_hmac_key.clear();
-    } else {
-        if let Some(k) = req.eab_kid {
-            cfg.eab_kid = k.trim().to_string();
+    let cfg = match update_config_locked(|cfg| {
+        if let Some(e) = req.enabled {
+            cfg.enabled = e;
         }
-        if let Some(h) = req.eab_hmac_key
-            && !h.trim().is_empty()
-        {
-            cfg.eab_hmac_key = h.trim().to_string();
+        if let Some(iss) = req.issuer {
+            cfg.issuer = iss;
         }
-    }
-    if let Some(p) = req.dns_provider {
-        if p != cfg.dns_provider {
-            cfg.dns_credentials.clear();
+        if let Some(u) = req.custom_directory_url {
+            cfg.custom_directory_url = u.trim().to_string();
         }
-        cfg.dns_provider = p;
-    }
-    if let Some(creds) = req.dns_credentials {
-        for (k, v) in creds {
-            if !v.trim().is_empty() {
-                cfg.dns_credentials.insert(k, v.trim().to_string());
+        if let Some(em) = req.email {
+            cfg.email = em.trim().to_string();
+        }
+        if let Some(doms) = req.domains {
+            cfg.domains = doms
+                .into_iter()
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect();
+        }
+        if let Some(v) = req.validation {
+            cfg.validation = v;
+        }
+        if req.clear_eab {
+            cfg.eab_kid.clear();
+            cfg.eab_hmac_key.clear();
+        } else {
+            if let Some(k) = req.eab_kid {
+                cfg.eab_kid = k.trim().to_string();
+            }
+            if let Some(h) = req.eab_hmac_key
+                && !h.trim().is_empty()
+            {
+                cfg.eab_hmac_key = h.trim().to_string();
             }
         }
-    }
-    if let Some(ps) = req.propagation_seconds {
-        cfg.propagation_seconds = ps.clamp(5, 300);
-    }
-    if let Some(rb) = req.renew_before_days {
-        cfg.renew_before_days = rb.clamp(7, 60);
-    }
-
-    if let Err(e) = save_config(&cfg) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "status": "error", "error": e })),
-        )
-            .into_response();
-    }
+        if let Some(p) = req.dns_provider {
+            if p != cfg.dns_provider {
+                cfg.dns_credentials.clear();
+            }
+            cfg.dns_provider = p;
+        }
+        if let Some(creds) = req.dns_credentials {
+            for (k, v) in creds {
+                if !v.trim().is_empty() {
+                    cfg.dns_credentials.insert(k, v.trim().to_string());
+                }
+            }
+        }
+        if let Some(ps) = req.propagation_seconds {
+            cfg.propagation_seconds = ps.clamp(5, 300);
+        }
+        if let Some(rb) = req.renew_before_days {
+            cfg.renew_before_days = rb.clamp(7, 60);
+        }
+        Ok(cfg.clone())
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "status": "error", "error": e })),
+            )
+                .into_response();
+        }
+    };
     ctx.app.push_daemon_log(format!(
         "ACME config updated (issuer={}, validation={:?})",
         cfg.issuer.key_tag(),
@@ -1245,6 +1301,7 @@ pub async fn post_acme_issue(State(ctx): State<HttpCtx>) -> Response {
 }
 
 pub fn reset_acme_cert_and_disable() -> Result<(), String> {
+    RESET_EPOCH.fetch_add(1, Ordering::AcqRel);
     for p in [ACME_CERT_PATH, ACME_KEY_PATH] {
         let mapped = crate::paths::p(p);
         if let Err(e) = fs::remove_file(&mapped)
@@ -1253,9 +1310,10 @@ pub fn reset_acme_cert_and_disable() -> Result<(), String> {
             return Err(format!("remove {mapped}: {e}"));
         }
     }
-    let mut cfg = load_config();
-    cfg.enabled = false;
-    save_config(&cfg)?;
+    update_config_locked(|cfg| {
+        cfg.enabled = false;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1510,24 +1568,35 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         "config" => {
-            let mut cfg = load_config();
-            if let Err(e) = apply_cli_config_args(&mut cfg, &args[1..]) {
-                eprintln!("acme config error: {e}");
-                print_acme_cli_usage();
-                return 2;
+            let mut arg_err = false;
+            let res = update_config_locked(|cfg| {
+                if let Err(e) = apply_cli_config_args(cfg, &args[1..]) {
+                    arg_err = true;
+                    return Err(e);
+                }
+                Ok(cfg.clone())
+            });
+            match res {
+                Ok(cfg) => {
+                    println!(
+                        "ok=1 issuer={} validation={:?} domains={} enabled={}",
+                        cfg.issuer.key_tag(),
+                        cfg.validation,
+                        if cfg.domains.is_empty() { "none".to_string() } else { cfg.domains.join(",") },
+                        cfg.enabled
+                    );
+                    0
+                }
+                Err(e) if arg_err => {
+                    eprintln!("acme config error: {e}");
+                    print_acme_cli_usage();
+                    2
+                }
+                Err(e) => {
+                    eprintln!("acme config save failed: {e}");
+                    1
+                }
             }
-            if let Err(e) = save_config(&cfg) {
-                eprintln!("acme config save failed: {e}");
-                return 1;
-            }
-            println!(
-                "ok=1 issuer={} validation={:?} domains={} enabled={}",
-                cfg.issuer.key_tag(),
-                cfg.validation,
-                if cfg.domains.is_empty() { "none".to_string() } else { cfg.domains.join(",") },
-                cfg.enabled
-            );
-            0
         }
         "issue" => {
             // Prefer IPC into the running daemon so HTTP-01 challenges are served on port :80
@@ -1739,6 +1808,67 @@ mod tests {
                 .flatten()
                 .any(|e| e.file_name().to_string_lossy().starts_with("acme.json.corrupt."));
             assert!(quarantined, "corrupt acme.json must be quarantined via load_json_or_default");
+        });
+    }
+
+    #[test]
+    fn account_url_persist_preserves_concurrent_user_edits_and_resets() {
+        let sbx = crate::paths::TestSandbox::new("acme-race");
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            // Initial config loaded before issuance starts.
+            let initial = AcmeConfig {
+                enabled: true,
+                email: "old@example.com".into(),
+                domains: vec!["old.example.com".into()],
+                renew_before_days: 30,
+                ..Default::default()
+            };
+            save_config(&initial).unwrap();
+
+            // Simulate user concurrently editing config on disk while issuance is in flight.
+            update_config_locked(|c| {
+                c.email = "new@example.com".into();
+                c.domains = vec!["new.example.com".into()];
+                c.renew_before_days = 14;
+                Ok(())
+            })
+            .unwrap();
+
+            // Issuance registers an account URL and persists ONLY the account_urls key.
+            persist_account_url_update(
+                "letsencrypt|https://acme-v02.api.letsencrypt.org/directory",
+                Some("https://acme-v02.api.letsencrypt.org/acme/acct/12345"),
+            )
+            .unwrap();
+
+            let after = load_config();
+            assert_eq!(after.email, "new@example.com", "concurrent email edit must not be reverted");
+            assert_eq!(after.domains, vec!["new.example.com"], "concurrent domain edit must not be reverted");
+            assert_eq!(after.renew_before_days, 14, "concurrent renew_before_days must not be reverted");
+            assert_eq!(
+                after
+                    .account_urls
+                    .get("letsencrypt|https://acme-v02.api.letsencrypt.org/directory")
+                    .map(String::as_str),
+                Some("https://acme-v02.api.letsencrypt.org/acme/acct/12345")
+            );
+
+            // Simulate concurrent DELETE / reset while issuance is in flight.
+            let before_epoch = RESET_EPOCH.load(Ordering::Acquire);
+            reset_acme_cert_and_disable().unwrap();
+            assert!(RESET_EPOCH.load(Ordering::Acquire) > before_epoch);
+            let after_reset = load_config();
+            assert!(!after_reset.enabled, "reset must disable ACME");
+
+            // Even if a late account URL removal happens, it must NOT re-enable ACME.
+            persist_account_url_update(
+                "letsencrypt|https://acme-v02.api.letsencrypt.org/directory",
+                None,
+            )
+            .unwrap();
+            let final_cfg = load_config();
+            assert!(!final_cfg.enabled, "account_urls update must never re-enable after reset");
+            assert!(final_cfg.account_urls.is_empty());
         });
     }
 }

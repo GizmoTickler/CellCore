@@ -577,11 +577,31 @@ pub(crate) async fn is_maintenance_pause_active(state: &AppState) -> bool {
     state.quecwatch.read().await.status == "recovering"
 }
 
+/// Combine netlink rmnet liveness with native QMI WDS bearer state so Route10
+/// never receives a false `wan_up=1` after a PDN drop while stale addresses linger.
+pub(crate) fn resolve_native_wan_up(
+    native_mode: bool,
+    wds_connected: bool,
+    netlink_dev: Option<String>,
+    native_uptime: Option<u64>,
+    proc_uptime: u64,
+) -> (u8, u64, String) {
+    if native_mode && !wds_connected {
+        return (0, 0, String::from("none"));
+    }
+    if let Some(dev) = netlink_dev {
+        let up = native_uptime.unwrap_or_else(|| proc_uptime.max(1));
+        return (1, up, dev);
+    }
+    (0, 0, String::from("none"))
+}
+
 pub async fn query_wan_ubus_async() -> (u8, u64, String) {
     let mut wan_up = 0u8;
     let mut wan_uptime = 0u64;
     let mut l3_device = String::from("none");
-    if !crate::dataplane::is_native_mode() {
+    let native_mode = crate::dataplane::is_native_mode();
+    if !native_mode {
         for iface in ["network.interface.wan", "network.interface.wan_v6"] {
             if let Ok(out) = run_cmd("ubus", &["call", iface, "status"], Duration::from_secs(2)).await
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
@@ -600,13 +620,28 @@ pub async fn query_wan_ubus_async() -> (u8, u64, String) {
             }
         }
     }
-    if wan_up == 0
-        && let Ok(Some(dev)) = tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live).await
-    {
-        wan_up = 1;
-        l3_device = dev;
-        wan_uptime = crate::dataplane::native_wan_uptime_secs()
-            .unwrap_or_else(|| read_proc_uptime_secs().max(1));
+    if wan_up == 0 {
+        let wds_connected = crate::dataplane::is_wds_connected();
+        let netlink_dev = if !native_mode || wds_connected {
+            tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let (up, uptime, dev) = resolve_native_wan_up(
+            native_mode,
+            wds_connected,
+            netlink_dev,
+            crate::dataplane::native_wan_uptime_secs(),
+            read_proc_uptime_secs(),
+        );
+        wan_up = up;
+        wan_uptime = uptime;
+        if dev != "none" {
+            l3_device = dev;
+        }
     }
     if l3_device == "none" {
         l3_device = detect_first_up_rmnet();
@@ -1020,5 +1055,29 @@ lte_rsrq_db=\nnr_band=n41\nnr_rsrp_dbm=-101\nnr_sinr_db=9\nnr_rsrq_db=-11\n"
         app.recovery_in_progress
             .store(false, std::sync::atomic::Ordering::Release);
         assert!(!is_maintenance_pause_active(&app).await);
+    }
+
+    #[test]
+    fn native_wan_up_requires_both_netlink_and_wds_connected() {
+        // PDN dropped (WDS disconnected) while stale rmnet IP still lingers -> MUST report wan_up=0!
+        assert_eq!(
+            resolve_native_wan_up(true, false, Some("rmnet_data0".into()), Some(120), 500),
+            (0, 0, "none".into())
+        );
+        // WDS connected but netlink has no IP/UP -> MUST report wan_up=0!
+        assert_eq!(
+            resolve_native_wan_up(true, true, None, Some(120), 500),
+            (0, 0, "none".into())
+        );
+        // Both WDS connected AND netlink UP -> wan_up=1 with native uptime.
+        assert_eq!(
+            resolve_native_wan_up(true, true, Some("rmnet_data1".into()), Some(42), 500),
+            (1, 42, "rmnet_data1".into())
+        );
+        // Coexist mode (native_mode=false) relies on netlink liveness when ubus is absent.
+        assert_eq!(
+            resolve_native_wan_up(false, false, Some("rmnet_data0".into()), None, 500),
+            (1, 500, "rmnet_data0".into())
+        );
     }
 }

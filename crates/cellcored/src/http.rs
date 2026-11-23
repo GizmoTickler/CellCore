@@ -207,6 +207,14 @@ pub struct ConnLimits {
     pub handshake: Duration,
     /// Request headers (incl. on idle keep-alive connections) within this.
     pub header_read: Duration,
+    /// HTTP/2 PING keepalive interval.
+    pub h2_keep_alive_interval: Duration,
+    /// HTTP/2 PING ack timeout before closing dead peers.
+    pub h2_keep_alive_timeout: Duration,
+    /// Maximum time an HTTP/2 connection may sit with zero in-flight requests.
+    pub h2_idle_timeout: Duration,
+    /// Maximum concurrent HTTP/2 streams per connection.
+    pub h2_max_concurrent_streams: u32,
 }
 
 impl Default for ConnLimits {
@@ -218,6 +226,10 @@ impl Default for ConnLimits {
             light_client: 4,
             handshake: Duration::from_secs(10),
             header_read: Duration::from_secs(15),
+            h2_keep_alive_interval: Duration::from_secs(20),
+            h2_keep_alive_timeout: Duration::from_secs(10),
+            h2_idle_timeout: Duration::from_secs(60),
+            h2_max_concurrent_streams: 64,
         }
     }
 }
@@ -302,22 +314,74 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let hyper_io = TokioIo::new(io);
-    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-        req.extensions_mut().insert(ConnectInfo(peer));
-        let mut r = router.clone();
-        async move {
-            let axum_req = req.map(Body::new);
-            r.call(axum_req).await
-        }
-    });
     if h2 {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(crate::state::mono_ms()));
+        struct InFlightGuard {
+            in_flight: Arc<std::sync::atomic::AtomicUsize>,
+            last_activity: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.last_activity
+                    .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
+                self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let in_flight_svc = Arc::clone(&in_flight);
+        let last_act_svc = Arc::clone(&last_activity);
+        let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let mut r = router.clone();
+            in_flight_svc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            last_act_svc.store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
+            let guard = InFlightGuard {
+                in_flight: Arc::clone(&in_flight_svc),
+                last_activity: Arc::clone(&last_act_svc),
+            };
+            async move {
+                let _guard = guard;
+                let axum_req = req.map(Body::new);
+                r.call(axum_req).await
+            }
+        });
         let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
         builder
             .timer(TokioTimer::new())
-            .keep_alive_interval(Some(Duration::from_secs(20)))
-            .keep_alive_timeout(Duration::from_secs(10));
-        let _ = builder.serve_connection(hyper_io, svc).await;
+            .keep_alive_interval(Some(limits.h2_keep_alive_interval))
+            .keep_alive_timeout(limits.h2_keep_alive_timeout)
+            .max_concurrent_streams(limits.h2_max_concurrent_streams);
+        let mut conn = std::pin::pin!(builder.serve_connection(hyper_io, svc));
+        let idle_ms = limits.h2_idle_timeout.as_millis() as u64;
+        let tick_dur = (limits.h2_idle_timeout / 2).clamp(Duration::from_millis(50), Duration::from_secs(5));
+        let mut tick = tokio::time::interval(tick_dur);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = conn.as_mut() => break,
+                _ = tick.tick() => {
+                    if in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+                        && crate::state::mono_ms()
+                            .saturating_sub(last_activity.load(std::sync::atomic::Ordering::Acquire))
+                            >= idle_ms
+                    {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = tokio::time::timeout(Duration::from_secs(2), conn.as_mut()).await;
+                        break;
+                    }
+                }
+            }
+        }
     } else {
+        let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let mut r = router.clone();
+            async move {
+                let axum_req = req.map(Body::new);
+                r.call(axum_req).await
+            }
+        });
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder.timer(TokioTimer::new()).header_read_timeout(limits.header_read);
         let _ = builder.serve_connection(hyper_io, svc).with_upgrades().await;
@@ -427,7 +491,10 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
 
     let public = Router::new()
         .route("/.well-known/acme-challenge/{token}", get(acme_http01_handler))
-        .route("/api/v1/auth/status", get(handlers::get_auth_status))
+        .route(
+            "/api/v1/auth/status",
+            get(handlers::get_auth_status).layer(middleware::from_fn(auth_status_origin_guard)),
+        )
         .route(
             "/api/v1/auth/login",
             post(handlers::post_login).layer(axum::extract::DefaultBodyLimit::max(LOGIN_MAX_BODY)),
@@ -497,7 +564,22 @@ async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, n
         HeaderName::from_static("cross-origin-opener-policy"),
         HeaderValue::from_static("same-origin"),
     );
-    if !path.starts_with("/cgi-bin/luci") {
+    if path.starts_with("/cgi-bin/luci") || path.starts_with("/luci-static/") {
+        headers.insert(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        );
+        headers.insert(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("same-origin"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+            ),
+        );
+    } else {
         headers.insert(
             HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static(
@@ -741,6 +823,9 @@ fn ws_query_token(uri: &Uri) -> Option<String> {
     })
 }
 
+const WS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const WS_MAX_FRAME_SIZE: usize = 64 * 1024;
+
 async fn ws_upgrade_handler(
     State(ctx): State<HttpCtx>,
     headers: axum::http::HeaderMap,
@@ -748,7 +833,9 @@ async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     let token = extract_session_token(&headers).or_else(|| ws_query_token(&uri)).unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_ws_socket(ctx.app, socket, token))
+    ws.max_message_size(WS_MAX_MESSAGE_SIZE)
+        .max_frame_size(WS_MAX_FRAME_SIZE)
+        .on_upgrade(move |socket| handle_ws_socket(ctx.app, socket, token))
 }
 
 /// True while the WebSocket's session is still valid (not logged out,
@@ -1013,7 +1100,55 @@ pub fn same_origin_request(headers: &axum::http::HeaderMap) -> bool {
     same_origin_for(headers, None)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static LUCI_PROXY_ENABLED_TEST_OVERRIDE: bool;
+}
+
+/// Same-origin LuCI reverse proxying is disabled by default to preserve strict
+/// origin isolation between LuCI and the CellCore API/CSRF surface. Operators
+/// who explicitly need legacy LuCI may opt in with `CELLCORE_ENABLE_LUCI_PROXY=1`.
+pub fn luci_proxy_enabled() -> bool {
+    #[cfg(test)]
+    if let Ok(v) = LUCI_PROXY_ENABLED_TEST_OVERRIDE.try_with(|b| *b) {
+        return v;
+    }
+    std::env::var("CELLCORE_ENABLE_LUCI_PROXY")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Block requests to `/api/v1/auth/status` originating from proxied LuCI pages
+/// so even when `CELLCORE_ENABLE_LUCI_PROXY=1` is opted in, LuCI-origin scripts
+/// cannot harvest the CellCore CSRF token.
+async fn auth_status_origin_guard(req: Request, next: Next) -> Response {
+    if let Some(referer) = req.headers().get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        let lower = referer.to_ascii_lowercase();
+        if lower.contains("/cgi-bin/luci") || lower.contains("/luci-static/") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "LuCI origin may not access CellCore auth status"
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 async fn proxy_auth_middleware(State(ctx): State<HttpCtx>, req: Request, next: Next) -> Response {
+    if !luci_proxy_enabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "Same-origin LuCI proxy is disabled by default for origin isolation. Set CELLCORE_ENABLE_LUCI_PROXY=1 to enable."
+            })),
+        )
+            .into_response();
+    }
     let authed = match qm_cookie_token(req.headers()) {
         Some(tok) => ctx.app.auth.validate_token(&tok, true).await.is_some(),
         None => false,
@@ -2014,68 +2149,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn luci_and_ubus_require_a_cellcore_session() {
-        let up = mock_upstream().await;
+    async fn luci_proxy_disabled_by_default() {
         let (router, auth) = test_router();
-        let login = r#"{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":"x"}]}"#;
-        let batch = format!("[{login},{login}]");
-        let dup = r#"{"method":"call","params":["0123456789abcdef0123456789abcdef","uci","get",{}],"params":["00000000000000000000000000000000","session","login",{}]}"#;
-        let nul = r#"{"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root\u0000x","password":"x"}]}"#;
-        const FAKE_LUCI: &[(&str, &str)] = &[("cookie", "sysauth_https=0123456789abcdef0123456789abcdef")];
-        type Case<'a> = (Method, &'a str, &'a [(&'a str, &'a str)], String);
-        let cases: Vec<Case> = vec![
-            (Method::POST, "/ubus", &[], login.to_string()),
-            (Method::POST, "/ubus", &[], batch.clone()),
-            (Method::POST, "/ubus", &[], dup.to_string()),
-            (Method::POST, "/ubus", &[], nul.to_string()),
-            (Method::POST, "/ubus/call/session/login", &[], r#"{"username":"root","password":"x"}"#.into()),
-            (Method::GET, "/ubus/list", &[], String::new()),
-            (Method::GET, "/cgi-bin/luci/?luci_username=root&luci_password=x", &[], String::new()),
-            (Method::POST, "/cgi-bin/luci/", FAKE_LUCI, "luci_username=root&luci_password=x".into()),
-            (Method::PUT, "/cgi-bin/luci/", &[], "luci_password=x".into()),
-            (Method::GET, "/luci-static/bootstrap/cascade.css", &[], String::new()),
-            (Method::POST, "/ubus", &[("authorization", "Bearer 0123456789abcdef0123456789abcdef")], login.to_string()),
-            (Method::POST, "/ubus", &[("cookie", "qm_session=0123456789abcdef0123456789abcdef")], login.to_string()),
-        ];
-        for (m, uri, h, body) in cases {
-            let r = send(&router, m.clone(), uri, h, &body).await;
-            let s = r.status();
-            assert!(
-                s == StatusCode::UNAUTHORIZED || (m == Method::GET && uri.starts_with("/cgi-bin/luci") && s == StatusCode::FOUND),
-                "{m} {uri} -> {s}"
-            );
-        }
-        assert!(up.hits.lock().unwrap().is_empty(), "unauthenticated request reached uhttpd/rpcd");
-
-        // after CellCore login
         let sess = auth.create_session().await.unwrap();
-        let qm = format!("qm_session={}; sysauth_https=abcdef", sess.token);
-        let same_origin: &[(&str, &str)] = &[("cookie", qm.as_str()), ("origin", "https://192.168.224.1")];
-        let r = send(&router, Method::GET, "/luci-static/bootstrap/cascade.css", &[("cookie", qm.as_str())], "").await;
-        assert_eq!(r.status(), StatusCode::OK, "LuCI static assets load after QM login");
-        let r = send(&router, Method::GET, "/cgi-bin/luci/", &[("cookie", qm.as_str())], "").await;
-        assert_eq!(r.status(), StatusCode::OK);
-        let r = send(&router, Method::POST, "/ubus", same_origin, dup).await;
-        assert_eq!(r.status(), StatusCode::OK);
-        // NUL is refused even when authenticated; malformed JSON too
-        assert_eq!(send(&router, Method::POST, "/ubus", same_origin, nul).await.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(send(&router, Method::POST, "/ubus", same_origin, "{\"a\":").await.status(), StatusCode::BAD_REQUEST);
-        // cross-origin state change with a valid cookie: refused
-        let cross: &[(&str, &str)] = &[("cookie", qm.as_str()), ("origin", "https://evil.example")];
-        assert_eq!(send(&router, Method::POST, "/ubus", cross, login).await.status(), StatusCode::FORBIDDEN);
-        let no_origin: &[(&str, &str)] = &[("cookie", qm.as_str())];
-        assert_eq!(send(&router, Method::POST, "/ubus", no_origin, login).await.status(), StatusCode::FORBIDDEN);
+        let qm = format!("qm_session={}", sess.token);
+        for (m, uri) in [
+            (Method::GET, "/cgi-bin/luci"),
+            (Method::GET, "/cgi-bin/luci/"),
+            (Method::GET, "/luci-static/bootstrap/cascade.css"),
+            (Method::POST, "/ubus"),
+        ] {
+            // Unauthenticated
+            let r = send(&router, m.clone(), uri, &[], "").await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "unauth {m} {uri}");
+            // Even authenticated
+            let r = send(&router, m.clone(), uri, &[("cookie", qm.as_str())], "").await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "auth {m} {uri}");
+        }
+    }
 
-        let hits = up.hits.lock().unwrap().clone();
-        assert_eq!(hits.len(), 3, "{hits:?}");
-        // canonical body: rpcd sees the single value we parsed
-        let (path, body, cookie) = &hits[2];
-        assert_eq!(path, "/ubus");
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(v["params"][1], "session");
-        assert_eq!(body.matches("\"params\"").count(), 1);
-        // the CellCore session cookie is not forwarded, LuCI's is
-        assert!(!cookie.contains("qm_session") && cookie.contains("sysauth_https=abcdef"), "{cookie}");
+    #[tokio::test]
+    async fn auth_status_rejects_luci_referer_and_allows_spa() {
+        let (router, auth) = test_router();
+        let sess = auth.create_session().await.unwrap();
+        let qm = format!("qm_session={}", sess.token);
+
+        // Normal CellCore SPA request succeeds and returns csrfToken
+        let ok_resp = send(
+            &router,
+            Method::GET,
+            "/api/v1/auth/status",
+            &[("cookie", qm.as_str()), ("referer", "https://192.168.224.1/")],
+            "",
+        )
+        .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let ok_body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(ok_resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(ok_body["authenticated"], true);
+        assert!(ok_body["csrfToken"].as_str().is_some());
+
+        // Referer from LuCI is refused with 403
+        for bad_ref in [
+            "https://192.168.224.1/cgi-bin/luci",
+            "https://192.168.224.1/cgi-bin/luci/admin/status",
+            "https://192.168.224.1/CGI-BIN/LUCI/",
+            "https://192.168.224.1/luci-static/bootstrap/x.html",
+        ] {
+            let r = send(
+                &router,
+                Method::GET,
+                "/api/v1/auth/status",
+                &[("cookie", qm.as_str()), ("referer", bad_ref)],
+                "",
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "referer={bad_ref}");
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_idle_connection_is_closed_after_idle_timeout() {
+        let limits = ConnLimits {
+            max_conns: 2,
+            max_per_ip: 2,
+            reserved: 0,
+            h2_keep_alive_interval: Duration::from_secs(10),
+            h2_keep_alive_timeout: Duration::from_secs(5),
+            h2_idle_timeout: Duration::from_millis(200),
+            ..ConnLimits::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/ping", get(|| async { "pong" }));
+        let slots = Arc::new(ConnTracker::new(limits));
+        let slots_srv = Arc::clone(&slots);
+        tokio::spawn(accept_loop(listener, slots_srv, move |stream, peer, permit| {
+            let r = router.clone();
+            async move {
+                let _p = permit;
+                serve_connection_with(stream, r, peer, limits, true).await;
+            }
+        }));
+
+        // Connect and send the HTTP/2 client connection preface + empty SETTINGS frame,
+        // then sit idle without sending any requests.
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
+        s.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap(); // empty SETTINGS frame
+
+        // Drain server frames until EOF; the idle watchdog must close the H2 connection.
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = [0u8; 256];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return true,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "idle HTTP/2 connection was not closed after h2_idle_timeout");
+    }
+
+    #[tokio::test]
+    async fn luci_and_ubus_require_a_cellcore_session() {
+        LUCI_PROXY_ENABLED_TEST_OVERRIDE
+            .scope(true, async {
+                let up = mock_upstream().await;
+                let (router, auth) = test_router();
+                let login = r#"{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":"x"}]}"#;
+                let batch = format!("[{login},{login}]");
+                let dup = r#"{"method":"call","params":["0123456789abcdef0123456789abcdef","uci","get",{}],"params":["00000000000000000000000000000000","session","login",{}]}"#;
+                let nul = r#"{"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root\u0000x","password":"x"}]}"#;
+                const FAKE_LUCI: &[(&str, &str)] = &[("cookie", "sysauth_https=0123456789abcdef0123456789abcdef")];
+                type Case<'a> = (Method, &'a str, &'a [(&'a str, &'a str)], String);
+                let cases: Vec<Case> = vec![
+                    (Method::POST, "/ubus", &[], login.to_string()),
+                    (Method::POST, "/ubus", &[], batch.clone()),
+                    (Method::POST, "/ubus", &[], dup.to_string()),
+                    (Method::POST, "/ubus", &[], nul.to_string()),
+                    (Method::POST, "/ubus/call/session/login", &[], r#"{"username":"root","password":"x"}"#.into()),
+                    (Method::GET, "/ubus/list", &[], String::new()),
+                    (Method::GET, "/cgi-bin/luci/?luci_username=root&luci_password=x", &[], String::new()),
+                    (Method::POST, "/cgi-bin/luci/", FAKE_LUCI, "luci_username=root&luci_password=x".into()),
+                    (Method::PUT, "/cgi-bin/luci/", &[], "luci_password=x".into()),
+                    (Method::GET, "/luci-static/bootstrap/cascade.css", &[], String::new()),
+                    (Method::POST, "/ubus", &[("authorization", "Bearer 0123456789abcdef0123456789abcdef")], login.to_string()),
+                    (Method::POST, "/ubus", &[("cookie", "qm_session=0123456789abcdef0123456789abcdef")], login.to_string()),
+                ];
+                for (m, uri, h, body) in cases {
+                    let r = send(&router, m.clone(), uri, h, &body).await;
+                    let s = r.status();
+                    assert!(
+                        s == StatusCode::UNAUTHORIZED || (m == Method::GET && uri.starts_with("/cgi-bin/luci") && s == StatusCode::FOUND),
+                        "{m} {uri} -> {s}"
+                    );
+                }
+                assert!(up.hits.lock().unwrap().is_empty(), "unauthenticated request reached uhttpd/rpcd");
+
+                // after CellCore login
+                let sess = auth.create_session().await.unwrap();
+                let qm = format!("qm_session={}; sysauth_https=abcdef", sess.token);
+                let same_origin: &[(&str, &str)] = &[("cookie", qm.as_str()), ("origin", "https://192.168.224.1")];
+                let r = send(&router, Method::GET, "/luci-static/bootstrap/cascade.css", &[("cookie", qm.as_str())], "").await;
+                assert_eq!(r.status(), StatusCode::OK, "LuCI static assets load after QM login");
+                let r = send(&router, Method::GET, "/cgi-bin/luci/", &[("cookie", qm.as_str())], "").await;
+                assert_eq!(r.status(), StatusCode::OK);
+                assert_eq!(
+                    r.headers().get("x-frame-options").and_then(|v| v.to_str().ok()),
+                    Some("DENY"),
+                    "proxied LuCI responses must enforce X-Frame-Options: DENY"
+                );
+                let csp = r
+                    .headers()
+                    .get("content-security-policy")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert!(
+                    csp.contains("frame-ancestors 'none'") && csp.contains("script-src 'self'"),
+                    "proxied LuCI responses must enforce strict CSP, got: {csp}"
+                );
+                let r = send(&router, Method::POST, "/ubus", same_origin, dup).await;
+                assert_eq!(r.status(), StatusCode::OK);
+                // NUL is refused even when authenticated; malformed JSON too
+                assert_eq!(send(&router, Method::POST, "/ubus", same_origin, nul).await.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(send(&router, Method::POST, "/ubus", same_origin, "{\"a\":").await.status(), StatusCode::BAD_REQUEST);
+                // cross-origin state change with a valid cookie: refused
+                let cross: &[(&str, &str)] = &[("cookie", qm.as_str()), ("origin", "https://evil.example")];
+                assert_eq!(send(&router, Method::POST, "/ubus", cross, login).await.status(), StatusCode::FORBIDDEN);
+                let no_origin: &[(&str, &str)] = &[("cookie", qm.as_str())];
+                assert_eq!(send(&router, Method::POST, "/ubus", no_origin, login).await.status(), StatusCode::FORBIDDEN);
+
+                let hits = up.hits.lock().unwrap().clone();
+                assert_eq!(hits.len(), 3, "{hits:?}");
+                // canonical body: rpcd sees the single value we parsed
+                let (path, body, cookie) = &hits[2];
+                assert_eq!(path, "/ubus");
+                let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(v["params"][1], "session");
+                assert_eq!(body.matches("\"params\"").count(), 1);
+                // the CellCore session cookie is not forwarded, LuCI's is
+                assert!(!cookie.contains("qm_session") && cookie.contains("sysauth_https=abcdef"), "{cookie}");
+            })
+            .await;
     }
 
     #[test]

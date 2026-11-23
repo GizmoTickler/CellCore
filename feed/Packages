@@ -11,19 +11,6 @@ Filename: ookla-speedtest_1.2.0_aarch64_cortex-a53.ipk
 Description: Allows you to test your internet speed with speedtest.net
 
 
-Package: kmod-wireguard
-Depends: sdxpinn-patch
-Version: 1
-Architecture: sdxpinn
-Maintainer: Cameron Thompson iamromulan@github.com
-Source: github.com/iamromulan
-MD5Sum: 98e77b68c2f1b5ff46ef7713b4f63a94
-SHA256sum: fc2f24bfdaf9245ca2809d7a2b20a4bc9a789ab08a835ea54ed84fabfaafd1ac
-Size: 789
-Filename: kmod-wireguard_1_sdxpinn.ipk
-Description: Wireguard is compiled into the kernel
-
-
 Package: tailscale-tiny
 Version: 1.104.7
 Depends: ca-bundle, kmod-tun
@@ -55,18 +42,18 @@ Description: wgcf is an unofficial, cross-platform CLI for Cloudflare Warp
 
 
 Package: sdxpinn-cellcore
-Version: 1.7.0-1
+Version: 1.8.0-1
 Architecture: sdxpinn
 Maintainer: GizmoTickler <gizmotickler@users.noreply.github.com>
 Source: github.com/GizmoTickler/CellCore
-Depends: libc, uci, ubus, uhttpd, ookla-speedtest, msmtp, ca-bundle, ca-certificates
+Depends: libc, uci, ubus, uhttpd, msmtp, ca-bundle, ca-certificates
 Conflicts: sdxpinn-quecmanager, sdxpinn-quecmanager-beta, sdxpinn-console-menu
 Replaces: sdxpinn-quecmanager-beta, sdxpinn-quecmanager, sdxpinn-patch, socat-at-bridge, sdxpinn-console-menu
 Provides: sdxpinn-quecmanager-beta
-MD5Sum: 5cd0c929d8a425de6305ba13a1364c74
-SHA256sum: d9ea545c92bcef89618148e8fbb3d49c5a942ba4fc0405859f1fbf3128a4931e
-Size: 4882858
-Filename: sdxpinn-cellcore_1.7.0-1_sdxpinn.ipk
+MD5Sum: f1a0ca8f3fddfed5a515e47328dac614
+SHA256sum: 2f4613e6efb26842242f6a912e440d0fdb3b60f933a35e23ea283bd23ca9a8ac
+Size: 4944662
+Filename: sdxpinn-cellcore_1.8.0-1_sdxpinn.ipk
 Description: CellCore — static Rust cellular gateway daemon (cellcored) and React 19 UI with native QRTR/QMI data plane for Quectel RM55x SDX75 modems
 
 

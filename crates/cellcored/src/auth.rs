@@ -190,7 +190,7 @@ impl AuthStore {
             .map_err(|_| VerifyError::Busy)?
             .map_err(|_| VerifyError::Busy)?;
         let pw = plain.to_string();
-        let res = tokio::task::spawn_blocking(move || {
+        let res = crate::paths::spawn_blocking(move || {
             let _permit = permit;
             verify(pw)
         })
