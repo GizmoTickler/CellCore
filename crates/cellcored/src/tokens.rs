@@ -682,6 +682,17 @@ mod tests {
         assert!(token_may_access(r, &post, "/api/v1/cellular/bands", None).is_err());
         assert!(token_may_access(r, &del, "/api/v1/cellular/cell-lock", None).is_err());
         assert!(token_may_access(r, &put, "/api/v1/admin/cron", None).is_err());
+        // A/B firmware status is readable; all POST endpoints are strictly forbidden for read tokens.
+        assert!(token_may_access(r, &get, "/api/v1/system/firmware-ab", None).is_ok());
+        for ep in [
+            "/api/v1/system/firmware-ab/inspect",
+            "/api/v1/system/firmware-ab/flash",
+            "/api/v1/system/firmware-ab/switch",
+            "/api/v1/system/firmware-ab/confirm",
+        ] {
+            assert!(token_may_access(r, &post, ep, None).is_err(), "read token must not POST {ep}");
+            assert!(token_may_access(w, &post, ep, None).is_ok(), "rw token may POST {ep}");
+        }
         for p in READ_DENY {
             assert!(token_may_access(r, &get, p, None).is_err(), "{p}");
             assert!(token_may_access(w, &get, p, None).is_ok(), "rw reads {p}");

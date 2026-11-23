@@ -1,13 +1,20 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "../../lib/api";
+import { apiFetch, confirmFirmwareAbSlot, getFirmwareAbStatus, inspectFirmwareAb } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { useWsStore } from "../../stores/ws-store";
 import { useToastStore } from "../../stores/toast-store";
 import { useDraft } from "../../lib/draft";
 
 const DEFAULT_REB_DAYS = ["sunday"];
-import type { ReconcileReport, SystemInternals } from "../../types/cellcore";
+import type {
+  FirmwareAbInspectReport,
+  FirmwareAbScope,
+  FirmwareAbSlot,
+  FirmwareAbStatus,
+  ReconcileReport,
+  SystemInternals,
+} from "../../types/cellcore";
 
 export const SYS_TABS = ["hardware", "internals", "logs", "alerts", "ota", "backup", "security"] as const;
 export type SysTab = (typeof SYS_TABS)[number];
@@ -116,6 +123,15 @@ export function useSystemController(tab: SysTab) {
 
   const [reconcileOutput, setReconcileOutput] = useState<ReconcileReport | null>(null);
 
+  // A/B Zero-USB Modem Firmware state
+  const [abPath, setAbPath] = useState("");
+  const [abScope, setAbScope] = useState<FirmwareAbScope>("rootfs");
+  const [abPreserveCellcore, setAbPreserveCellcore] = useState(true);
+  const [abVerifyReadback, setAbVerifyReadback] = useState(true);
+  const [abActivateReboot, setAbActivateReboot] = useState(false);
+  const [abInspect, setAbInspect] = useState<FirmwareAbInspectReport | null>(null);
+  const [abPolling, setAbPolling] = useState(false);
+
   const modem = useWsStore((s) => s.modem);
   const settings = useWsStore((s) => s.settings);
   const internalsStore = useWsStore((s) => s.internals);
@@ -162,6 +178,26 @@ export function useSystemController(tab: SysTab) {
       pushToast("Upgrade failed", "error", d.upgrade.message ?? "See the installer log below.");
     }
   }, [pkgInfoQuery.data, otaWatch, pushToast]);
+
+  const firmwareAbQuery = useQuery<FirmwareAbStatus>({
+    queryKey: ["firmware-ab"],
+    queryFn: getFirmwareAbStatus,
+    enabled: tab === "ota" || abPolling,
+    refetchInterval: (query) => (abPolling || query.state.data?.job?.running ? 2000 : false),
+  });
+
+  useEffect(() => {
+    const j = firmwareAbQuery.data?.job;
+    if (!abPolling || !j) return;
+    if (!j.running && j.finishedAt != null) {
+      setAbPolling(false);
+      if (j.ok === true) {
+        notify("ok", j.dryRun ? "A/B firmware dry-run passed cleanly" : "A/B firmware flash completed cleanly");
+      } else if (j.ok === false) {
+        notify("err", j.error || "A/B firmware flash failed");
+      }
+    }
+  }, [firmwareAbQuery.data, abPolling]);
 
   const maintQuery = useQuery({
     queryKey: ["sys-maintenance"],
@@ -448,6 +484,96 @@ export function useSystemController(tab: SysTab) {
     }
   }
 
+  async function inspectAbPackage() {
+    const trimmed = abPath.trim();
+    if (!trimmed) {
+      notify("err", "Enter the path to a firmware .zip or unpacked directory on the modem");
+      return;
+    }
+    setBusy("ab-inspect");
+    try {
+      const report = await inspectFirmwareAb({ path: trimmed, scope: abScope });
+      setAbInspect(report);
+      notify("ok", `Planned ${report.plan.partitions.length} inactive-slot partitions (${report.plan.targetSlot})`);
+    } catch (e) {
+      setAbInspect(null);
+      notify("err", e instanceof Error ? e.message : "Package inspection failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function startAbFlash(dryRun: boolean) {
+    const trimmed = abPath.trim();
+    if (!trimmed) {
+      notify("err", "Enter a firmware package path first");
+      return;
+    }
+    setBusy(dryRun ? "ab-dryrun" : "ab-flash");
+    try {
+      const payload = {
+        path: trimmed,
+        scope: abScope,
+        dryRun,
+        preserveCellcore: abPreserveCellcore,
+        verifyReadback: abVerifyReadback,
+        activateSlot: !dryRun && abActivateReboot,
+        reboot: !dryRun && abActivateReboot,
+      };
+      if (!dryRun && abActivateReboot) {
+        await disruptiveFetch(
+          "A/B firmware flash & reboot",
+          "/api/v1/system/firmware-ab/flash",
+          { method: "POST", body: JSON.stringify(payload) },
+          { confirmed: true }
+        );
+      } else {
+        await apiFetch("/api/v1/system/firmware-ab/flash", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+      }
+      setAbPolling(true);
+      await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
+      notify("ok", dryRun ? "Started A/B firmware dry-run" : "Started inactive-slot A/B firmware flash");
+    } catch (e) {
+      if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Failed starting A/B flash");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function switchAbSlot(slot: FirmwareAbSlot, reboot: boolean) {
+    setBusy("ab-switch");
+    try {
+      await disruptiveFetch(
+        `Switch boot slot to ${slot}`,
+        "/api/v1/system/firmware-ab/switch",
+        { method: "POST", body: JSON.stringify({ slot, reboot }) },
+        { confirmed: true }
+      );
+      await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
+      notify("ok", reboot ? `Switching to slot ${slot} and rebooting…` : `Next boot slot set to ${slot}`);
+    } catch (e) {
+      if (!isCancelled(e)) notify("err", e instanceof Error ? e.message : "Slot switch failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function confirmAbSlot() {
+    setBusy("ab-confirm");
+    try {
+      await confirmFirmwareAbSlot();
+      await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
+      notify("ok", "Current boot slot confirmed as successful");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Slot confirmation failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const useFahrenheit = settings?.temperatureUnit === "fahrenheit";
   const fmtTemp = (c: number) => (useFahrenheit ? `${Math.round(((c * 9) / 5 + 32) * 10) / 10} °F` : `${c} °C`);
 
@@ -527,6 +653,24 @@ export function useSystemController(tab: SysTab) {
     checkOtaFeed,
     otaWatch,
     upgradePackage,
+    // firmware a/b
+    firmwareAbQuery,
+    abPath,
+    setAbPath,
+    abScope,
+    setAbScope,
+    abPreserveCellcore,
+    setAbPreserveCellcore,
+    abVerifyReadback,
+    setAbVerifyReadback,
+    abActivateReboot,
+    setAbActivateReboot,
+    abInspect,
+    setAbInspect,
+    inspectAbPackage,
+    startAbFlash,
+    switchAbSlot,
+    confirmAbSlot,
     // security
     oldPassword,
     setOldPassword,

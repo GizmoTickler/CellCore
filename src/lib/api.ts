@@ -1,6 +1,13 @@
 import { useAuthStore } from "@/stores/auth-store";
 import { useWsStore } from "@/stores/ws-store";
-import type { AtCommandItem } from "@/types/cellcore";
+import type {
+  AtCommandItem,
+  FirmwareAbFlashRequest,
+  FirmwareAbInspectReport,
+  FirmwareAbScope,
+  FirmwareAbStatus,
+  FirmwareAbSwitchRequest,
+} from "@/types/cellcore";
 
 export class ApiError extends Error {
   status: number;
@@ -93,4 +100,50 @@ export async function sendAtCommand(command: string, timeoutSecs = 12, confirm =
 
 export async function classifyAtCommand(command: string): Promise<AtClassification> {
   return apiFetch<AtClassification>(`/api/v1/modem/at/classify?command=${encodeURIComponent(command)}`);
+}
+
+export async function getFirmwareAbStatus(): Promise<FirmwareAbStatus> {
+  return apiFetch<FirmwareAbStatus>("/api/v1/system/firmware-ab");
+}
+
+export async function inspectFirmwareAb(params: {
+  path: string;
+  scope?: FirmwareAbScope;
+  allowProjectMismatch?: boolean;
+  allowNoManifest?: boolean;
+}): Promise<FirmwareAbInspectReport> {
+  return apiFetch<FirmwareAbInspectReport>("/api/v1/system/firmware-ab/inspect", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export async function flashFirmwareAb(body: FirmwareAbFlashRequest): Promise<{
+  ok: boolean;
+  started: boolean;
+  status: string;
+  targetSlot: string;
+  partitions: number;
+}> {
+  return apiFetch("/api/v1/system/firmware-ab/flash", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function switchFirmwareAbSlot(body: FirmwareAbSwitchRequest): Promise<{
+  ok: boolean;
+  rebooting: boolean;
+}> {
+  return apiFetch("/api/v1/system/firmware-ab/switch", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function confirmFirmwareAbSlot(): Promise<{ ok: boolean }> {
+  return apiFetch("/api/v1/system/firmware-ab/confirm", {
+    method: "POST",
+    body: "{}",
+  });
 }

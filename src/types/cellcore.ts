@@ -554,3 +554,111 @@ export interface WsStoreState {
   dismissAlert: (index: number) => void;
   clearAlerts: () => void;
 }
+
+export type FirmwareAbSlot = "_a" | "_b";
+export type FirmwareAbScope = "rootfs" | "baseband" | "full";
+
+export interface FirmwareAbRciInfo {
+  selectedSet?: number | null;
+  trialBootEnable?: number | null;
+  trialBootMaxAttempts?: number | null;
+  trialBootFailedAttempts?: number | null;
+  imageSetToBoot?: number | null;
+  raw?: string;
+}
+
+export interface FirmwareAbPersistedState {
+  status: string;
+  lastFlashTs?: number | null;
+  previousSlot?: FirmwareAbSlot | null;
+  targetSlot?: FirmwareAbSlot | null;
+  scope?: FirmwareAbScope | null;
+  sourceName?: string | null;
+  projectName?: string | null;
+  partitionsFlashed: string[];
+  verifiedOnBoot: boolean;
+  message?: string | null;
+  log: string[];
+}
+
+export interface FirmwareAbJobProgress {
+  running: boolean;
+  dryRun: boolean;
+  phase: string;
+  currentPartition?: string | null;
+  completed: number;
+  total: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  ok?: boolean | null;
+  error?: string | null;
+  log: string[];
+}
+
+export interface FirmwareAbStatus {
+  supported: boolean;
+  unsupportedReason?: string | null;
+  totalMtds: number;
+  abBaseCount: number;
+  activeSlot?: FirmwareAbSlot | null;
+  inactiveSlot?: FirmwareAbSlot | null;
+  slotAUnbootable?: boolean | null;
+  slotBUnbootable?: boolean | null;
+  trialBootActive?: boolean | null;
+  rci?: FirmwareAbRciInfo | null;
+  projectName?: string | null;
+  projectRev?: string | null;
+  tmpAvailMib?: number | null;
+  job: FirmwareAbJobProgress;
+  lastState: FirmwareAbPersistedState;
+}
+
+export interface FirmwareAbPlannedPartition {
+  baseLabel: string;
+  targetPartition: string;
+  mtdNum: number;
+  mtdSize: number;
+  erasesize: number;
+  zipRelpath: string;
+  expectedMd5?: string | null;
+  isUbi: boolean;
+  fileSize?: number | null;
+}
+
+export interface FirmwareAbFlashPlan {
+  activeSlot: FirmwareAbSlot;
+  targetSlot: FirmwareAbSlot;
+  scope: FirmwareAbScope;
+  projectName?: string | null;
+  deviceProjectName?: string | null;
+  deviceProjectRev?: string | null;
+  partitions: FirmwareAbPlannedPartition[];
+  warnings: string[];
+}
+
+export interface FirmwareAbInspectReport {
+  sourcePath: string;
+  sourceKind: string;
+  rawprogramFile: string;
+  md5Entries: number;
+  tmpAvailMib?: number | null;
+  tmpSpaceOk: boolean;
+  plan: FirmwareAbFlashPlan;
+}
+
+export interface FirmwareAbFlashRequest {
+  path: string;
+  scope?: FirmwareAbScope;
+  dryRun?: boolean;
+  preserveCellcore?: boolean;
+  verifyReadback?: boolean;
+  activateSlot?: boolean;
+  reboot?: boolean;
+  allowProjectMismatch?: boolean;
+  allowNoManifest?: boolean;
+}
+
+export interface FirmwareAbSwitchRequest {
+  slot?: FirmwareAbSlot;
+  reboot?: boolean;
+}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.0 — Zero-USB Native A/B Firmware Flasher & Clean-Room USB Provisioning CLI
+
+- **Native Zero-USB Inactive-Slot A/B Firmware Flasher (`crates/cellcored/src/firmware_ab.rs`, `cli.rs`, `http.rs`, `main.rs`, `tokens.rs`, `obs/failover.rs`, `OtaView.tsx`):**
+  - Added full dual-slot NAND (`R02A02+`, 58-partition `/proc/mtd`) firmware inspection, streaming single-image extraction & MD5/SHA-256 verification, and flashing strictly into the **inactive** `_a`/`_b` slot (`rootfs`, `baseband`, or `full` scope) over PoE Ethernet — zero USB needed after initial `R02A02+` migration.
+  - Hard-blocks all 14 non-A/B calibration/identity/user partitions (`mibib`, `efs2`, `usrdata`, `misc`, `recoveryinfo`, etc.), active-slot partitions, and any UBI-attached MTD; verifies UBI attachability (`ubiformat` + `ubiattach`/`ubinfo`) for `.ubi` images and SHA-256 read-back (`nanddump`/`mtdimg`) for raw MTD images.
+  - Automatically injects clean-room `S03cellcore-overlay` + `S13cellcore-overlay-rw` hooks and stages `/usrdata/bin/cellcored` when flashing a stock read-only Quectel `sysfs.ubi`, preserving CellCore, SSH keys, and configuration across stock firmware updates.
+  - Integrates with Qualcomm `/sbin/abctl` hardware trial-boot (`set_active`, `set_success` auto-confirm on healthy boot, `get_unbootable`, RCI status) and 1-command / 1-click slot switching & rollback without ever marking the previous slot unbootable.
+  - Added `cellctl firmware-flash` (`status`, `inspect`, `flash`, `switch`, `rollback`, `confirm`), `/api/v1/system/firmware-ab/*` HTTP endpoints (protected by read-token deny & failover guard), and the **A/B Modem Firmware (Zero-USB)** panel in `System → Updates`.
+- **Clean-Room USB Flash & Full Provisioning CLI (`scripts/flash-modem.sh`, `bootstrap.sh`, `docs/FLASHING.md`, `docs/BOOTSTRAP.md`):**
+  - Added `scripts/flash-modem.sh` (`doctor`, `inspect-xqcn`, `verify-firmware`, `backup`, `flash`) replacing external flashing scripts with one fail-closed CLI: verifies `md5.txt` before touching the modem, enforces mandatory `>= 1 MiB` `.xqcn` + `.tar` EFS backup with embedded NV 550 BCD IMEI decoding & Luhn verification, supports 1-stage and 2-stage factory→target `QFirehose` flashing, validates IMEI on restore, and hands off directly to `bootstrap.sh`.
+  - Enhanced `bootstrap.sh` with `--auto-overlay`, fail-closed `--config-bundle <tar.gz>` (path/symlink/allowlist validation + remote SHA-256), `--lan-ip`, `--hostname`, `--at-baseline`, `--mbn`, `--lan-gw-ip`, `--root-shadow`, and `--lockdown`, plus a 47-test offline suite (`scripts/tests/test-flash-and-bootstrap.sh`).
+
 ## 1.8.0 — Independent Security, Failover-Reliability & Daemon-Stability Hardening
 
 - **Supply Chain, Backup & Access Hardening (`bootstrap.sh`, `scripts/release.sh`, `ota.rs`, `admin/backup.rs`, `http.rs`, `tokens.rs`, `handlers.rs`, `atguard.rs`, `vpn/cloudflared.rs`, `vpn/warp.rs`):**

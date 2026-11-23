@@ -6,6 +6,7 @@ mod audit;
 mod auth;
 mod cli;
 mod dataplane;
+mod firmware_ab;
 mod handlers;
 mod hardening;
 mod http;
@@ -207,6 +208,10 @@ fn main() {
             let code = overlay::run_cli(&args[2..]);
             process::exit(code);
         }
+        Some("firmware-flash") => {
+            let code = firmware_ab::run_cli(&args[2..]);
+            process::exit(code);
+        }
         Some("acme") => {
             let code = acme::run_cli(&args[2..]);
             process::exit(code);
@@ -366,6 +371,7 @@ async fn async_main() {
         sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spn_cache: Arc::new(RwLock::new((String::new(), String::new(), String::new()))),
+        ab_flash: Arc::new(firmware_ab::AbFlashState::new()),
     };
     state.audit.spawn_flusher();
 
@@ -374,6 +380,7 @@ async fn async_main() {
     vpn::start(&state);
     dataplane::start(&state);
     acme::spawn_renewal_task();
+    firmware_ab::spawn_boot_auto_confirm(state.clone());
     hardening::spawn_dropbear_boot_watchdog(state.clone());
     spawn_background_tasks(state.clone(), rf_refresh_rx);
     spawn_liveness_watchdog(&state);
@@ -421,7 +428,7 @@ mod tests {
 
     #[test]
     fn crate_version_matches_package() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.8.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.9.0");
     }
 
     #[test]

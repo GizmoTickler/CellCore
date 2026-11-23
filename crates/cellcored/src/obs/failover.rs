@@ -506,6 +506,8 @@ pub fn disruptive_action(method: &Method, path: &str) -> Option<&'static str> {
     match (m, path) {
         ("POST", "/api/v1/cellular/scan") => Some("cell scan (QSCAN)"),
         ("POST", "/api/v1/system/ota") => Some("OTA upgrade"),
+        ("POST", "/api/v1/system/firmware-ab/switch") => Some("A/B slot switch"),
+        ("POST", "/api/v1/system/firmware-ab/flash") => Some("A/B firmware flash & reboot"),
         ("POST", "/api/v1/speedtest/start") => Some("speedtest"),
         ("POST", "/api/v1/cellular/bands") => Some("band lock"),
         ("POST", "/api/v1/cellular/mode") => Some("network mode change"),
@@ -545,6 +547,13 @@ pub fn guard_verdict(active: bool, action: Option<&str>, path: &str, body: &serd
         return GuardVerdict::Pass;
     };
     if path == "/api/v1/system/ota" && body.get("action").and_then(|a| a.as_str()) != Some("upgrade") {
+        return GuardVerdict::Pass;
+    }
+    // Flashing the inactive A/B slot without rebooting (or dry-run) does not interrupt active traffic.
+    if path == "/api/v1/system/firmware-ab/flash"
+        && (body.get("dryRun").and_then(|v| v.as_bool()) == Some(true)
+            || body.get("reboot").and_then(|v| v.as_bool()) != Some(true))
+    {
         return GuardVerdict::Pass;
     }
     // Only the exit node moves traffic among the Tailscale settings.
@@ -750,6 +759,17 @@ mod tests {
         let up = serde_json::json!({ "action": "upgrade" });
         assert_eq!(guard_verdict(true, ota, "/api/v1/system/ota", &check, None), GuardVerdict::Pass);
         assert_eq!(guard_verdict(true, ota, "/api/v1/system/ota", &up, None), GuardVerdict::Block);
+        // A/B firmware switch is gated while active; flash is only gated when reboot:true and not dryRun
+        let ab_sw = disruptive_action(&Method::POST, "/api/v1/system/firmware-ab/switch");
+        assert!(ab_sw.is_some());
+        assert_eq!(guard_verdict(true, ab_sw, "/api/v1/system/firmware-ab/switch", &serde_json::json!({"reboot":true}), None), GuardVerdict::Block);
+        assert_eq!(guard_verdict(true, ab_sw, "/api/v1/system/firmware-ab/switch", &serde_json::json!({"reboot":true,"force":true}), None), GuardVerdict::Forced);
+        let ab_fl = disruptive_action(&Method::POST, "/api/v1/system/firmware-ab/flash");
+        assert!(ab_fl.is_some());
+        assert_eq!(guard_verdict(true, ab_fl, "/api/v1/system/firmware-ab/flash", &serde_json::json!({"path":"/tmp/fw.zip","dryRun":true,"reboot":true}), None), GuardVerdict::Pass);
+        assert_eq!(guard_verdict(true, ab_fl, "/api/v1/system/firmware-ab/flash", &serde_json::json!({"path":"/tmp/fw.zip","activateSlot":false,"reboot":false}), None), GuardVerdict::Pass);
+        assert_eq!(guard_verdict(true, ab_fl, "/api/v1/system/firmware-ab/flash", &serde_json::json!({"path":"/tmp/fw.zip","activateSlot":true,"reboot":true}), None), GuardVerdict::Block);
+        assert_eq!(guard_verdict(true, ab_fl, "/api/v1/system/firmware-ab/flash", &serde_json::json!({"path":"/tmp/fw.zip","activateSlot":true,"reboot":true,"force":true}), None), GuardVerdict::Forced);
         // reads and unrelated writes are never gated
         assert!(disruptive_action(&Method::GET, "/api/v1/cellular/scan").is_none());
         assert!(disruptive_action(&Method::POST, "/api/v1/modem/refresh").is_none());

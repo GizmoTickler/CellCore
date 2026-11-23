@@ -417,6 +417,7 @@ pub fn run_cellctl(args: &[String]) -> i32 {
             0
         }
         "overlay" => crate::overlay::run_cli(&args[1..]),
+        "firmware-flash" => crate::firmware_ab::run_cli(&args[1..]),
         "reconcile" => {
             if let Ok(resp) = call_daemon_sync(&IpcRequest::Reconcile)
                 && resp.ok
@@ -505,7 +506,7 @@ pub fn run_cellctl(args: &[String]) -> i32 {
         "security" => crate::hardening::run_cli(&args[1..]),
         "dataplane-restore" => crate::dataplane::run_dataplane_restore_cli(),
         _ => {
-            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|dataplane-restore|verify [--expect-wan 0|1]|upgrade [--check|--yes]|acme <status|config|issue|reset>|security <audit|harden>|overlay <status|pivot|remount-rw|revert>|speedtest|lan>");
+            eprintln!("Usage: cellctl <status|at <CMD>|reconcile|dataplane-restore|verify [--expect-wan 0|1]|upgrade [--check|--yes]|acme <status|config|issue|reset>|security <audit|harden>|overlay <status|pivot|remount-rw|revert>|firmware-flash <status|inspect|flash|switch|rollback|confirm>|speedtest|lan>");
             2
         }
     }

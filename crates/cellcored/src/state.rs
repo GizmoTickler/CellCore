@@ -656,6 +656,8 @@ pub struct AppState {
     pub sched_boot_checked: Arc<std::sync::atomic::AtomicBool>,
     /// Cached `(mcc, mnc, spn)` for `AT+QSPN` chatter avoidance when PLMN is unchanged.
     pub spn_cache: Arc<RwLock<(String, String, String)>>,
+    /// Native zero-USB inactive-slot A/B firmware flasher state and exclusive lock.
+    pub ab_flash: Arc<crate::firmware_ab::AbFlashState>,
 }
 
 impl AppState {
@@ -734,6 +736,7 @@ impl AppState {
             sim_switched_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spn_cache: Default::default(),
+            ab_flash: Arc::new(crate::firmware_ab::AbFlashState::new()),
         }
     }
 
