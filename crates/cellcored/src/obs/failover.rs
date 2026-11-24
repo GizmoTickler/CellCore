@@ -140,6 +140,14 @@ impl ThroughputDetector {
         }
         self.active
     }
+
+    /// Freeze sustain/release timers while local self-traffic (speedtest) is
+    /// running so an active failover episode is never prematurely released and
+    /// an idle link never accumulates sustain time from test traffic.
+    pub fn freeze(&mut self) {
+        self.above_since = None;
+        self.below_since = None;
+    }
 }
 
 /// Combine the hint and the throughput detector. A fresh hint (monotonic TTL) wins.
@@ -213,6 +221,7 @@ impl FailoverRuntime {
     }
 
     /// One second of input. Pure apart from the struct itself.
+    #[cfg(test)]
     pub fn tick(
         &mut self,
         now: u64,
@@ -221,8 +230,29 @@ impl FailoverRuntime {
         bytes: u64,
         cfg: &FailoverConfig,
     ) -> Option<Transition> {
-        let tp = self.throughput.tick(mono_now, bps, cfg);
-        self.apply_decision(tp, now, mono_now, bytes, cfg)
+        self.tick_with_self_traffic(now, mono_now, bps, bytes, false, cfg)
+    }
+
+    /// One second of input with awareness of local self-generated speedtest traffic.
+    /// When `speedtest_active` is true, throughput activation and release transitions
+    /// are frozen (preserving any active episode) while explicit Route10 `Role` hints
+    /// are still honored immediately.
+    pub fn tick_with_self_traffic(
+        &mut self,
+        now: u64,
+        mono_now: Instant,
+        bps: u64,
+        bytes: u64,
+        speedtest_active: bool,
+        cfg: &FailoverConfig,
+    ) -> Option<Transition> {
+        let (tp, counted_bytes) = if speedtest_active {
+            self.throughput.freeze();
+            (self.throughput.active, 0)
+        } else {
+            (self.throughput.tick(mono_now, bps, cfg), bytes)
+        };
+        self.apply_decision(tp, now, mono_now, counted_bytes, cfg)
     }
 
     pub fn apply_decision(
@@ -326,12 +356,18 @@ fn emit_transition(tr: Transition) {
 }
 
 /// Called every second by the obs loop.
+#[allow(dead_code)]
 pub fn on_tick(now: u64, bps: u64, bytes: u64) {
+    on_tick_with_self_traffic(now, bps, bytes, false);
+}
+
+/// Called every second by the obs loop with lock-free self-traffic awareness.
+pub fn on_tick_with_self_traffic(now: u64, bps: u64, bytes: u64, speedtest_active: bool) {
     let mono_now = Instant::now();
     let cfg = lock(&obs().config).failover.clone();
     let tr = {
         let mut f = lock(&obs().failover);
-        let tr = f.tick(now, mono_now, bps, bytes, &cfg);
+        let tr = f.tick_with_self_traffic(now, mono_now, bps, bytes, speedtest_active, &cfg);
         ACTIVE.store(f.active, Ordering::Relaxed);
         tr
     };
@@ -477,6 +513,26 @@ pub async fn check_deferred_reboot(state: &AppState, now: u64) {
             );
         }
         DeferredReboot::Run => {
+            if state.ab_flash.job.read().await.running {
+                state.push_daemon_log(
+                    "Deferred scheduled reboot delayed: A/B NAND firmware flash is in progress",
+                );
+                return;
+            }
+            let uptime = crate::profiles::read_proc_uptime_secs();
+            let last_persisted = crate::profiles::read_last_scheduled_reboot_min();
+            if let Err(reason) =
+                crate::profiles::should_allow_scheduled_reboot(now, uptime, last_persisted)
+            {
+                state.push_daemon_log(format!("Deferred scheduled reboot held: {reason}"));
+                return;
+            }
+            if let Err(e) = crate::profiles::persist_last_scheduled_reboot_min(now / 60) {
+                state.push_daemon_log(format!(
+                    "Deferred scheduled reboot aborted: failed to persist last_scheduled_reboot_min: {e}"
+                ));
+                return;
+            }
             lock(&obs().persisted).deferred_reboot_at = None;
             lock(&obs().failover).deferred_reboot_mono_ms = None;
             obs().mark_state_dirty();
@@ -592,7 +648,9 @@ pub async fn guard_middleware(req: Request, next: Next) -> Response {
                 .into_response();
         }
     };
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let mut parts = parts;
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let mut forward_body = Body::from(bytes);
     match guard_verdict(true, action, &path, &json, query.as_deref()) {
         GuardVerdict::Pass => {}
         GuardVerdict::Forced => {
@@ -603,6 +661,21 @@ pub async fn guard_middleware(req: Request, next: Next) -> Response {
                 format!("{what} forced while carrying failover traffic"),
                 serde_json::json!({ "action": what, "path": path }),
             );
+            // Strip `force` from JSON object bodies before forwarding so downstream
+            // handlers using `#[serde(deny_unknown_fields)]` never reject forced calls.
+            if let Some(map) = json.as_object_mut()
+                && map.remove("force").is_some()
+                && let Ok(rewritten) = serde_json::to_vec(&json)
+            {
+                if parts.headers.contains_key(axum::http::header::CONTENT_LENGTH)
+                    && let Ok(val) = axum::http::HeaderValue::from_str(&rewritten.len().to_string())
+                {
+                    parts.headers.insert(axum::http::header::CONTENT_LENGTH, val);
+                } else {
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                }
+                forward_body = Body::from(rewritten);
+            }
         }
         GuardVerdict::Block => {
             return (
@@ -620,7 +693,7 @@ pub async fn guard_middleware(req: Request, next: Next) -> Response {
                 .into_response();
         }
     }
-    next.run(Request::from_parts(parts, Body::from(bytes))).await
+    next.run(Request::from_parts(parts, forward_body)).await
 }
 
 #[cfg(test)]
@@ -804,8 +877,13 @@ mod tests {
         }
     }
 
+    static GLOBAL_ACTIVE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
     #[test]
     fn set_hint_updates_failover_active_synchronously() {
+        let _test_guard = GLOBAL_ACTIVE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .blocking_lock();
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -829,5 +907,95 @@ mod tests {
         assert!(out2.contains("role=standby"), "{out2}");
         assert!(!is_active(), "is_active must reflect standby hint immediately");
         assert_eq!(status_json()["active"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn guard_middleware_strips_force_for_deny_unknown_fields_handlers() {
+        use axum::{Router, routing::post};
+        use tower::ServiceExt;
+
+        let _test_guard = GLOBAL_ACTIVE_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictPayload {
+            bands: String,
+        }
+
+        async fn strict_handler(Json(p): Json<StrictPayload>) -> impl IntoResponse {
+            (StatusCode::OK, Json(serde_json::json!({ "bands": p.bands })))
+        }
+
+        struct ActiveReset;
+        impl Drop for ActiveReset {
+            fn drop(&mut self) {
+                ACTIVE.store(false, Ordering::Relaxed);
+            }
+        }
+        let _reset = ActiveReset;
+        ACTIVE.store(true, Ordering::Relaxed);
+
+        let app = Router::new()
+            .route("/api/v1/cellular/bands", post(strict_handler))
+            .route_layer(axum::middleware::from_fn(guard_middleware));
+
+        // Without force -> 409 Conflict
+        let req_block = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/cellular/bands")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"bands":"2:66"}"#))
+            .unwrap();
+        let resp_block = app.clone().oneshot(req_block).await.unwrap();
+        assert_eq!(resp_block.status(), StatusCode::CONFLICT);
+
+        // With force:true -> guard strips `force` so `deny_unknown_fields` handler succeeds (200 OK)!
+        let req_force = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/cellular/bands")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"bands":"2:66","force":true}"#))
+            .unwrap();
+        let resp_force = app.oneshot(req_force).await.unwrap();
+        assert_eq!(resp_force.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp_force.into_body(), 4096).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["bands"], "2:66");
+    }
+
+    #[test]
+    fn speedtest_self_traffic_freezes_active_failover_but_honors_route10_hints() {
+        let c = cfg();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut f = FailoverRuntime::default();
+
+        // Drive throughput detector active via sustained production traffic.
+        for t in 0..45 {
+            f.tick_with_self_traffic(t, at(t), 5_000, 5_000, false, &c);
+        }
+        assert!(f.active, "failover should be active after sustained traffic");
+        let bytes_before = f.episode.as_ref().unwrap().bytes;
+
+        // Run a local speedtest for longer than release_secs (120 s > 60 s):
+        // failover MUST remain active and speedtest bytes MUST NOT inflate episode bytes.
+        for t in 45..165 {
+            assert_eq!(
+                f.tick_with_self_traffic(t, at(t), 0, 100_000, true, &c),
+                None,
+                "speedtest must freeze failover without releasing at t={t}"
+            );
+            assert!(f.active);
+        }
+        assert_eq!(f.episode.as_ref().unwrap().bytes, bytes_before);
+
+        // An explicit Route10 Standby hint MUST still end the episode even while speedtest is active!
+        f.hint = Some((Role::Standby, at(165)));
+        let tr = f.tick_with_self_traffic(165, at(165), 0, 100_000, true, &c);
+        assert!(matches!(tr, Some(Transition::Ended(_))));
+        assert!(!f.active);
     }
 }

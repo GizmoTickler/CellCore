@@ -45,6 +45,10 @@ const MOVE_MOUNTS: &[&str] = &[
     "/persist",
 ];
 
+/// Optional platform mounts whose move failure warns instead of aborting the pivot.
+/// Critical mounts (`/proc`, `/sys`, `/dev`, `/tmp`, `/usrdata`, `/etc`, etc.) remain fail-closed.
+const OPTIONAL_MOVE_MOUNTS: &[&str] = &["/cache", "/persist", "/systemrw"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MountEntry {
     pub source: String,
@@ -375,6 +379,10 @@ where
         let src = format!("{REAL_ROOTFS}{target}");
         if let Err(e) = mover(&src, target) {
             let msg = format!("mount --move {src} -> {target} failed: {e}");
+            if OPTIONAL_MOVE_MOUNTS.contains(&target) {
+                log_line(&format!("warn: optional {msg}; continuing"));
+                continue;
+            }
             log_line(&format!("error: {msg}"));
             return Err(msg);
         }
@@ -580,6 +588,9 @@ pub fn run_pivot(dry_run: bool) -> Result<(), String> {
 
     if let Err(e) = sys_pivot_root(NEW_ROOTFS, &put_old) {
         let _ = sys_umount_detach(NEW_ROOTFS);
+        if remounted_base_rw {
+            let _ = sys_mount(None, "/", None, libc::MS_REMOUNT | libc::MS_RDONLY, None);
+        }
         return Err(e);
     }
 
@@ -882,6 +893,21 @@ overlay /etc overlay rw,relatime 0 0
         .unwrap_err();
         assert!(err.contains("mount --move /real_rootfs/sys -> /sys failed: EBUSY"), "{err}");
         assert_eq!(seen.len(), 2, "must stop immediately on first failed move");
+    }
+
+    #[test]
+    fn move_mounts_treats_optional_platform_mounts_as_best_effort() {
+        let mut seen = Vec::new();
+        move_mounts_with(&["/proc", "/cache", "/persist", "/systemrw", "/etc"], |src, tgt| {
+            seen.push((src.to_string(), tgt.to_string()));
+            if matches!(tgt, "/cache" | "/persist" | "/systemrw") {
+                Err("ENOENT".into())
+            } else {
+                Ok(())
+            }
+        })
+        .expect("optional mount move failures should warn and continue");
+        assert_eq!(seen.len(), 5);
     }
 
     #[test]

@@ -162,7 +162,7 @@ pub struct RadioTuningState {
     pub nr5g_pref_freq_list: Vec<String>,
     pub nr5g_earfcn_lock: Vec<String>,
     pub event_a3_enabled: Option<bool>,
-    pub event_a3_offset: Option<u8>,
+    pub event_a3_offset: Option<i8>,
     pub sim_slot: Option<u8>,
     pub sim_det_enabled: Option<bool>,
 }
@@ -254,7 +254,7 @@ pub struct RadioTuningPatch {
     #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
     pub nr5g_earfcn_lock: Option<Vec<String>>,
     pub event_a3_enabled: Option<bool>,
-    pub event_a3_offset: Option<u8>,
+    pub event_a3_offset: Option<i8>,
     pub sim_slot: Option<u8>,
 }
 
@@ -282,7 +282,7 @@ pub struct RadioTuningHttpPatch {
     #[serde(default, deserialize_with = "deserialize_opt_arfcn_list")]
     pub nr5g_earfcn_lock: Option<Vec<String>>,
     pub event_a3_enabled: Option<bool>,
-    pub event_a3_offset: Option<u8>,
+    pub event_a3_offset: Option<i16>,
     pub sim_slot: Option<u8>,
     pub sar_backoff_lock_zero: Option<bool>,
     #[serde(default)]
@@ -291,8 +291,12 @@ pub struct RadioTuningHttpPatch {
 }
 
 impl RadioTuningHttpPatch {
-    fn split(self) -> (RadioTuningPatch, Option<bool>) {
-        (
+    fn split(self) -> Result<(RadioTuningPatch, Option<bool>), String> {
+        let a3_off = match self.event_a3_offset {
+            Some(v) => Some(validate_event_a3_offset(i32::from(v))?),
+            None => None,
+        };
+        Ok((
             RadioTuningPatch {
                 lte_ca_enabled: self.lte_ca_enabled,
                 nr_ca_enabled: self.nr_ca_enabled,
@@ -313,11 +317,11 @@ impl RadioTuningHttpPatch {
                 nr5g_pref_freq_list: self.nr5g_pref_freq_list,
                 nr5g_earfcn_lock: self.nr5g_earfcn_lock,
                 event_a3_enabled: self.event_a3_enabled,
-                event_a3_offset: self.event_a3_offset,
+                event_a3_offset: a3_off,
                 sim_slot: self.sim_slot,
             },
             self.sar_backoff_lock_zero,
-        )
+        ))
     }
 }
 
@@ -448,6 +452,8 @@ fn parse_band_priority(body: &str, key: &str) -> Vec<String> {
 pub(crate) fn default_nr_scs_khz(arfcn: u32) -> u16 {
     if arfcn >= 2_016_667 {
         120 // FR2 mmWave
+    } else if (524_000..=538_000).contains(&arfcn) {
+        15 // FR1 FDD n7 (2620-2690 MHz DL)
     } else if arfcn >= 499_200 {
         30 // FR1 mid-band TDD (n41, n48, n77, n78, n79)
     } else {
@@ -496,8 +502,18 @@ pub(crate) fn parse_arfcn_list(body: &str, key: &str) -> Vec<String> {
     }
 }
 
+/// Validate 3GPP TS 38.331 Event A3 offset (`-30..=30` half-dB steps).
+pub fn validate_event_a3_offset(raw: i32) -> Result<i8, String> {
+    if !(-30..=30).contains(&raw) {
+        return Err(format!(
+            "eventA3Offset {raw} out of range (-30..=30 half-dB steps per 3GPP TS 38.331)"
+        ));
+    }
+    Ok(raw as i8)
+}
+
 /// Parse `+QNWCFG: "event_a3_offset",<enable>,<offset>`.
-pub(crate) fn parse_event_a3(body: &str) -> (Option<bool>, Option<u8>) {
+pub(crate) fn parse_event_a3(body: &str) -> (Option<bool>, Option<i8>) {
     let Some(tail) = extract_keyed_tail(body, "event_a3_offset") else {
         return (None, None);
     };
@@ -507,7 +523,9 @@ pub(crate) fn parse_event_a3(body: &str) -> (Option<bool>, Option<u8>) {
         0 => Some(false),
         _ => None,
     });
-    let offset = vals.get(1).and_then(|&v| u8::try_from(v).ok());
+    let offset = vals
+        .get(1)
+        .and_then(|&v| validate_event_a3_offset(v).ok());
     (enabled, offset)
 }
 
@@ -1287,13 +1305,26 @@ pub async fn enable_phy_telemetry_counters(app: &crate::state::AppState) {
     let _ = app.smd.exec_batch(cmds, Priority::Telemetry).await;
 }
 
+type PhyContextKey = (String, i32, u64, String);
+
+static LAST_PHY_CONTEXT: std::sync::Mutex<Option<PhyContextKey>> = std::sync::Mutex::new(None);
+
+pub(crate) fn should_retain_idle_qos_ambr(
+    poll_connected_only: bool,
+    is_registered: bool,
+    prev_ctx: Option<&PhyContextKey>,
+    cur_ctx: &PhyContextKey,
+) -> bool {
+    !poll_connected_only && is_registered && prev_ctx.is_none_or(|prev| prev == cur_ctx)
+}
+
 /// Lightweight PHY-only poll used by the 30 s background loop to keep Prometheus
 /// metrics warm without querying all 36 tuning keys.
 /// Skips `lte_csi` on `NR5G-SA`, caches `AT+QMAP="SFE"` in `SFE_AT_CACHE`, and
 /// gates connected-only PHY commands (`nr5g_ambr`, `nr5g_qos`, `used_algo`, `c_rnti`)
 /// on `RRC=Connected` or active WebSocket subscribers.
 pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagnostics, String> {
-    let (skip_lte_csi, rrc_connected_serving, is_registered) = {
+    let (skip_lte_csi, rrc_connected_serving, is_registered, sim_slot, bearer_apns) = {
         let m = app.modem.read().await;
         let skip_lte = m.serving.as_ref().is_some_and(|s| s.rat == "NR5G-SA");
         let conn = m
@@ -1301,7 +1332,23 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
             .as_ref()
             .is_some_and(|s| s.state.eq_ignore_ascii_case("CONNECT"));
         let reg = m.identity.cfun == 1 && crate::telemetry::is_modem_registered(m.serving.as_ref());
-        (skip_lte, conn, reg)
+        let apns: String = m
+            .bearers
+            .iter()
+            .map(|b| b.apn.trim())
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        (skip_lte, conn, reg, m.identity.sim_slot, apns)
+    };
+    let iccid = app.secrets.read().await.iccid.clone();
+    let sim_switched_ms = app.sim_switched_at_ms.load(Ordering::Acquire);
+    let cur_ctx: PhyContextKey = (iccid, sim_slot, sim_switched_ms, bearer_apns);
+    let prev_ctx = {
+        let mut g = LAST_PHY_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = g.clone();
+        *g = Some(cur_ctx.clone());
+        prev
     };
     let (prev_rrc_conn, prev_qos, prev_ambr_caps, prev_ambr_str) = {
         let p = app.phy_diag.read().await;
@@ -1385,7 +1432,7 @@ pub async fn poll_phy_telemetry(app: &crate::state::AppState) -> Result<PhyDiagn
         body(14),
         body(15),
     );
-    if !poll_connected_only && is_registered {
+    if should_retain_idle_qos_ambr(poll_connected_only, is_registered, prev_ctx.as_ref(), &cur_ctx) {
         if phy.qos_bearers.is_empty() {
             phy.qos_bearers = prev_qos;
         }
@@ -1526,6 +1573,11 @@ async fn apply_tuning_patch_ext(
         },
         None => None,
     };
+    if let Some(off) = req.event_a3_offset
+        && let Err(e) = validate_event_a3_offset(i32::from(off))
+    {
+        return Err((StatusCode::BAD_REQUEST, e, Vec::new()));
+    }
     if let Some(slot) = req.sim_slot
         && !(1..=2).contains(&slot)
     {
@@ -1713,6 +1765,29 @@ async fn apply_tuning_patch_ext(
     }
 
     *app.tuning_cache.write().await = None;
+    let sim_slot_changed = req.sim_slot.filter(|_| applied.iter().any(|s| s == "simSlot"));
+    // Release the radio lock before profile sync (which acquires radio::lock itself).
+    drop(_radio);
+    if let Some(new_slot) = sim_slot_changed {
+        app.last_sim_slot.store(i32::from(new_slot), Ordering::Release);
+        app.sim_switched_at_ms
+            .store(crate::state::mono_ms(), Ordering::Release);
+        {
+            let mut sec = app.secrets.write().await;
+            sec.iccid.clear();
+            sec.imsi.clear();
+        }
+        *app.spn_cache.write().await = (String::new(), String::new(), String::new());
+        {
+            let mut phy = app.phy_diag.write().await;
+            phy.qos_bearers.clear();
+            phy.ambr_caps.clear();
+            phy.nr5g_ambr = None;
+        }
+        *LAST_PHY_CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::profiles::tick_iccid_profile_sync(app).await;
+        let _ = crate::dataplane::trigger_native_reconnect_if_active().await;
+    }
     let summary = applied.join(", ");
     app.push_daemon_log(format!("cellular: radio tuning updated ({summary})"));
     app.audit.event("cellular", "tuning", summary);
@@ -1723,7 +1798,10 @@ pub async fn post_tuning(
     State(ctx): State<HttpCtx>,
     Json(req): Json<RadioTuningHttpPatch>,
 ) -> Response {
-    let (patch, sar_lock_zero) = req.split();
+    let (patch, sar_lock_zero) = match req.split() {
+        Ok(v) => v,
+        Err(msg) => return bad(msg),
+    };
     match apply_tuning_patch_ext(&ctx.app, patch, sar_lock_zero).await {
         Ok(applied) => Json(serde_json::json!({
             "status": "ok",
@@ -1927,10 +2005,37 @@ mod tests {
             validate_arfcn_list(&["397470".into()], "pref").unwrap(),
             "1,397470:15"
         );
+        // FDD n7 (524000..=538000) defaults to 15 kHz SCS instead of 30 kHz.
+        assert_eq!(default_nr_scs_khz(524_000), 15);
+        assert_eq!(default_nr_scs_khz(531_000), 15);
+        assert_eq!(default_nr_scs_khz(538_000), 15);
+        assert_eq!(default_nr_scs_khz(521_310), 30);
+        assert_eq!(
+            validate_arfcn_list(&["531000".into()], "pref").unwrap(),
+            "1,531000:15"
+        );
         assert!(validate_arfcn_list(&["0".into()], "pref").is_err());
         assert!(validate_arfcn_list(&["501390:45".into()], "pref").is_err());
         assert!(validate_arfcn_list(&["4000000".into()], "pref").is_err());
         assert!(validate_arfcn_list(&["521310:30".into(), "521310:30".into()], "pref").is_err());
+
+        // Event A3 offset range validation (-30..=30 half-dB steps per 3GPP TS 38.331).
+        assert_eq!(validate_event_a3_offset(-30), Ok(-30));
+        assert_eq!(validate_event_a3_offset(0), Ok(0));
+        assert_eq!(validate_event_a3_offset(30), Ok(30));
+        assert!(validate_event_a3_offset(-31).is_err());
+        assert!(validate_event_a3_offset(31).is_err());
+        assert!(validate_event_a3_offset(255).is_err());
+        assert_eq!(parse_event_a3(r#"+QNWCFG: "event_a3_offset",1,-6"#), (Some(true), Some(-6)));
+        assert_eq!(parse_event_a3(r#"+QNWCFG: "event_a3_offset",1,255"#), (Some(true), None));
+
+        // Idle QoS/AMBR retention clears immediately on ICCID/SIM/APN change even in RRC Idle.
+        let ctx_a = ("89012600000000000001".to_string(), 1, 0u64, "fast.t-mobile.com".to_string());
+        let ctx_b = ("89014100000000000002".to_string(), 2, 100u64, "broadband".to_string());
+        assert!(should_retain_idle_qos_ambr(false, true, Some(&ctx_a), &ctx_a));
+        assert!(!should_retain_idle_qos_ambr(false, true, Some(&ctx_a), &ctx_b));
+        assert!(!should_retain_idle_qos_ambr(true, true, Some(&ctx_a), &ctx_a));
+        assert!(!should_retain_idle_qos_ambr(false, false, Some(&ctx_a), &ctx_a));
     }
 
     fn socketpair() -> Result<(RawFd, RawFd), String> {
@@ -2037,6 +2142,9 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 
         let (st, v) = call_router(&router, &rw, Method::POST, "/api/v1/cellular/tuning", r#"{"simSlot":3}"#).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+        let (st, v) = call_router(&router, &rw, Method::POST, "/api/v1/cellular/tuning", r#"{"eventA3Offset":255}"#).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 
         let (st, v) = call_router(

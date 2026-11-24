@@ -43,7 +43,7 @@ use crate::{
             WdsProfileSummary, WdsRuntimeSettings,
         },
     },
-    state::{AppState, atomic_write, save_json_atomic},
+    state::{AppState, atomic_write, save_json_atomic, save_json_compact_tmpfs},
 };
 
 pub const DATAPLANE_CONFIG_PATH: &str = "/etc/cellcore/dataplane.json";
@@ -341,6 +341,8 @@ pub struct PersistedNativeState {
 }
 
 static HUB: OnceLock<Arc<DataplaneHub>> = OnceLock::new();
+static NATIVE_STATE_LOCK: Mutex<()> = Mutex::new(());
+static LAST_WRITTEN_NATIVE_STATE: Mutex<Option<(String, PersistedNativeState)>> = Mutex::new(None);
 static BASELINE_SYSCTLS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
 static BASELINE_IRQ_AFFINITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static BASELINE_ETHTOOL_FEATURES: OnceLock<Mutex<HashMap<String, EthtoolGroFeatures>>> =
@@ -353,20 +355,58 @@ static NATIVE_WDS_V6_CONNECTED: AtomicBool = AtomicBool::new(false);
 static FORCE_FW_HEAL: AtomicBool = AtomicBool::new(false);
 static SFE_LOADED_BY_US: AtomicBool = AtomicBool::new(false);
 
-pub fn load_persisted_native_state() -> Option<PersistedNativeState> {
+fn load_persisted_native_state_locked() -> Option<PersistedNativeState> {
     let p = crate::paths::p(NATIVE_STATE_PATH);
     let raw = fs::read_to_string(&p).ok()?;
     serde_json::from_str::<PersistedNativeState>(&raw).ok()
 }
 
-pub fn save_persisted_native_state(st: &PersistedNativeState) -> Result<(), String> {
+fn save_persisted_native_state_locked(st: &PersistedNativeState) -> Result<(), String> {
     let p = crate::paths::p(NATIVE_STATE_PATH);
-    save_json_atomic(&p, st, 0o600)
+    {
+        let last = LAST_WRITTEN_NATIVE_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((ref last_p, ref last_st)) = *last
+            && last_p == &p
+            && last_st == st
+            && Path::new(&p).exists()
+        {
+            return Ok(());
+        }
+    }
+    save_json_compact_tmpfs(&p, st, 0o600)?;
+    *LAST_WRITTEN_NATIVE_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((p, st.clone()));
+    Ok(())
+}
+
+fn clear_persisted_native_state_locked() {
+    let p = crate::paths::p(NATIVE_STATE_PATH);
+    let _ = fs::remove_file(&p);
+    let mut last = LAST_WRITTEN_NATIVE_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.as_ref().is_some_and(|(lp, _)| lp == &p) {
+        *last = None;
+    }
+}
+
+pub fn load_persisted_native_state() -> Option<PersistedNativeState> {
+    let _guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_persisted_native_state_locked()
+}
+
+#[cfg(test)]
+pub fn save_persisted_native_state(st: &PersistedNativeState) -> Result<(), String> {
+    let _guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_persisted_native_state_locked(st)
 }
 
 pub fn clear_persisted_native_state() {
-    let p = crate::paths::p(NATIVE_STATE_PATH);
-    let _ = fs::remove_file(&p);
+    let _guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_persisted_native_state_locked();
 }
 
 /// True when at least one native QMI WDS family (IPv4 or IPv6) is currently connected.
@@ -1001,24 +1041,27 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
             // Strictly BEFORE applying tuning: load any previously persisted original baseline
             // (so crash-restart reuses the original pre-tuning values rather than capturing
             // already-tuned values!), and only capture values for paths not yet recorded.
-            let mut persisted = load_persisted_native_state().unwrap_or_default();
-            for rel in HIGH_THROUGHPUT_SYSCTLS
-                .iter()
-                .chain(OPTIONAL_IPA_SYSCTLS.iter())
-                .map(|(r, _)| *r)
-                .chain(dyn_entries.iter().map(|(r, _)| r.as_str()))
             {
-                if !persisted.baseline_sysctls.iter().any(|(k, _)| k == rel)
-                    && let Some(orig) = read_trimmed(rel)
+                let _state_guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let mut persisted = load_persisted_native_state_locked().unwrap_or_default();
+                for rel in HIGH_THROUGHPUT_SYSCTLS
+                    .iter()
+                    .chain(OPTIONAL_IPA_SYSCTLS.iter())
+                    .map(|(r, _)| *r)
+                    .chain(dyn_entries.iter().map(|(r, _)| r.as_str()))
                 {
-                    persisted.baseline_sysctls.push((rel.to_string(), orig));
+                    if !persisted.baseline_sysctls.iter().any(|(k, _)| k == rel)
+                        && let Some(orig) = read_trimmed(rel)
+                    {
+                        persisted.baseline_sysctls.push((rel.to_string(), orig));
+                    }
                 }
+                {
+                    let mut mem = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *mem = persisted.baseline_sysctls.clone();
+                }
+                let _ = save_persisted_native_state_locked(&persisted);
             }
-            {
-                let mut mem = baseline_lock.lock().unwrap_or_else(|e| e.into_inner());
-                *mem = persisted.baseline_sysctls.clone();
-            }
-            let _ = save_persisted_native_state(&persisted);
 
             let buf_max = socket_buf_max_bytes_for_ram(total_ram_mib());
             let buf_max_s = buf_max.to_string();
@@ -1070,14 +1113,17 @@ pub fn apply_kernel_tuning(profile: KernelTuningProfile, active_iface: Option<&s
                 }
             }
             restore_nic_offloads_and_irqs(&mut warnings);
-            if let Some(mut st) = persisted {
-                st.baseline_sysctls.clear();
-                st.baseline_irq_affinities.clear();
-                st.baseline_ethtool_features.clear();
-                if !st.native_active && !st.vendor_daemons_stopped && !st.mwan3_stopped {
-                    clear_persisted_native_state();
-                } else {
-                    let _ = save_persisted_native_state(&st);
+            {
+                let _state_guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut st) = load_persisted_native_state_locked() {
+                    st.baseline_sysctls.clear();
+                    st.baseline_irq_affinities.clear();
+                    st.baseline_ethtool_features.clear();
+                    if !st.native_active && !st.vendor_daemons_stopped && !st.mwan3_stopped {
+                        clear_persisted_native_state_locked();
+                    } else {
+                        let _ = save_persisted_native_state_locked(&st);
+                    }
                 }
             }
         }
@@ -1167,39 +1213,46 @@ pub(crate) fn pin_eth0_irqs_to_cpu2_3() -> Vec<(String, &'static str)> {
     };
     let plan = plan_irq_affinities(&text);
     let baseline = BASELINE_IRQ_AFFINITIES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut persisted = load_persisted_native_state().unwrap_or_default();
-    let mut persisted_dirty = false;
     let mut assigned = Vec::with_capacity(plan.len());
-    for target in plan {
-        if let Some((rel, is_list)) = irq_affinity_file_for(&target.irq) {
-            if !persisted.baseline_irq_affinities.contains_key(&rel)
-                && let Some(orig) = read_trimmed(&rel)
-            {
-                persisted.baseline_irq_affinities.insert(rel.clone(), orig.clone());
-                persisted_dirty = true;
-                baseline
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(rel.clone())
-                    .or_insert(orig);
-            } else if let Some(orig) = persisted.baseline_irq_affinities.get(&rel) {
-                baseline
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(rel.clone())
-                    .or_insert_with(|| orig.clone());
+    let mut to_write: Vec<(String, &'static str)> = Vec::with_capacity(plan.len());
+    {
+        let _state_guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut persisted = load_persisted_native_state_locked().unwrap_or_default();
+        let mut persisted_dirty = false;
+        for target in plan {
+            if let Some((rel, is_list)) = irq_affinity_file_for(&target.irq) {
+                if !persisted.baseline_irq_affinities.contains_key(&rel)
+                    && let Some(orig) = read_trimmed(&rel)
+                {
+                    persisted.baseline_irq_affinities.insert(rel.clone(), orig.clone());
+                    persisted_dirty = true;
+                    baseline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(rel.clone())
+                        .or_insert(orig);
+                } else if let Some(orig) = persisted.baseline_irq_affinities.get(&rel) {
+                    baseline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(rel.clone())
+                        .or_insert_with(|| orig.clone());
+                }
+                let val = if is_list {
+                    target.cpu_list
+                } else {
+                    target.cpu_mask
+                };
+                to_write.push((rel, val));
             }
-            let val = if is_list {
-                target.cpu_list
-            } else {
-                target.cpu_mask
-            };
-            let _ = fs::write(crate::paths::p(&rel), format!("{val}\n"));
+            assigned.push((target.irq, target.cpu_list));
         }
-        assigned.push((target.irq, target.cpu_list));
+        if persisted_dirty {
+            let _ = save_persisted_native_state_locked(&persisted);
+        }
     }
-    if persisted_dirty {
-        let _ = save_persisted_native_state(&persisted);
+    for (rel, val) in to_write {
+        let _ = fs::write(crate::paths::p(&rel), format!("{val}\n"));
     }
     assigned
 }
@@ -1236,15 +1289,16 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
         ifaces.push(iface);
     }
     let eth_baseline = BASELINE_ETHTOOL_FEATURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut persisted = load_persisted_native_state().unwrap_or_default();
-    let mut persisted_dirty = false;
+    let known_saved: std::collections::HashSet<String> = load_persisted_native_state()
+        .map(|st| st.baseline_ethtool_features.into_keys().collect())
+        .unwrap_or_default();
+    let mut captured: Vec<(String, EthtoolGroFeatures)> = Vec::new();
     for iface in ifaces {
         let sys_if = crate::paths::p(&format!("/sys/class/net/{iface}"));
         if !Path::new(&sys_if).exists() {
             continue;
         }
-        let already_saved = persisted.baseline_ethtool_features.contains_key(iface);
-        if !already_saved
+        if !known_saved.contains(iface)
             && let Ok(stdout) = crate::uci::run_cmd_blocking_timeout(
                 &crate::paths::program("ethtool"),
                 &["-k", iface],
@@ -1253,12 +1307,7 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
         {
             let feats = parse_ethtool_gro_features(&stdout);
             if feats.0.is_some() || feats.1.is_some() {
-                persisted.baseline_ethtool_features.insert(iface.to_string(), feats);
-                persisted_dirty = true;
-                eth_baseline
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(iface.to_string(), feats);
+                captured.push((iface.to_string(), feats));
             }
         }
         let _ = crate::uci::run_cmd_blocking_timeout(
@@ -1267,8 +1316,24 @@ fn tune_nic_offloads_and_irqs(active_iface: Option<&str>) {
             Duration::from_secs(2),
         );
     }
-    if persisted_dirty {
-        let _ = save_persisted_native_state(&persisted);
+    if !captured.is_empty() {
+        let _state_guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut persisted = load_persisted_native_state_locked().unwrap_or_default();
+        let mut dirty = false;
+        for (iface, feats) in captured {
+            if !persisted.baseline_ethtool_features.contains_key(&iface) {
+                persisted.baseline_ethtool_features.insert(iface.clone(), feats);
+                dirty = true;
+            }
+            eth_baseline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(iface)
+                .or_insert(feats);
+        }
+        if dirty {
+            let _ = save_persisted_native_state_locked(&persisted);
+        }
     }
 
     let _ = pin_eth0_irqs_to_cpu2_3();
@@ -1623,7 +1688,8 @@ pub(crate) fn bearer_restart_needed(prev: Option<&AppliedCfgSig>, cur: &AppliedC
 }
 
 fn persist_native_handoff_state(nh: &NativeHandles, cfg: &DataplaneConfig, active: bool) {
-    let mut st = load_persisted_native_state().unwrap_or_default();
+    let _state_guard = NATIVE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = load_persisted_native_state_locked().unwrap_or_default();
     st.native_active = active;
     st.vendor_daemons_stopped = nh.vendor_daemons_stopped;
     st.mwan3_stopped = nh.mwan3_stopped;
@@ -1648,9 +1714,9 @@ fn persist_native_handoff_state(nh: &NativeHandles, cfg: &DataplaneConfig, activ
         && st.baseline_irq_affinities.is_empty()
         && st.baseline_ethtool_features.is_empty()
     {
-        clear_persisted_native_state();
+        clear_persisted_native_state_locked();
     } else {
-        let _ = save_persisted_native_state(&st);
+        let _ = save_persisted_native_state_locked(&st);
     }
 }
 
@@ -2852,6 +2918,7 @@ async fn apply_native_netlink(
     v6: Option<&WdsRuntimeSettings>,
     apply_v4: bool,
     apply_v6: bool,
+    mtu_changed: bool,
 ) -> Result<AppliedNetlinkState, String> {
     let iface = cfg.iface.clone();
     let mux_id = cfg.mux_id;
@@ -2898,6 +2965,18 @@ async fn apply_native_netlink(
                 netlink::replace_passthrough_host_route_v4("br-lan", br.ifindex, ip, table)?;
                 out_ippt_host_ip = Some(ip);
             }
+        } else if !apply_v4
+            && mtu_changed
+            && let Some(rt4) = v4.as_ref()
+            && rt4.ipv4_addr.is_some()
+        {
+            // MTU changed on the sibling family: update v4 route MTU/metric in place
+            // without flushing the healthy v4 address or tearing down IPPT.
+            let gw = rt4
+                .ipv4_gateway
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok());
+            netlink::replace_default_route_v4(&resolved_iface, ifindex, gw, table, None, mtu4)?;
         }
 
         let mut out_v6_addr_str = None;
@@ -2922,6 +3001,14 @@ async fn apply_native_netlink(
                     out_v6_dns.push(dns_ip);
                 }
             }
+        } else if !apply_v6
+            && mtu_changed
+            && let Some(rt6) = v6.as_ref()
+            && rt6.ipv6_addr.is_some()
+        {
+            // MTU changed on the sibling family: update v6 route MTU/metric in place
+            // without flushing the healthy v6 address or tearing down IPA v6 sharing.
+            netlink::replace_default_route_v6(&resolved_iface, ifindex, table, None, mtu6)?;
         }
         Ok(AppliedNetlinkState {
             resolved_iface,
@@ -3112,6 +3199,12 @@ pub async fn metrics_view() -> DataplaneMetricsView {
 }
 
 async fn flush_rmnet_stale_state(iface: String, table: u32) {
+    flush_rmnet_stale_family(iface, table, None).await;
+}
+
+/// Immediately strip stale IPv4 or IPv6 addresses and default route on `iface`
+/// (or both families when `family` is `None`) via fork-free RTNETLINK.
+async fn flush_rmnet_stale_family(iface: String, table: u32, family: Option<u8>) {
     let _ = tokio::task::spawn_blocking(move || {
         if netlink::validate_managed_iface(&iface).is_err()
             || netlink::validate_managed_table(table).is_err()
@@ -3121,46 +3214,11 @@ async fn flush_rmnet_stale_state(iface: String, table: u32) {
         if let Ok(links) = netlink::list_links()
             && let Some(link) = links.into_iter().find(|l| l.name == iface)
         {
-            let _ = netlink::del_default_routes(&iface, link.ifindex, table);
-            let _ = netlink::flush_iface_addrs(&iface, link.ifindex, None);
+            let _ = netlink::del_default_routes_family(&iface, link.ifindex, table, family);
+            let _ = netlink::flush_iface_addrs(&iface, link.ifindex, family);
         }
     })
     .await;
-}
-
-/// Immediately strip stale IPv4 or IPv6 addresses and default route on `iface`
-/// (or both families when `family` is `None`).
-async fn flush_rmnet_stale_family(iface: String, table: u32, family: Option<u8>) {
-    if family.is_none() {
-        flush_rmnet_stale_state(iface, table).await;
-        return;
-    }
-    let iface_nl = iface.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        if netlink::validate_managed_iface(&iface_nl).is_err()
-            || netlink::validate_managed_table(table).is_err()
-        {
-            return;
-        }
-        if let Ok(links) = netlink::list_links()
-            && let Some(link) = links.into_iter().find(|l| l.name == iface_nl)
-        {
-            let _ = netlink::flush_iface_addrs(&iface_nl, link.ifindex, family);
-        }
-    })
-    .await;
-    if netlink::validate_managed_iface(&iface).is_ok()
-        && netlink::validate_managed_table(table).is_ok()
-    {
-        let fam_flag = if family == Some(libc::AF_INET6 as u8) { "-6" } else { "-4" };
-        let tbl_s = table.to_string();
-        let _ = run(
-            "ip",
-            &[fam_flag, "route", "del", "default", "dev", &iface, "table", &tbl_s],
-            ExecOpts::new(3, 8 * KIB),
-        )
-        .await;
-    }
 }
 
 /// Coalesce a burst of QMI indications arriving within `window` into a single batch,
@@ -3532,12 +3590,21 @@ async fn apply_qmi_indication(
         && let Some(fam) = flush_fam
     {
         let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
-        let flush_tbl = nh
+        let prev_sig = nh
             .last_applied_sig
-            .as_ref()
-            .map(|s| s.route_table)
-            .unwrap_or(cfg.route_table);
+            .clone()
+            .unwrap_or_else(|| AppliedCfgSig::from(cfg));
+        let flush_tbl = prev_sig.route_table;
+        let tear_v4 = fam.is_none() || fam == Some(libc::AF_INET as u8);
+        let tear_v6 = fam.is_none() || fam == Some(libc::AF_INET6 as u8);
+        let mut tear_warns = Vec::new();
+        teardown_ipa_and_routes(nh, &flush_if, &prev_sig, tear_v4, tear_v6, &mut tear_warns).await;
+        if !is_wds_connected() && cfg.manage_dns && nh.saved_resolv.is_some() {
+            nh.applied_dns.clear();
+            let _ = restore_native_dns(&mut nh.saved_resolv).await;
+        }
         flush_rmnet_stale_family(flush_if, flush_tbl, fam).await;
+        persist_native_handoff_state(nh, cfg, true);
     }
 }
 
@@ -3810,10 +3877,22 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         nh.last_v6_ip = None;
                         nh.last_v6_key = None;
                         let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
-                        let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                        let prev_sig = nh
+                            .last_applied_sig
+                            .clone()
+                            .unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                        let flush_tbl = prev_sig.route_table;
+                        teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, true, true, &mut snap.warnings).await;
+                        if cfg.manage_dns && nh.saved_resolv.is_some() {
+                            nh.applied_dns.clear();
+                            if let Err(e) = restore_native_dns(&mut nh.saved_resolv).await {
+                                snap.warnings.push(format!("restore native DNS: {e}"));
+                            }
+                        }
                         flush_rmnet_stale_state(flush_if, flush_tbl).await;
+                        persist_native_handoff_state(&nh, &cfg, true);
                         flushed_unregistered = true;
-                        state.push_daemon_log("dataplane: immediately flushed stale rmnet addresses/routes after PS registration loss");
+                        state.push_daemon_log("dataplane: immediately flushed stale rmnet/IPA/DNS state after PS registration loss");
                     }
                     snap.supervisor_state = "native-waiting-registration".into();
                 } else {
@@ -3853,10 +3932,12 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                         nh.v4_handle = None;
                                         nh.last_v4_ip = None;
                                         NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                                        let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                        teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, true, false, &mut snap.warnings).await;
                                         flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
                                         v4_failed_this_tick = true;
                                         let d = nh.v4_backoff.next_delay();
-                                        nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                        nh.v4_next_retry_ms = crate::state::mono_ms().saturating_add(d.as_millis() as u64);
                                         v4_retry_delay = Some(d);
                                         let msg = format!("get_runtime_settings: {e}");
                                         nh.v4_last_error = Some(msg.clone());
@@ -3870,6 +3951,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 nh.last_v4_ip = None;
                                 NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                                 snap.wds_v4.state = "disconnected";
+                                let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, true, false, &mut snap.warnings).await;
                                 flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
                             }
                         } else {
@@ -3878,6 +3961,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             nh.last_v4_ip = None;
                             NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                             snap.wds_v4.state = "disconnected";
+                            let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                            teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, true, false, &mut snap.warnings).await;
                             flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET as u8)).await;
                         }
                     }
@@ -3910,10 +3995,12 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                         nh.last_v6_ip = None;
                                         nh.last_v6_key = None;
                                         NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                                        let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                        teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, false, true, &mut snap.warnings).await;
                                         flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
                                         v6_failed_this_tick = true;
                                         let d = nh.v6_backoff.next_delay();
-                                        nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                        nh.v6_next_retry_ms = crate::state::mono_ms().saturating_add(d.as_millis() as u64);
                                         v6_retry_delay = Some(d);
                                         let msg = format!("get_runtime_settings: {e}");
                                         nh.v6_last_error = Some(msg.clone());
@@ -3928,6 +4015,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 nh.last_v6_key = None;
                                 NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                                 snap.wds_v6.state = "disconnected";
+                                let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, false, true, &mut snap.warnings).await;
                                 flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
                             }
                         } else {
@@ -3937,6 +4026,8 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             nh.last_v6_key = None;
                             NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                             snap.wds_v6.state = "disconnected";
+                            let prev_sig = nh.last_applied_sig.clone().unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                            teardown_ipa_and_routes(&mut nh, &flush_if, &prev_sig, false, true, &mut snap.warnings).await;
                             flush_rmnet_stale_family(flush_if.clone(), flush_tbl, Some(libc::AF_INET6 as u8)).await;
                         }
                     }
@@ -3999,6 +4090,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             }
                         },
                     );
+                    let after_ms = crate::state::mono_ms();
                     snap.warnings.extend(v4_warns);
                     snap.warnings.extend(v6_warns);
 
@@ -4018,7 +4110,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 Err(e) => {
                                     NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                                     let d = nh.v4_backoff.next_delay();
-                                    nh.v4_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                    nh.v4_next_retry_ms = after_ms.saturating_add(d.as_millis() as u64);
                                     v4_retry_delay = Some(d);
                                     let msg = e.to_string();
                                     nh.v4_last_error = Some(msg.clone());
@@ -4028,7 +4120,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             }
                         } else {
                             NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
-                            let rem_ms = nh.v4_next_retry_ms.saturating_sub(now_ms);
+                            let rem_ms = nh.v4_next_retry_ms.saturating_sub(after_ms);
                             v4_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
                             snap.wds_v4.state = "backoff";
                             snap.wds_v4.last_error = nh.v4_last_error.clone();
@@ -4051,7 +4143,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                 Err(e) => {
                                     NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                                     let d = nh.v6_backoff.next_delay();
-                                    nh.v6_next_retry_ms = now_ms.saturating_add(d.as_millis() as u64);
+                                    nh.v6_next_retry_ms = after_ms.saturating_add(d.as_millis() as u64);
                                     v6_retry_delay = Some(d);
                                     let msg = e.to_string();
                                     nh.v6_last_error = Some(msg.clone());
@@ -4061,7 +4153,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             }
                         } else {
                             NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
-                            let rem_ms = nh.v6_next_retry_ms.saturating_sub(now_ms);
+                            let rem_ms = nh.v6_next_retry_ms.saturating_sub(after_ms);
                             v6_retry_delay = Some(Duration::from_millis(rem_ms.max(1000)));
                             snap.wds_v6.state = "backoff";
                             snap.wds_v6.last_error = nh.v6_last_error.clone();
@@ -4070,6 +4162,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
 
                     NATIVE_WDS_V4_CONNECTED.store(v4_rt.is_some(), Ordering::Release);
                     NATIVE_WDS_V6_CONNECTED.store(v6_rt.is_some(), Ordering::Release);
+                    if v4_rt.is_none() && v6_rt.is_none() && cfg.manage_dns && nh.saved_resolv.is_some() {
+                        nh.applied_dns.clear();
+                        let _ = restore_native_dns(&mut nh.saved_resolv).await;
+                        persist_native_handoff_state(&nh, &cfg, true);
+                    }
 
                     let cur_sig = AppliedCfgSig::from(&cfg);
                     let v4_changed = v4_rt.as_ref().and_then(|r| r.ipv4_addr.clone()) != nh.last_v4_ip;
@@ -4080,12 +4177,14 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     );
                     let mtu_changed = desired_mtu != nh.last_link_mtu;
                     let cfg_changed = nh.last_applied_sig.as_ref() != Some(&cur_sig);
-                    let apply_v4 = cfg_changed || v4_changed || mtu_changed;
-                    let apply_v6 = cfg_changed || v6_changed || mtu_changed;
-                    if (apply_v4 || apply_v6) && (v4_rt.is_some() || v6_rt.is_some()) {
+                    let apply_v4 = cfg_changed || v4_changed;
+                    let apply_v6 = cfg_changed || v6_changed;
+                    if (apply_v4 || apply_v6 || mtu_changed) && (v4_rt.is_some() || v6_rt.is_some()) {
                         if cfg_changed && nh.last_applied_sig.is_some() {
                             teardown_ipa_and_dns(&mut nh, &cfg, !cfg.manage_dns, &mut snap.warnings).await;
-                        } else if let Some(prev) = nh.last_applied_sig.as_ref().cloned() {
+                        } else if (apply_v4 || apply_v6)
+                            && let Some(prev) = nh.last_applied_sig.as_ref().cloned()
+                        {
                             let tear_iface = nh.last_resolved_iface.clone().unwrap_or_else(|| prev.iface.clone());
                             teardown_ipa_and_routes(
                                 &mut nh,
@@ -4097,7 +4196,16 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                             )
                             .await;
                         }
-                        match apply_native_netlink(&cfg, v4_rt.as_ref(), v6_rt.as_ref(), apply_v4, apply_v6).await {
+                        match apply_native_netlink(
+                            &cfg,
+                            v4_rt.as_ref(),
+                            v6_rt.as_ref(),
+                            apply_v4,
+                            apply_v6,
+                            mtu_changed,
+                        )
+                        .await
+                        {
                             Ok(applied) => {
                                 let prev_v4_for_ct = nh.last_applied_v4_ip.clone();
                                 let prev_v6_key_for_ct = nh.last_applied_v6_key.clone();
@@ -4962,7 +5070,10 @@ mod tests {
                 assert!(v["snapshot"]["ipaCliPresent"].is_boolean());
                 assert!(v["snapshot"]["appliedDns"].is_array());
 
+                // `/api/v1/dataplane/profiles` is in READ_DENY (exposes carrier APN profiles)
                 let (s, _) = call_router(&router, &rd, Method::GET, "/api/v1/dataplane/profiles", None, "").await;
+                assert_eq!(s, StatusCode::FORBIDDEN);
+                let (s, _) = call_router(&router, &rw, Method::GET, "/api/v1/dataplane/profiles", None, "").await;
                 assert_eq!(s, StatusCode::OK);
 
                 // read token cannot mutate

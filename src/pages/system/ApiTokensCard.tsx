@@ -25,7 +25,7 @@ const KINDS: Array<{ id: Kind; label: string; hint: string }> = [
   {
     id: "read",
     label: "Read-only",
-    hint: "For monitoring and dashboards. Reads status, radio, metrics and admin views. Cannot change anything, and cannot read secrets (audit log, IMEI/ICCID, backups, SMS, crontab).",
+    hint: "Reads /metrics, status, radio telemetry, dataplane, failover and VPN status. Cannot mutate state or read sensitive/admin views (events, logs, SMS, profiles, OTA, ACME, notifications, SSH access, backups, processes, netstat, audit log, IMEI/ICCID).",
   },
   {
     id: "rw",
@@ -74,12 +74,13 @@ export function ApiTokensCard() {
   async function create() {
     setBusy(true);
     try {
+      const effectiveExpiry = kind === "rw" && expiry === "never" ? "90" : expiry;
       const res = await apiFetch<{ token: string; info: TokenInfo }>("/api/v1/security/tokens", {
         method: "POST",
         body: JSON.stringify({
           name: name.trim(),
           kind,
-          expiresInDays: expiry === "never" ? null : Number(expiry),
+          expiresInDays: effectiveExpiry === "never" ? null : Number(effectiveExpiry),
         }),
       });
       setCreateOpen(false);
@@ -183,7 +184,10 @@ export function ApiTokensCard() {
                     type="button"
                     role="radio"
                     aria-checked={on}
-                    onClick={() => setKind(k.id)}
+                    onClick={() => {
+                      setKind(k.id);
+                      if (k.id === "rw" && expiry === "never") setExpiry("90");
+                    }}
                     className={cn(
                       "min-h-[44px] rounded-xl border px-3 py-2.5 text-left transition cursor-pointer",
                       on ? (danger ? "border-crimson bg-crimson-soft" : "border-ember bg-ember-soft") : "border-line bg-raised hover:border-line-strong"
@@ -203,9 +207,17 @@ export function ApiTokensCard() {
               have leaked. Every change it makes is recorded in the audit log under its name.
             </Notice>
           )}
-          <Field label="Expires" htmlFor="qm-tok-exp">
-            <Select id="qm-tok-exp" value={expiry} onChange={(e) => setExpiry(e.target.value)}>
-              {EXPIRY.map((x) => (
+          <Field
+            label="Expires"
+            htmlFor="qm-tok-exp"
+            hint={kind === "rw" ? "Read-write tokens require an expiry (90 days default)." : undefined}
+          >
+            <Select
+              id="qm-tok-exp"
+              value={kind === "rw" && expiry === "never" ? "90" : expiry}
+              onChange={(e) => setExpiry(e.target.value)}
+            >
+              {(kind === "rw" ? EXPIRY.filter((x) => x.id !== "never") : EXPIRY).map((x) => (
                 <option key={x.id} value={x.id}>
                   {x.label}
                 </option>

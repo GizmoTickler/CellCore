@@ -601,7 +601,7 @@ pub struct AppState {
     pub internals: Arc<RwLock<SystemInternals>>,
     pub speedtest_live: Arc<RwLock<SpeedtestLiveState>>,
     pub speedtest_history: Arc<RwLock<Vec<SpeedtestRun>>>,
-    pub speedtest_pid: Arc<tokio::sync::Mutex<Option<u32>>>,
+    pub speedtest_pid: Arc<tokio::sync::Mutex<Option<u64>>>,
     pub speedtest_cancel: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     pub antenna_align: Arc<RwLock<AntennaAlignState>>,
     pub align_notify: Arc<Notify>,
@@ -658,6 +658,15 @@ pub struct AppState {
     pub spn_cache: Arc<RwLock<(String, String, String)>>,
     /// Native zero-USB inactive-slot A/B firmware flasher state and exclusive lock.
     pub ab_flash: Arc<crate::firmware_ab::AbFlashState>,
+    /// Synchronized watchdog grace window for in-flight console AT commands.
+    pub console_at_window: Arc<std::sync::Mutex<ConsoleAtWindow>>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConsoleAtWindow {
+    pub inflight: u32,
+    pub started_ms: u64,
+    pub deadline_ms: u64,
 }
 
 impl AppState {
@@ -737,6 +746,7 @@ impl AppState {
             sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spn_cache: Default::default(),
             ab_flash: Arc::new(crate::firmware_ab::AbFlashState::new()),
+            console_at_window: Arc::new(std::sync::Mutex::new(ConsoleAtWindow::default())),
         }
     }
 
@@ -787,17 +797,30 @@ impl AppState {
     /// bounded grace on the RF loop for the command's duration. Cleared on drop.
     pub fn begin_console_at(&self, timeout: std::time::Duration) -> ConsoleAtGuard {
         use std::sync::atomic::Ordering;
-        let stats = self.smd.stats();
         let now = mono_ms();
         let timeout_ms = (timeout.as_millis() as u64).max(1);
-        let prev = stats.console_at_inflight.fetch_add(1, Ordering::AcqRel);
-        if prev == 0 {
-            stats.console_at_started_ms.store(now, Ordering::Release);
-            stats.console_at_timeout_ms.store(timeout_ms, Ordering::Release);
-        } else {
-            stats.console_at_timeout_ms.fetch_max(timeout_ms, Ordering::AcqRel);
+        let my_deadline = now.saturating_add(timeout_ms);
+        {
+            let mut w = self
+                .console_at_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if w.inflight == 0 {
+                w.started_ms = now;
+                w.deadline_ms = my_deadline;
+            } else {
+                w.deadline_ms = w.deadline_ms.max(my_deadline);
+            }
+            w.inflight = w.inflight.saturating_add(1);
+            let stats = self.smd.stats();
+            stats.console_at_inflight.store(u64::from(w.inflight), Ordering::Relaxed);
+            stats.console_at_started_ms.store(w.started_ms, Ordering::Relaxed);
+            stats
+                .console_at_timeout_ms
+                .store(w.deadline_ms.saturating_sub(w.started_ms).max(1), Ordering::Relaxed);
         }
         ConsoleAtGuard {
+            window: Arc::clone(&self.console_at_window),
             smd: self.smd.clone(),
         }
     }
@@ -805,32 +828,43 @@ impl AppState {
     /// Snapshot `(started_ms, timeout_ms)` for any in-flight console AT command
     /// (`(0, 0)` when none is running).
     pub fn console_at_window(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        let stats = self.smd.stats();
-        if stats.console_at_inflight.load(Ordering::Acquire) == 0 {
+        let w = self
+            .console_at_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if w.inflight == 0 {
             return (0, 0);
         }
-        (
-            stats.console_at_started_ms.load(Ordering::Acquire),
-            stats.console_at_timeout_ms.load(Ordering::Acquire),
-        )
+        (w.started_ms, w.deadline_ms.saturating_sub(w.started_ms).max(1))
     }
 }
 
 /// RAII guard tracking an in-flight console AT command for the liveness watchdog.
 pub struct ConsoleAtGuard {
+    window: Arc<std::sync::Mutex<ConsoleAtWindow>>,
     smd: SmdClient,
 }
 
 impl Drop for ConsoleAtGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        let stats = self.smd.stats();
-        let prev = stats.console_at_inflight.fetch_sub(1, Ordering::AcqRel);
-        if prev <= 1 {
-            stats.console_at_started_ms.store(0, Ordering::Release);
-            stats.console_at_timeout_ms.store(0, Ordering::Release);
+        let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        w.inflight = w.inflight.saturating_sub(1);
+        if w.inflight == 0 {
+            w.started_ms = 0;
+            w.deadline_ms = 0;
         }
+        let stats = self.smd.stats();
+        stats.console_at_inflight.store(u64::from(w.inflight), Ordering::Relaxed);
+        stats.console_at_started_ms.store(w.started_ms, Ordering::Relaxed);
+        stats.console_at_timeout_ms.store(
+            if w.inflight == 0 {
+                0
+            } else {
+                w.deadline_ms.saturating_sub(w.started_ms).max(1)
+            },
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1605,7 +1639,7 @@ mod tests {
         let g2 = app.begin_console_at(std::time::Duration::from_secs(60));
         let (s2, t2) = app.console_at_window();
         assert_eq!(s2, s1);
-        assert_eq!(t2, 60_000);
+        assert!(t2 >= 60_000, "expected >= 60000ms budget, got {t2}");
 
         drop(g1);
         assert!(app.console_at_window().0 > 0, "still in-flight while g2 lives");

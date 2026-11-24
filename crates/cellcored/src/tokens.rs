@@ -71,6 +71,10 @@ pub const READ_DENY: &[&str] = &[
     "/api/v1/modem/secrets",
     "/api/v1/admin/backup",
     "/api/v1/admin/backup/download",
+    "/api/v1/admin/processes",
+    "/api/v1/admin/network/connections",
+    "/api/v1/admin/network/neighbours",
+    "/api/v1/dataplane/profiles",
     "/api/v1/sms",
     "/api/v1/events",
     "/api/v1/notify",
@@ -179,7 +183,10 @@ pub fn token_may_access(kind: TokenKind, method: &Method, route: &str, query: Op
             if *method != Method::GET && *method != Method::HEAD {
                 return Err("Read-only token: changes need a read-write token");
             }
-            if READ_DENY.contains(&route) {
+            if READ_DENY
+                .iter()
+                .any(|p| route == *p || route.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
+            {
                 return Err("Read-only tokens cannot read secrets (audit log, identifiers, backups, SMS, crontab)");
             }
             if route == EXPORT_ROUTE && query_flag(query, "identifiers") {
@@ -670,7 +677,12 @@ mod tests {
         assert!(token_may_access(r, &get, "/api/v1/bootstrap", None).is_ok());
         assert!(token_may_access(r, &head, "/api/v1/bootstrap", None).is_ok());
         assert!(token_may_access(r, &get, "/api/v1/metrics", None).is_ok());
-        assert!(token_may_access(r, &get, "/api/v1/admin/processes", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/admin/processes", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/admin/network/connections", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/admin/network/neighbours", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/dataplane/profiles", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/admin/backup/subpath", None).is_err());
+        assert!(token_may_access(r, &get, "/api/v1/sms/123", None).is_err());
         assert!(token_may_access(r, &get, "/api/v1/cellular/bands", None).is_ok());
         assert!(token_may_access(r, &get, "/api/v1/cellular/tower-finder", None).is_ok());
         assert!(token_may_access(r, &get, "/api/v1/vpn/cloudflared", None).is_ok());
@@ -684,8 +696,10 @@ mod tests {
         assert!(token_may_access(r, &put, "/api/v1/admin/cron", None).is_err());
         // A/B firmware status is readable; all POST endpoints are strictly forbidden for read tokens.
         assert!(token_may_access(r, &get, "/api/v1/system/firmware-ab", None).is_ok());
+        assert!(token_may_access(r, &get, "/api/v1/system/firmware-ab/staged", None).is_ok());
         for ep in [
             "/api/v1/system/firmware-ab/inspect",
+            "/api/v1/system/firmware-ab/upload",
             "/api/v1/system/firmware-ab/flash",
             "/api/v1/system/firmware-ab/switch",
             "/api/v1/system/firmware-ab/confirm",

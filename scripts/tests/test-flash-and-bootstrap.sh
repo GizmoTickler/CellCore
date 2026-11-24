@@ -233,6 +233,16 @@ def build_fw_zip(zip_path: str, is_factory: bool, tamper: bool = False):
 build_fw_zip(os.path.join(tmp, "fw_update_ok.zip"), is_factory=False, tamper=False)
 build_fw_zip(os.path.join(tmp, "fw_factory_ok.zip"), is_factory=True, tamper=False)
 build_fw_zip(os.path.join(tmp, "fw_tampered.zip"), is_factory=False, tamper=True)
+
+# Multi-rawprogram zip: verify deterministic preference for p4k_b256k over p2k_b128k
+with zipfile.ZipFile(os.path.join(tmp, "fw_update_ok.zip"), "r") as zin, \
+     zipfile.ZipFile(os.path.join(tmp, "fw_multi_rp.zip"), "w", compression=zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        zout.writestr(item, zin.read(item.filename))
+    zout.writestr(
+        "RM551EGL00AAR02A02M8G/update/firehose/rawprogram_nand_p2K_b128K_update.xml",
+        b'<?xml version="1.0" ?><data><program label="0:boot" filename="boot.img" /></data>\n',
+    )
 PYEOF
 
 assert_cmd_ok "verify-firmware passes valid update zip (Windows \\ + CRLF)" "$FLASH" verify-firmware "$TMP_DIR/fw_update_ok.zip"
@@ -240,6 +250,9 @@ assert_contains "verify-firmware detects update image_type" "$LAST_OUT" "image_t
 assert_contains "verify-firmware detects A/B dual-slot" "$LAST_OUT" "ab_dual_slot=1"
 assert_contains "verify-firmware extracts c_project_name" "$LAST_OUT" "c_project_name=RM551EGL00AAR02A02M8G"
 assert_contains "verify-firmware counts partitions" "$LAST_OUT" "partitions=5"
+
+assert_cmd_ok "verify-firmware deterministically prefers p4k_b256k rawprogram" "$FLASH" verify-firmware "$TMP_DIR/fw_multi_rp.zip"
+assert_contains "verify-firmware chose p4K_b256K over p2K_b128K" "$LAST_OUT" "rawprogram=rawprogram_nand_p4K_b256K_update.xml"
 
 assert_cmd_ok "verify-firmware passes valid factory zip" "$FLASH" verify-firmware "$TMP_DIR/fw_factory_ok.zip"
 assert_contains "verify-firmware detects factory image_type" "$LAST_OUT" "image_type=factory"
@@ -359,6 +372,15 @@ assert_cmd_fail "bootstrap.sh rejects invalid --lan-ip prefix" \
 
 assert_cmd_fail "bootstrap.sh rejects shell metacharacters in --mbn" \
   "$BOOTSTRAP" --adb --ipk "$TMP_DIR/dummy.ipk" --mbn 'Commercial-TMO;reboot' --dry-run
+
+assert_cmd_fail "bootstrap.sh rejects single quotes / shell injection in CELLCORE_FEED_URL" \
+  env CELLCORE_FEED_URL="https://example.com/feed';reboot;'" "$BOOTSTRAP" --adb --ipk "$TMP_DIR/dummy.ipk" --dry-run
+
+assert_cmd_fail "bootstrap.sh rejects whitespace in CELLCORE_FEED_URL" \
+  env CELLCORE_FEED_URL="https://example.com/feed with spaces" "$BOOTSTRAP" --adb --ipk "$TMP_DIR/dummy.ipk" --dry-run
+
+assert_cmd_fail "bootstrap.sh rejects command substitution in CELLCORE_FEED_URL" \
+  env CELLCORE_FEED_URL='https://example.com/$(id)' "$BOOTSTRAP" --adb --ipk "$TMP_DIR/dummy.ipk" --dry-run
 
 assert_cmd_ok "bootstrap.sh accepts valid bundle + all flags in --dry-run" \
   "$BOOTSTRAP" --adb --auto-overlay --ipk "$TMP_DIR/dummy.ipk" \

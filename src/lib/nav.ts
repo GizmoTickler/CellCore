@@ -108,7 +108,7 @@ export const NAV: NavSection[] = [
       { id: "status", label: "Routes & Connections", hint: "Interfaces, routes, neighbours, conntrack", keywords: "interfaces routes routing table arp neighbours conntrack connections" },
       { id: "dhcp", label: "DHCP & DNS", hint: "Static leases, active leases, dnsmasq", keywords: "dhcp dns dnsmasq leases static reservation hostname" },
       { id: "tools", label: "Net Tools", hint: "Ping, traceroute and nslookup", keywords: "ping traceroute nslookup dns lookup diagnostics" },
-      { id: "backup", label: "Backup & LuCI", hint: "Config backup, restore, legacy LuCI", keywords: "backup restore sysupgrade luci legacy" },
+      { id: "backup", label: "Backup & Restore", hint: "Config backup and restore", keywords: "backup restore sysupgrade luci legacy" },
     ],
   },
 ];

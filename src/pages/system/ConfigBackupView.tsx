@@ -211,7 +211,7 @@ export function ConfigBackupView() {
             </p>
             <Notice tone="info" title="Never included (by design)">
               The SMTP password, API tokens, login sessions, and Qualcomm EFS NV / XQCN factory calibration items (never auto-overwritten on restore; back up
-              XQCN separately with QPST/QFIL if needed). For OpenWrt itself use Admin › Backup &amp; LuCI.
+              XQCN separately with QPST/QFIL if needed). For OpenWrt itself use Admin › Backup &amp; Restore.
             </Notice>
             <Switch
               label="Include SIM identifiers"

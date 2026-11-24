@@ -304,17 +304,7 @@ export interface SpeedtestRun {
   serverName?: string | null;
   serverLocation?: string | null;
   externalIp?: string | null;
-  resultUrl?: string | null;
   engine?: string | null;
-}
-
-export interface SpeedtestServerOption {
-  id: number;
-  host: string;
-  port: number;
-  name: string;
-  location: string;
-  country: string;
 }
 
 export interface SpeedtestLiveState {
@@ -333,7 +323,6 @@ export interface SpeedtestLiveState {
   serverName?: string | null;
   serverLocation?: string | null;
   externalIp?: string | null;
-  resultUrl?: string | null;
   engine?: string | null;
   error?: string | null;
   samples?: SpeedtestSample[];

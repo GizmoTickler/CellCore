@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ExternalLink, History, Minus, Play, Radio, Square, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, History, Minus, Play, Radio, Square, Trash2 } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
@@ -89,7 +89,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
     try {
       await disruptiveFetch("speedtest", "/api/v1/speedtest/start", {
         method: "POST",
-        body: JSON.stringify({ engine: "native" }),
+        body: "{}",
       });
       resetSpeedtest();
     } catch (e) {
@@ -137,7 +137,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
         bufferbloatGrade: speedtest.bufferbloatGrade ?? "--",
         serverName: speedtest.serverName,
         serverLocation: speedtest.serverLocation,
-        resultUrl: speedtest.resultUrl,
         isp: speedtest.isp,
         packetLoss: speedtest.packetLoss,
       }
@@ -154,7 +153,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
   const stepIdx = STEPS.findIndex((s) => s.id === speedtest.phase);
 
   const statusLine = speedtest.running
-    ? `Testing ${speedtest.phase === "starting" ? "· finding a server" : `· ${speedtest.phase}`}`
+    ? `Testing ${speedtest.phase === "starting" ? "· connecting to Cloudflare" : `· ${speedtest.phase}`}`
     : speedtest.phase === "complete"
       ? "Run complete"
       : speedtest.phase === "stopped"
@@ -180,18 +179,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
 
   return (
     <>
-      {header(
-        activeRunDisplay?.resultUrl ? (
-          <a
-            href={activeRunDisplay.resultUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex h-9 items-center gap-1.5 rounded-full border border-line bg-raised px-4 text-[13px] font-semibold text-ink hover:border-line-strong"
-          >
-            External result <ExternalLink className="h-3.5 w-3.5" />
-          </a>
-        ) : undefined
-      )}
+      {header()}
 
       {/* ── Hero: run + headline numbers + bufferbloat verdict ── */}
       <Card className="qm-grain overflow-hidden p-0 sm:p-0">
@@ -503,17 +491,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                     <td className="py-2.5 px-3 max-w-[200px]">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span className="truncate text-ink-2">{run.serverName || "--"}</span>
-                        {run.resultUrl && (
-                          <a
-                            href={run.resultUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="shrink-0 rounded-full p-1 text-muted hover:text-ember-ink hover:bg-ember-soft"
-                            aria-label="Open external result"
-                          >
-                            <ExternalLink className="h-3 w-3" />
-                          </a>
-                        )}
                       </div>
                     </td>
                   </tr>

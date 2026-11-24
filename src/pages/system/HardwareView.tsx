@@ -343,7 +343,7 @@ function ImeiModal({ ctl }: { ctl: SystemController }) {
           <TriangleAlert className="h-4 w-4 shrink-0 mt-0.5" />
           <span>
             Changing NVRAM IMEI requires administrator password confirmation and automatically backs up your previous IMEI to UCI (
-            <code className="font-mono">quecmanager.imei.previous</code>).
+            <code className="font-mono">cellcore.imei.previous</code>).
           </span>
         </div>
 

@@ -135,6 +135,61 @@ fn feed_src_line<'a>(text: &'a str, feed: &str) -> Option<&'a str> {
     })
 }
 
+fn is_loopback_or_rfc1918_host(authority: &str) -> bool {
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((bracketed, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if !after.is_empty() && !after.starts_with(':') {
+            return false;
+        }
+        bracketed
+    } else {
+        authority.split_once(':').map_or(authority, |(h, _)| h)
+    };
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return ip.is_loopback() || ip.is_private();
+    }
+    false
+}
+
+/// Validate an opkg feed URL: requires `https://`, allowing `http://` ONLY for
+/// loopback (`localhost`/`127.0.0.1`/`[::1]`) or RFC1918 private LAN mirrors.
+pub fn validate_feed_url(url: &str) -> Result<(), String> {
+    if url.is_empty() || url.len() > 512 {
+        return Err("URL must be non-empty and at most 512 characters".into());
+    }
+    if url
+        .bytes()
+        .any(|b| b <= 0x20 || b >= 0x7f || matches!(b, b'"' | b'\'' | b'`'))
+    {
+        return Err("URL must not contain spaces, quotes, or control characters".into());
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.is_empty() || authority.contains('@') {
+            return Err(format!("Invalid https:// feed URL host: {url}"));
+        }
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if is_loopback_or_rfc1918_host(authority) {
+            return Ok(());
+        }
+        return Err(format!(
+            "Plain http:// feed URLs are only allowed for loopback or RFC1918 local mirrors (got {url})"
+        ));
+    }
+    Err(format!("Feed URL must use https:// (or http:// for loopback/RFC1918 local mirror; got {url})"))
+}
+
 /// Base settings (`dest`, `lists_dir`, `option`, `arch`) from opkg.conf plus
 /// only the CellCore feed's `src` line (read from customfeeds.conf, or
 /// opkg.conf as a fallback) — never a hard-coded URL. Always enforces
@@ -176,9 +231,7 @@ pub fn build_feed_conf(opkg_conf: &str, custom_feeds: &str, feed: &str) -> Resul
         .nth(2)
         .ok_or_else(|| format!("Feed {feed} has no URL"))?
         .to_string();
-    if !(feed_url.starts_with("https://") || feed_url.starts_with("http://")) {
-        return Err(format!("Feed {feed} URL must use https:// or http:// (got {feed_url})"));
-    }
+    validate_feed_url(&feed_url).map_err(|e| format!("Feed {feed}: {e}"))?;
     if !has_check_signature {
         out.push("option check_signature".to_string());
     }
@@ -575,29 +628,86 @@ pub async fn check_feed() -> CheckRecord {
 
 /// Installer run in its own session. Downloads the exact pinned `.ipk` from the
 /// verified CellCore feed URL, verifies its SHA-256 against the signed index,
-/// installs that exact `.ipk` with `opkg install`, and stages it as the rescue
-/// package after post-install verification succeeds.
+/// snapshots the current install, installs that exact `.ipk` with `opkg install`,
+/// verifies health for up to 30 s, rolls back on verification failure, and
+/// stages the verified `.ipk` as the rescue package only after health passes.
 const INSTALL_SCRIPT: &str = r#"
 status="$1"; pkg="$2"; target="$3"; from="$4"; started="$5"; feed_conf="$6"; ipk_url="$7"; expected_sha="$8"; ipk_name="$9"
 dl="/tmp/cellcore-ota-dl.$$"
+rb="/tmp/cellcore-ota-rb.$$"
 ipk_path="$dl/$ipk_name"
+rescue_ipk="/etc/cellcore-rescue/cellcore.ipk"
 mkdir -p "$dl"
+
+json_esc() {
+  printf '%s' "$1" | tr -d '"\\\000-\037'
+}
+
+snapshot_current() {
+  rm -rf "$rb"
+  mkdir -p "$rb/etc" "$rb/opkg-info"
+  [ -x /usr/sbin/cellcored ] && cp -a /usr/sbin/cellcored "$rb/cellcored"
+  [ -d /www ] && cp -a /www "$rb/www"
+  [ -f /etc/init.d/cellcored ] && cp -a /etc/init.d/cellcored "$rb/init.d-cellcored"
+  [ -f /etc/init.d/dropbear-lan-watchdog ] && cp -a /etc/init.d/dropbear-lan-watchdog "$rb/init.d-dropbear-lan-watchdog"
+  [ -d /etc/cellcore ] && cp -a /etc/cellcore "$rb/etc/cellcore"
+  [ -f /usr/lib/opkg/status ] && cp -a /usr/lib/opkg/status "$rb/opkg-status"
+  cp -a /usr/lib/opkg/info/sdxpinn-cellcore.* "$rb/opkg-info/" 2>/dev/null || true
+}
+
+do_rollback() {
+  reason="$1"
+  echo "[$(date)] ERROR: $reason -- running rollback"
+  rb_done=0
+  if [ -f "$rescue_ipk" ]; then
+    echo "[$(date)] Attempting rescue package restore from $rescue_ipk"
+    if opkg install --force-downgrade --force-reinstall "$rescue_ipk"; then
+      rb_done=1
+    fi
+  fi
+  if [ "$rb_done" -ne 1 ] && [ -d "$rb" ]; then
+    echo "[$(date)] Restoring pre-upgrade snapshot from $rb"
+    [ -x "$rb/cellcored" ] && cp -af "$rb/cellcored" /usr/sbin/cellcored
+    if [ -d "$rb/www" ]; then
+      rm -rf /www
+      cp -a "$rb/www" /www
+    fi
+    [ -f "$rb/init.d-cellcored" ] && cp -af "$rb/init.d-cellcored" /etc/init.d/cellcored
+    [ -f "$rb/init.d-dropbear-lan-watchdog" ] && cp -af "$rb/init.d-dropbear-lan-watchdog" /etc/init.d/dropbear-lan-watchdog
+    if [ -d "$rb/etc/cellcore" ]; then
+      mkdir -p /etc/cellcore
+      cp -af "$rb/etc/cellcore/." /etc/cellcore/
+    fi
+    [ -f "$rb/opkg-status" ] && cp -af "$rb/opkg-status" /usr/lib/opkg/status
+    if [ -d "$rb/opkg-info" ]; then
+      rm -f /usr/lib/opkg/info/sdxpinn-cellcore.* 2>/dev/null || true
+      cp -af "$rb/opkg-info/." /usr/lib/opkg/info/ 2>/dev/null || true
+    fi
+  fi
+  /etc/init.d/cellcored restart >/dev/null 2>&1 || /etc/init.d/cellcored start >/dev/null 2>&1 || true
+  sleep 2
+}
+
 echo "[$(date)] pinned OTA download $pkg $target from verified feed ($ipk_url)"
 dl_ok=0
 if command -v curl >/dev/null 2>&1; then
   curl -fsSL --connect-timeout 20 --max-time 180 -o "$ipk_path" "$ipk_url" && dl_ok=1
 elif command -v uclient-fetch >/dev/null 2>&1; then
-  uclient-fetch -q -O "$ipk_path" "$ipk_url" && dl_ok=1
+  uclient-fetch -T 60 -q -O "$ipk_path" "$ipk_url" && dl_ok=1
 elif command -v wget >/dev/null 2>&1; then
-  wget -q -O "$ipk_path" "$ipk_url" && dl_ok=1
+  wget -T 60 -q -O "$ipk_path" "$ipk_url" && dl_ok=1
 else
   echo "[$(date)] ERROR: no HTTP downloader (curl/uclient-fetch/wget) available"
 fi
 rc=1
+install_attempted=0
+msg=""
 if [ "$dl_ok" -eq 1 ] && [ -f "$ipk_path" ]; then
   actual_sha=$(sha256sum "$ipk_path" 2>/dev/null | awk '{print $1}' | tr 'A-Z' 'a-z')
   if [ -n "$actual_sha" ] && [ "$actual_sha" = "$expected_sha" ]; then
-    echo "[$(date)] verified SHA-256 ($actual_sha); running opkg install $ipk_path"
+    echo "[$(date)] verified SHA-256 ($actual_sha); snapshotting current install and running opkg install $ipk_path"
+    snapshot_current
+    install_attempted=1
     opkg -f "$feed_conf" install "$ipk_path"
     rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -606,16 +716,18 @@ if [ "$dl_ok" -eq 1 ] && [ -f "$ipk_path" ]; then
       rc=$?
     fi
   else
+    msg="SHA-256 mismatch for $ipk_name"
     echo "[$(date)] ERROR: SHA-256 mismatch for $ipk_name (expected $expected_sha, got ${actual_sha:-missing})"
     rc=1
   fi
 else
+  msg="failed to download $ipk_name"
   echo "[$(date)] ERROR: failed to download $ipk_url"
   rc=1
 fi
 inst=$(opkg list-installed "$pkg" | sed -n "s/^$pkg - \([^ ]*\).*/\1/p" | head -n 1)
+st=failed
 if [ "$rc" -eq 0 ] && [ "$inst" = "$target" ]; then
-  st=succeeded
   vi=0
   vok=0
   while [ "$vi" -lt 30 ]; do
@@ -626,18 +738,42 @@ if [ "$rc" -eq 0 ] && [ "$inst" = "$target" ]; then
     sleep 1
     vi=$((vi + 1))
   done
-  if [ "$vok" -eq 1 ] && [ -f "$ipk_path" ]; then
-    mkdir -p /etc/cellcore-rescue
-    cp -f "$ipk_path" /etc/cellcore-rescue/cellcore.ipk.tmp && mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
-    echo "[$(date)] staged verified rescue package -> /etc/cellcore-rescue/cellcore.ipk"
+  if [ "$vok" -eq 1 ]; then
+    st=succeeded
+    if [ -f "$ipk_path" ]; then
+      mkdir -p /etc/cellcore-rescue
+      cp -f "$ipk_path" /etc/cellcore-rescue/cellcore.ipk.tmp && mv -f /etc/cellcore-rescue/cellcore.ipk.tmp "$rescue_ipk"
+      echo "[$(date)] staged verified rescue package -> $rescue_ipk"
+    fi
+  else
+    st=failed
+    rc=1
+    msg="cellcored verify failed after 30s; rolled back"
+    do_rollback "$msg"
+    inst=$(opkg list-installed "$pkg" | sed -n "s/^$pkg - \([^ ]*\).*/\1/p" | head -n 1)
   fi
 else
   st=failed
+  if [ "$install_attempted" -eq 1 ]; then
+    msg="opkg install exited $rc; rolled back"
+    do_rollback "$msg"
+    inst=$(opkg list-installed "$pkg" | sed -n "s/^$pkg - \([^ ]*\).*/\1/p" | head -n 1)
+  fi
 fi
-rm -rf "$dl"
+rm -rf "$dl" "$rb"
 echo "[$(date)] opkg exited $rc; installed now: ${inst:-unknown} -> $st"
-printf '{"state":"%s","target":"%s","from":"%s","startedAt":%s,"finishedAt":%s,"exitCode":%s,"installedAfter":"%s"}\n' \
-  "$st" "$target" "$from" "$started" "$(date +%s)" "$rc" "$inst" > "$status.tmp" && mv "$status.tmp" "$status"
+st_e=$(json_esc "$st")
+target_e=$(json_esc "$target")
+from_e=$(json_esc "$from")
+inst_e=$(json_esc "$inst")
+msg_e=$(json_esc "$msg")
+if [ -n "$msg_e" ]; then
+  msg_json="\"$msg_e\""
+else
+  msg_json="null"
+fi
+printf '{"state":"%s","target":"%s","from":"%s","startedAt":%s,"finishedAt":%s,"exitCode":%s,"installedAfter":"%s","message":%s}\n' \
+  "$st_e" "$target_e" "$from_e" "$started" "$(date +%s)" "$rc" "$inst_e" "$msg_json" > "$status.tmp" && mv "$status.tmp" "$status"
 "#;
 
 /// Spawn `/bin/sh -c script _ args...` detached: new session, stdin closed,
@@ -739,6 +875,193 @@ pub async fn start_upgrade(pkg: &str, requested: Option<&str>) -> Result<Upgrade
         let _ = atomic_write(Path::new(&status_path), &serde_json::to_vec(&st).unwrap_or_default(), 0o644);
     }
     Ok(st)
+}
+
+/// Shared verified self-upgrade trigger for HTTP admin endpoints: enforces
+/// overlay space, refreshes and cryptographically verifies the signed CellCore
+/// feed (`option check_signature` + `"Signature check passed"`), pins the
+/// target `.ipk` filename and SHA-256 from the signed feed index, and launches
+/// the detached installer with rollback protection.
+pub async fn trigger_verified_self_upgrade(
+    pkg: &str,
+    requested: Option<&str>,
+    refresh_feed: bool,
+) -> Result<UpgradeStatus, String> {
+    if upgrade_running() {
+        return Err("An upgrade is already running".into());
+    }
+    if let Some(free) = crate::admin::opkg::overlay_free_bytes()
+        && free < crate::admin::opkg::MIN_SELF_UPGRADE_BYTES
+    {
+        return Err(format!(
+            "Insufficient overlay space: {} MiB free, at least {} MiB required",
+            free / (1024 * 1024),
+            crate::admin::opkg::MIN_SELF_UPGRADE_BYTES / (1024 * 1024)
+        ));
+    }
+    if refresh_feed {
+        let rec = check_feed().await;
+        if !rec.ok || rec.signature_verified != Some(true) {
+            return Err(rec
+                .error
+                .unwrap_or_else(|| "Signed CellCore feed verification failed".into()));
+        }
+    }
+    start_upgrade(pkg, requested).await
+}
+
+/// Shared verified CLI upgrade entrypoint (`cellctl upgrade [--check|--yes]`):
+/// always refreshes and verifies the signed `CellCore-repo` feed signature and
+/// pins the target `.ipk` SHA-256 before installing.
+pub fn run_verified_cli_upgrade(check_only: bool, yes: bool) -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error=runtime_init detail={e}");
+            return 1;
+        }
+    };
+    let (pkg, status_installed) = crate::admin::opkg::find_qm_package_status();
+    let installed = status_installed.or_else(|| rt.block_on(installed_version(&pkg)).ok().flatten());
+
+    let rec = rt.block_on(check_feed());
+    if !rec.ok || rec.signature_verified != Some(true) {
+        eprintln!(
+            "error=feed_signature_check_failed detail={}",
+            rec.error.unwrap_or_else(|| "feed signature verification failed".into())
+        );
+        return 1;
+    }
+
+    let available = match rt.block_on(feed_version(&pkg)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error=feed_list_failed detail={e}");
+            return 1;
+        }
+    };
+
+    if check_only {
+        let update_available = classify(installed.as_deref(), available.as_deref()) == OtaState::UpdateAvailable;
+        println!(
+            "package={pkg} installed={} available={} update_available={} signature_verified=1",
+            installed.as_deref().unwrap_or("none"),
+            available.as_deref().unwrap_or("none"),
+            if update_available { 1 } else { 0 }
+        );
+        return 0;
+    }
+
+    if !yes {
+        eprintln!("Usage: cellctl upgrade [--check] | cellctl upgrade --yes");
+        return 2;
+    }
+
+    if upgrade_running() {
+        eprintln!("error=upgrade_running detail=another upgrade is already in progress");
+        return 1;
+    }
+
+    if let Some(free) = crate::admin::opkg::overlay_free_bytes()
+        && free < crate::admin::opkg::MIN_SELF_UPGRADE_BYTES
+    {
+        eprintln!(
+            "error=insufficient_overlay_space free_bytes={free} required_bytes={}",
+            crate::admin::opkg::MIN_SELF_UPGRADE_BYTES
+        );
+        return 1;
+    }
+
+    let target = match decide_upgrade(installed.as_deref(), available.as_deref(), None) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error=upgrade_refused detail={e}");
+            return 1;
+        }
+    };
+    let fc = match load_feed_conf() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error=feed_conf detail={e}");
+            return 1;
+        }
+    };
+    let feed_conf_path = crate::paths::p(FEED_CONF_TMP);
+    let info_out = match rt.block_on(run_cmd(
+        "opkg",
+        &["-f", &feed_conf_path, "info", &pkg],
+        Duration::from_secs(15),
+    )) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error=opkg_info detail={e}");
+            return 1;
+        }
+    };
+    let meta = match parse_pkg_metadata(&info_out, &pkg, &target) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error=pkg_metadata detail={e}");
+            return 1;
+        }
+    };
+
+    let ipk_url = format!("{}/{}", fc.feed_url.trim_end_matches('/'), meta.filename);
+    let from = installed.unwrap_or_else(|| "unknown".into());
+    let started = now_secs();
+    let status_path = crate::paths::p(UPGRADE_STATUS_PATH);
+    let init_st = UpgradeStatus {
+        state: "running".into(),
+        target: target.clone(),
+        from: from.clone(),
+        started_at: started,
+        pid: Some(std::process::id()),
+        ..Default::default()
+    };
+    let _ = atomic_write(
+        Path::new(&status_path),
+        &serde_json::to_vec(&init_st).unwrap_or_default(),
+        0o644,
+    );
+
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    let started_s = started.to_string();
+    let status = std::process::Command::new(crate::paths::p("/bin/sh"))
+        .arg("-c")
+        .arg(INSTALL_SCRIPT)
+        .arg("qm-ota-cli")
+        .args([
+            status_path.as_str(),
+            pkg.as_str(),
+            target.as_str(),
+            from.as_str(),
+            started_s.as_str(),
+            feed_conf_path.as_str(),
+            ipk_url.as_str(),
+            meta.sha256.as_str(),
+            meta.filename.as_str(),
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() && read_upgrade_status().is_some_and(|st| st.state == "succeeded") => {
+            println!("ok=1 package={pkg} upgraded_from={from} target={target} sha256={}", meta.sha256);
+            0
+        }
+        Ok(s) => {
+            let detail = read_upgrade_status()
+                .and_then(|st| st.message)
+                .unwrap_or_else(|| format!("exit={:?}", s.code()));
+            eprintln!("error=upgrade_failed detail={detail}");
+            1
+        }
+        Err(e) => {
+            eprintln!("error=exec_failed detail={e}");
+            1
+        }
+    }
 }
 
 #[cfg(test)]
@@ -971,6 +1294,39 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("opkg -f \"$feed_conf\" install \"$ipk_path\""));
         assert!(INSTALL_SCRIPT.contains("/usr/sbin/cellcored verify --expect-wan 0"));
         assert!(INSTALL_SCRIPT.contains(RESCUE_IPK_PATH));
+        assert!(INSTALL_SCRIPT.contains("uclient-fetch -T 60"));
+        assert!(INSTALL_SCRIPT.contains("wget -T 60"));
+        assert!(INSTALL_SCRIPT.contains("do_rollback"));
+        assert!(INSTALL_SCRIPT.contains("json_esc"));
+        // Verify st=succeeded is ONLY set after the 30s verify loop succeeds, never before
+        let verify_idx = INSTALL_SCRIPT
+            .find("/usr/sbin/cellcored verify --expect-wan 0")
+            .unwrap();
+        let succ_idx = INSTALL_SCRIPT.find("st=succeeded").unwrap();
+        assert!(
+            succ_idx > verify_idx,
+            "st=succeeded must only be set after verify loop succeeds"
+        );
+    }
+
+    #[test]
+    fn validate_feed_url_requires_https_or_private_local_http() {
+        assert!(validate_feed_url("https://raw.githubusercontent.com/org/repo/main/feed").is_ok());
+        assert!(validate_feed_url("http://127.0.0.1:8000/feed").is_ok());
+        assert!(validate_feed_url("http://localhost:8080/feed").is_ok());
+        assert!(validate_feed_url("http://[::1]:8080/feed").is_ok());
+        assert!(validate_feed_url("http://192.168.1.50/feed").is_ok());
+        assert!(validate_feed_url("http://10.0.0.5:8080/feed").is_ok());
+        assert!(validate_feed_url("http://172.16.4.2/feed").is_ok());
+
+        // Public plain HTTP and non-HTTP(S) schemes must be rejected
+        assert!(validate_feed_url("http://example.com/feed").is_err());
+        assert!(validate_feed_url("http://8.8.8.8/feed").is_err());
+        assert!(validate_feed_url("http://172.32.0.1/feed").is_err());
+        assert!(validate_feed_url("http://127.0.0.1@evil.com/feed").is_err());
+        assert!(validate_feed_url("ftp://example.com/feed").is_err());
+        assert!(validate_feed_url("file:///etc/passwd").is_err());
+        assert!(validate_feed_url("https://example.com/a'b").is_err());
     }
 
     #[tokio::test]

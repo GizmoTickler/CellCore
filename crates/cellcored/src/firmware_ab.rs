@@ -28,14 +28,19 @@ use std::{
 
 use axum::{
     Json,
+    body::Body,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt as _;
 use md5::Digest as _;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    io::AsyncWriteExt as _,
+    sync::{Mutex, RwLock},
+};
 
 use crate::{http::HttpCtx, state::AppState};
 
@@ -43,7 +48,14 @@ pub const AB_STATE_PATH: &str = "/etc/cellcore/ab-flash-state.json";
 pub const AB_LOCK_PATH: &str = "/var/run/cellcore-ab-flash.lock";
 pub const STAGE_DIR: &str = "/tmp/cellcore-ab-stage";
 pub const SYSMNT_DIR: &str = "/tmp/cellcore-ab-sysmnt";
+pub const UPLOAD_CACHE_DIR: &str = "/usrdata/cache";
 pub const MIN_STAGE_FREE_MIB: u64 = 128;
+pub const FLASH_SPACE_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_UPLOAD_ZIP_BYTES: u64 = 250 * 1024 * 1024;
+pub const UPLOAD_MIN_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
+const UNZIP_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_CONFIRM_DELAY_SECS: u64 = 90;
+const MAX_STAGED_ENTRIES: usize = 50;
 const MAX_LOG_LINES: usize = 200;
 
 /// Rootfs scope A/B partition bases (2).
@@ -375,6 +387,8 @@ pub struct AbStatusResponse {
     pub project_name: Option<String>,
     pub project_rev: Option<String>,
     pub tmp_avail_mib: Option<u64>,
+    pub ab_updater_enabled: bool,
+    pub mirror_copy_enabled: bool,
     pub job: AbJobProgress,
     pub last_state: PersistedAbFlashState,
 }
@@ -996,7 +1010,7 @@ pub fn read_rci_info() -> Option<RciInfo> {
     Some(parse_rci_output(&out))
 }
 
-fn statvfs_avail_mib(path: &str) -> Option<u64> {
+fn statvfs_avail_bytes(path: &str) -> Option<u64> {
     let mapped = crate::paths::p(path);
     let c = CString::new(Path::new(&mapped).as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1005,7 +1019,69 @@ fn statvfs_avail_mib(path: &str) -> Option<u64> {
         return None;
     }
     let bytes = (st.f_bavail as u128).saturating_mul(st.f_frsize as u128);
-    Some((bytes / (1024 * 1024)) as u64)
+    Some(bytes.min(u64::MAX as u128) as u64)
+}
+
+fn statvfs_avail_mib(path: &str) -> Option<u64> {
+    statvfs_avail_bytes(path).map(|b| b / (1024 * 1024))
+}
+
+fn detect_vendor_ab_init_enabled() -> (bool, bool) {
+    let dir = crate::paths::p("/etc/rc.d");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return (false, false);
+    };
+    let mut ab_updater = false;
+    let mut mirror_copy = false;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with('S') {
+            continue;
+        }
+        if name.contains("ab-updater") {
+            ab_updater = true;
+        }
+        if name.contains("mirror_copy") {
+            mirror_copy = true;
+        }
+    }
+    (ab_updater, mirror_copy)
+}
+
+pub fn detect_conflicting_vendor_ab_procs() -> Vec<String> {
+    let mut found = Vec::new();
+    let proc_dir = crate::paths::p("/proc");
+    let Ok(entries) = fs::read_dir(&proc_dir) else {
+        return found;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let comm = fs::read_to_string(e.path().join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let cmdline_raw = fs::read(e.path().join("cmdline")).unwrap_or_default();
+        let argv0 = cmdline_raw
+            .split(|&b| b == 0)
+            .next()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .unwrap_or_default();
+        let argv0_base = Path::new(&argv0)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        for target in ["mirror_copy", "ab-updater"] {
+            if comm == target || argv0_base == target {
+                found.push(format!("{target} (pid {name})"));
+                break;
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 pub fn load_persisted_state() -> PersistedAbFlashState {
@@ -1019,6 +1095,7 @@ pub fn save_persisted_state(st: &PersistedAbFlashState) -> Result<(), String> {
 pub fn probe_ab_status(job: AbJobProgress) -> AbStatusResponse {
     let (project_name, project_rev) = read_device_project_info();
     let tmp_avail_mib = statvfs_avail_mib("/tmp");
+    let (ab_updater_enabled, mirror_copy_enabled) = detect_vendor_ab_init_enabled();
     let last_state = load_persisted_state();
 
     let mtds = match read_proc_mtd() {
@@ -1038,6 +1115,8 @@ pub fn probe_ab_status(job: AbJobProgress) -> AbStatusResponse {
                 project_name,
                 project_rev,
                 tmp_avail_mib,
+                ab_updater_enabled,
+                mirror_copy_enabled,
                 job,
                 last_state,
             };
@@ -1062,6 +1141,8 @@ pub fn probe_ab_status(job: AbJobProgress) -> AbStatusResponse {
                 project_name,
                 project_rev,
                 tmp_avail_mib,
+                ab_updater_enabled,
+                mirror_copy_enabled,
                 job,
                 last_state,
             };
@@ -1083,6 +1164,8 @@ pub fn probe_ab_status(job: AbJobProgress) -> AbStatusResponse {
         project_name,
         project_rev,
         tmp_avail_mib,
+        ab_updater_enabled,
+        mirror_copy_enabled,
         job,
         last_state,
     }
@@ -1119,6 +1202,65 @@ pub fn validate_source_path(raw: &str) -> Result<PathBuf, String> {
         return Err(format!("firmware package path not found: {}", path.display()));
     }
     Ok(path)
+}
+
+/// Strict path confinement for HTTP API endpoints (`inspect` and `flash`):
+/// rejects symlinks, non-regular/non-dir files (device nodes, FIFOs), and any
+/// canonical path outside `/tmp/` or `/usrdata/` (respecting `crate::paths::p`).
+pub fn validate_http_source_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("firmware package path is required".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("firmware package path contains NUL byte".into());
+    }
+    if !trimmed.starts_with('/') {
+        return Err("firmware package path must be an absolute path under /tmp/ or /usrdata/".into());
+    }
+    let raw_path = PathBuf::from(trimmed);
+    for c in raw_path.components() {
+        if matches!(c, Component::ParentDir) {
+            return Err("firmware package path must not contain '..' traversal".into());
+        }
+    }
+
+    let mapped = PathBuf::from(crate::paths::p(trimmed));
+    let sym_meta = fs::symlink_metadata(&mapped)
+        .map_err(|_| format!("firmware package path not found: {trimmed}"))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("firmware package path must not be a symlink".into());
+    }
+    if !(sym_meta.file_type().is_file() || sym_meta.file_type().is_dir()) {
+        return Err("firmware package path must be a regular file or directory".into());
+    }
+
+    let canon = fs::canonicalize(&mapped)
+        .map_err(|e| format!("failed to canonicalize firmware package path: {e}"))?;
+    let canon_meta = fs::metadata(&canon)
+        .map_err(|e| format!("failed to stat firmware package path: {e}"))?;
+    if !(canon_meta.is_file() || canon_meta.is_dir()) {
+        return Err("firmware package path must be a regular file or directory".into());
+    }
+
+    let allowed_roots: Vec<PathBuf> = ["/tmp", "/usrdata"]
+        .into_iter()
+        .map(|root| {
+            let p = PathBuf::from(crate::paths::p(root));
+            fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect();
+
+    if !allowed_roots
+        .iter()
+        .any(|root| canon.starts_with(root) && canon != *root)
+    {
+        return Err(
+            "firmware package path must reside strictly inside /tmp/ or /usrdata/".into(),
+        );
+    }
+
+    Ok(canon)
 }
 
 fn parse_unzip_list(stdout: &str) -> HashMap<String, (String, u64)> {
@@ -1517,6 +1659,7 @@ fn stream_hash_and_maybe_stage<R: Read>(
     reader: &mut R,
     out_file: Option<&mut fs::File>,
     max_bytes: u64,
+    deadline: Option<(std::os::fd::RawFd, std::time::Instant)>,
 ) -> Result<(u64, String, String, [u8; 4]), String> {
     let mut md5 = md5::Md5::new();
     let mut sha = Sha256::new();
@@ -1526,6 +1669,37 @@ fn stream_hash_and_maybe_stage<R: Read>(
     let mut out = out_file;
 
     loop {
+        if let Some((fd, dl)) = deadline {
+            loop {
+                let now = std::time::Instant::now();
+                if now >= dl {
+                    return Err(format!(
+                        "unzip stream timed out after {}s",
+                        UNZIP_STREAM_TIMEOUT.as_secs()
+                    ));
+                }
+                let rem_ms = dl
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .min(500) as libc::c_int;
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, rem_ms.max(1)) };
+                if rc > 0 {
+                    break;
+                }
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(format!("poll image stream: {err}"));
+                }
+            }
+        }
         let n = reader.read(&mut buf).map_err(|e| format!("read image stream: {e}"))?;
         if n == 0 {
             break;
@@ -1575,7 +1749,7 @@ fn prepare_single_image(
             let mut f = fs::File::open(&full)
                 .map_err(|e| format!("open {}: {e}", full.display()))?;
             let (size, md5_hex, sha256_hex, magic4) =
-                stream_hash_and_maybe_stage(&mut f, None, part.mtd_size)?;
+                stream_hash_and_maybe_stage(&mut f, None, part.mtd_size, None)?;
             Ok(StreamedImage {
                 disk_path: Some(full),
                 is_staged_temp: false,
@@ -1616,32 +1790,72 @@ fn prepare_single_image(
             let mut tmp_file = match &staged_path {
                 Some(sp) => {
                     let _ = fs::remove_file(sp);
-                    Some(
-                        crate::state::create_private_tmp(sp, 0o600)
-                            .map_err(|e| format!("create staged file {}: {e}", sp.display()))?,
-                    )
+                    match crate::state::create_private_tmp(sp, 0o600) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            drop(stdout);
+                            let _ = err_thread.join();
+                            return Err(format!("create staged file {}: {e}", sp.display()));
+                        }
+                    }
                 }
                 None => None,
             };
 
-            let stream_res =
-                stream_hash_and_maybe_stage(&mut stdout, tmp_file.as_mut(), part.mtd_size);
+            let deadline = std::time::Instant::now() + UNZIP_STREAM_TIMEOUT;
+            let stdout_fd = stdout.as_raw_fd();
+            let stream_res = stream_hash_and_maybe_stage(
+                &mut stdout,
+                tmp_file.as_mut(),
+                part.mtd_size,
+                Some((stdout_fd, deadline)),
+            );
             drop(tmp_file);
             drop(stdout);
 
-            let status = child
-                .wait()
-                .map_err(|e| format!("wait unzip -p: {e}"))?;
+            if let Err(e) = stream_res {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = err_thread.join();
+                if let Some(sp) = &staged_path {
+                    let _ = fs::remove_file(sp);
+                }
+                return Err(e);
+            }
+
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => break Some(st),
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = err_thread.join();
+                        if let Some(sp) = &staged_path {
+                            let _ = fs::remove_file(sp);
+                        }
+                        return Err(format!("wait unzip -p: {e}"));
+                    }
+                }
+            };
             let err_bytes = err_thread.join().unwrap_or_default();
 
-            let (size, md5_hex, sha256_hex, magic4) = match stream_res {
-                Ok(v) => v,
-                Err(e) => {
-                    if let Some(sp) = &staged_path {
-                        let _ = fs::remove_file(sp);
-                    }
-                    return Err(e);
+            let (size, md5_hex, sha256_hex, magic4) = stream_res.unwrap();
+            let Some(status) = status else {
+                if let Some(sp) = &staged_path {
+                    let _ = fs::remove_file(sp);
                 }
+                return Err(format!(
+                    "unzip -p {entry_name} timed out after {}s",
+                    UNZIP_STREAM_TIMEOUT.as_secs()
+                ));
             };
             if !status.success() {
                 if let Some(sp) = &staged_path {
@@ -1700,14 +1914,41 @@ fn pick_unused_ubi_dev() -> u32 {
     7
 }
 
-fn stage_cellcored_to_usrdata(log: &mut impl FnMut(&str)) -> Result<(), String> {
+fn check_usrdata_space_for_cellcored() -> Result<u64, String> {
     let src_path = PathBuf::from(crate::paths::p("/usr/sbin/cellcored"));
-    if !src_path.is_file() {
-        return Err(format!(
+    let src_meta = fs::metadata(&src_path).map_err(|_| {
+        format!(
             "cannot preserve CellCore: {} does not exist",
+            src_path.display()
+        )
+    })?;
+    if !src_meta.is_file() {
+        return Err(format!(
+            "cannot preserve CellCore: {} is not a regular file",
             src_path.display()
         ));
     }
+    let cellcored_size = src_meta.len();
+    let need = cellcored_size.saturating_add(FLASH_SPACE_HEADROOM_BYTES);
+    let usrdata_dir = PathBuf::from(crate::paths::p("/usrdata"));
+    let avail = statvfs_avail_bytes("/usrdata").ok_or_else(|| {
+        format!(
+            "cannot preserve CellCore: unable to check available space on {}",
+            usrdata_dir.display()
+        )
+    })?;
+    if avail < need {
+        return Err(format!(
+            "insufficient /usrdata space to preserve CellCore: {} bytes available, need at least {} bytes (cellcored {} + 16 MiB headroom)",
+            avail, need, cellcored_size
+        ));
+    }
+    Ok(cellcored_size)
+}
+
+fn stage_cellcored_to_usrdata(log: &mut impl FnMut(&str)) -> Result<(), String> {
+    let _ = check_usrdata_space_for_cellcored()?;
+    let src_path = PathBuf::from(crate::paths::p("/usr/sbin/cellcored"));
     let dst_dir = PathBuf::from(crate::paths::p("/usrdata/bin"));
     fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
     let dst_path = dst_dir.join("cellcored");
@@ -1861,6 +2102,7 @@ fn flash_ubi_partition(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flash_raw_mtd_partition(
     part: &PlannedPartition,
     img_path: &Path,
@@ -1868,6 +2110,7 @@ fn flash_raw_mtd_partition(
     expected_sha256: &str,
     stage_dir: &Path,
     verify_readback: bool,
+    remove_img_after_flash: bool,
     log: &mut impl FnMut(&str),
 ) -> Result<(), String> {
     let mtd_dev = crate::paths::p(&format!("/dev/mtd{}", part.mtd_num));
@@ -1899,6 +2142,13 @@ fn flash_raw_mtd_partition(
             &["-p", &mtd_dev, img_str],
             Duration::from_secs(300),
         )?;
+    }
+
+    // Free the staged zip temp file BEFORE reading back from NAND so peak /tmp
+    // tmpfs usage stays at 1x image size instead of 2x (never delete source files
+    // when flashing from an unpacked directory!).
+    if remove_img_after_flash {
+        let _ = fs::remove_file(img_path);
     }
 
     if verify_readback {
@@ -1972,6 +2222,45 @@ where
         ));
     }
 
+    let source_name = source_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| source_path.display().to_string());
+
+    if !opts.dry_run {
+        let conflicts = detect_conflicting_vendor_ab_procs();
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "refusing A/B flash while conflicting vendor updater process is running: {}",
+                conflicts.join(", ")
+            ));
+        }
+
+        let max_planned_img_bytes = plan
+            .partitions
+            .iter()
+            .filter_map(|p| p.file_size)
+            .max()
+            .unwrap_or(0);
+        if matches!(pkg, PackageSource::Zip { .. }) || opts.verify_readback {
+            let tmp_root = PathBuf::from(crate::paths::p("/tmp"));
+            let _ = fs::create_dir_all(&tmp_root);
+            let need_tmp = max_planned_img_bytes.saturating_add(FLASH_SPACE_HEADROOM_BYTES);
+            let avail_tmp = statvfs_avail_bytes("/tmp")
+                .ok_or_else(|| "cannot check available /tmp space before flash".to_string())?;
+            if avail_tmp < need_tmp {
+                return Err(format!(
+                    "insufficient /tmp space for flash staging/verify: {} bytes available, need at least {} bytes (max image {} + 16 MiB headroom)",
+                    avail_tmp, need_tmp, max_planned_img_bytes
+                ));
+            }
+        }
+
+        if opts.preserve_cellcore && plan.partitions.iter().any(|p| p.base_label == "system") {
+            let _ = check_usrdata_space_for_cellcored()?;
+        }
+    }
+
     push_log(
         &format!(
             "{} A/B flash: active={} -> target={} scope={} ({total} partitions)",
@@ -1999,143 +2288,190 @@ where
     };
 
     let mut flashed_names = Vec::with_capacity(total);
+    let mut dirty_state_persisted = false;
 
     for (idx, part) in plan.partitions.iter().enumerate() {
-        // Re-assert safety invariants per partition
-        if is_never_touch_partition(&part.base_label)
-            || is_never_touch_partition(&part.target_partition)
-            || !is_known_ab_base(&part.base_label)
-            || part.target_partition == plan.active_slot.partition_name(&part.base_label)
-        {
-            return Err(format!(
-                "safety abort: refused unsafe partition '{}'",
-                part.target_partition
-            ));
-        }
-        let attached = read_attached_ubi_mtds();
-        if attached.contains(&part.mtd_num) {
-            return Err(format!(
-                "safety abort: /dev/mtd{} ('{}') is currently UBI-attached!",
-                part.mtd_num, part.target_partition
-            ));
-        }
-
-        let (entry_name, _) = pkg.resolve_image_entry(&prefix, &part.zip_relpath)?;
-        push_log(
-            &format!(
-                "[{}/{}] Verifying {} -> {} (mtd{})",
-                idx + 1,
-                total,
-                part.zip_relpath,
-                part.target_partition,
-                part.mtd_num
-            ),
-            Some(&part.target_partition),
-            idx,
-        );
-
-        let streamed = prepare_single_image(&pkg, &entry_name, &stage_dir, part, !opts.dry_run)?;
-        let _temp_guard = if streamed.is_staged_temp {
-            RemoveFileGuard(streamed.disk_path.clone())
-        } else {
-            RemoveFileGuard(None)
-        };
-
-        if let Some(expected_md5) = part.expected_md5.as_deref() {
-            if !streamed.md5_hex.eq_ignore_ascii_case(expected_md5) {
+        let part_res: Result<(), String> = (|| {
+            // Re-assert safety invariants per partition
+            if is_never_touch_partition(&part.base_label)
+                || is_never_touch_partition(&part.target_partition)
+                || !is_known_ab_base(&part.base_label)
+                || part.target_partition == plan.active_slot.partition_name(&part.base_label)
+            {
                 return Err(format!(
-                    "MD5 mismatch for '{}': expected {expected_md5}, got {}",
-                    part.zip_relpath, streamed.md5_hex
+                    "safety abort: refused unsafe partition '{}'",
+                    part.target_partition
                 ));
             }
-            push_log(
-                &format!(
-                    "MD5 OK for {} ({} bytes, md5={}…)",
-                    part.target_partition,
-                    streamed.size,
-                    &streamed.md5_hex[..12]
-                ),
-                Some(&part.target_partition),
-                idx,
-            );
-        } else {
-            push_log(
-                &format!(
-                    "No expected MD5 for {} ({} bytes, sha256={}…)",
-                    part.target_partition,
-                    streamed.size,
-                    &streamed.sha256_hex[..12]
-                ),
-                Some(&part.target_partition),
-                idx,
-            );
-        }
+            let attached = read_attached_ubi_mtds();
+            if attached.contains(&part.mtd_num) {
+                return Err(format!(
+                    "safety abort: /dev/mtd{} ('{}') is currently UBI-attached!",
+                    part.mtd_num, part.target_partition
+                ));
+            }
 
-        if part.is_ubi && &streamed.magic4 != b"UBI#" {
-            return Err(format!(
-                "invalid UBI magic on '{}' (expected 'UBI#', got {:02x?})",
-                part.zip_relpath, streamed.magic4
-            ));
-        }
-
-        if opts.dry_run {
+            let (entry_name, _) = pkg.resolve_image_entry(&prefix, &part.zip_relpath)?;
             push_log(
                 &format!(
-                    "[dry-run] Would flash {} -> /dev/mtd{} ('{}', {} bytes, {})",
+                    "[{}/{}] Verifying {} -> {} (mtd{})",
+                    idx + 1,
+                    total,
                     part.zip_relpath,
-                    part.mtd_num,
                     part.target_partition,
+                    part.mtd_num
+                ),
+                Some(&part.target_partition),
+                idx,
+            );
+
+            let streamed = prepare_single_image(&pkg, &entry_name, &stage_dir, part, !opts.dry_run)?;
+            let mut temp_guard = if streamed.is_staged_temp {
+                RemoveFileGuard(streamed.disk_path.clone())
+            } else {
+                RemoveFileGuard(None)
+            };
+
+            if let Some(expected_md5) = part.expected_md5.as_deref() {
+                if !streamed.md5_hex.eq_ignore_ascii_case(expected_md5) {
+                    return Err(format!(
+                        "MD5 mismatch for '{}': expected {expected_md5}, got {}",
+                        part.zip_relpath, streamed.md5_hex
+                    ));
+                }
+                push_log(
+                    &format!(
+                        "MD5 OK for {} ({} bytes, md5={}…)",
+                        part.target_partition,
+                        streamed.size,
+                        &streamed.md5_hex[..12]
+                    ),
+                    Some(&part.target_partition),
+                    idx,
+                );
+            } else {
+                push_log(
+                    &format!(
+                        "No expected MD5 for {} ({} bytes, sha256={}…)",
+                        part.target_partition,
+                        streamed.size,
+                        &streamed.sha256_hex[..12]
+                    ),
+                    Some(&part.target_partition),
+                    idx,
+                );
+            }
+
+            if part.is_ubi && &streamed.magic4 != b"UBI#" {
+                return Err(format!(
+                    "invalid UBI magic on '{}' (expected 'UBI#', got {:02x?})",
+                    part.zip_relpath, streamed.magic4
+                ));
+            }
+
+            if opts.dry_run {
+                push_log(
+                    &format!(
+                        "[dry-run] Would flash {} -> /dev/mtd{} ('{}', {} bytes, {})",
+                        part.zip_relpath,
+                        part.mtd_num,
+                        part.target_partition,
+                        streamed.size,
+                        if part.is_ubi { "ubiformat+verify" } else { "mtdimg+sha256" }
+                    ),
+                    Some(&part.target_partition),
+                    idx + 1,
+                );
+                flashed_names.push(part.target_partition.clone());
+                return Ok(());
+            }
+
+            // Persist flashing_in_progress BEFORE erasing the very first NAND partition
+            // so a crash or mid-flash failure marks the target slot dirty.
+            if !dirty_state_persisted {
+                let in_prog = PersistedAbFlashState {
+                    status: "flashing_in_progress".into(),
+                    last_flash_ts: Some(crate::auth::now_secs()),
+                    previous_slot: Some(plan.active_slot),
+                    target_slot: Some(plan.target_slot),
+                    scope: Some(plan.scope),
+                    source_name: Some(source_name.clone()),
+                    project_name: plan.project_name.clone(),
+                    partitions_flashed: Vec::new(),
+                    verified_on_boot: false,
+                    message: Some(format!(
+                        "Flashing {total} partitions to inactive slot {}...",
+                        plan.target_slot.suffix()
+                    )),
+                    log: Vec::new(),
+                };
+                save_persisted_state(&in_prog)?;
+                dirty_state_persisted = true;
+            }
+
+            let disk_path = streamed
+                .disk_path
+                .as_deref()
+                .ok_or("missing staged image path")?;
+
+            let mut step_log = |m: &str| {
+                push_log(m, Some(&part.target_partition), idx);
+            };
+            if part.is_ubi {
+                flash_ubi_partition(part, disk_path, opts.preserve_cellcore, &mut step_log)?;
+            } else {
+                flash_raw_mtd_partition(
+                    part,
+                    disk_path,
                     streamed.size,
-                    if part.is_ubi { "ubiformat+verify" } else { "mtdimg+sha256" }
+                    &streamed.sha256_hex,
+                    &stage_dir,
+                    opts.verify_readback,
+                    streamed.is_staged_temp,
+                    &mut step_log,
+                )?;
+                if streamed.is_staged_temp {
+                    temp_guard.0 = None;
+                }
+            }
+
+            // Delete the single extracted file immediately before next partition
+            drop(temp_guard);
+            flashed_names.push(part.target_partition.clone());
+            push_log(
+                &format!(
+                    "Completed [{}/{}] '{}'",
+                    idx + 1,
+                    total,
+                    part.target_partition
                 ),
                 Some(&part.target_partition),
                 idx + 1,
             );
-            flashed_names.push(part.target_partition.clone());
-            continue;
+            Ok(())
+        })();
+
+        if let Err(err) = part_res {
+            if !opts.dry_run && dirty_state_persisted {
+                drop(push_log);
+                let failed = PersistedAbFlashState {
+                    status: "failed".into(),
+                    last_flash_ts: Some(crate::auth::now_secs()),
+                    previous_slot: Some(plan.active_slot),
+                    target_slot: Some(plan.target_slot),
+                    scope: Some(plan.scope),
+                    source_name: Some(source_name),
+                    project_name: plan.project_name.clone(),
+                    partitions_flashed: flashed_names,
+                    verified_on_boot: false,
+                    message: Some(err.clone()),
+                    log: logs,
+                };
+                let _ = save_persisted_state(&failed);
+            }
+            return Err(err);
         }
-
-        let disk_path = streamed
-            .disk_path
-            .as_deref()
-            .ok_or("missing staged image path")?;
-
-        let mut step_log = |m: &str| {
-            push_log(m, Some(&part.target_partition), idx);
-        };
-        if part.is_ubi {
-            flash_ubi_partition(part, disk_path, opts.preserve_cellcore, &mut step_log)?;
-        } else {
-            flash_raw_mtd_partition(
-                part,
-                disk_path,
-                streamed.size,
-                &streamed.sha256_hex,
-                &stage_dir,
-                opts.verify_readback,
-                &mut step_log,
-            )?;
-        }
-
-        // Delete the single extracted file immediately before next partition
-        drop(_temp_guard);
-        flashed_names.push(part.target_partition.clone());
-        push_log(
-            &format!(
-                "Completed [{}/{}] '{}'",
-                idx + 1,
-                total,
-                part.target_partition
-            ),
-            Some(&part.target_partition),
-            idx + 1,
-        );
     }
-
-    let source_name = source_path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| source_path.display().to_string());
 
     if opts.dry_run {
         push_log(
@@ -2206,7 +2542,11 @@ where
     Ok(persisted)
 }
 
-pub fn switch_slot(target: Option<Slot>, reboot_now: bool) -> Result<PersistedAbFlashState, String> {
+pub fn switch_slot(
+    target: Option<Slot>,
+    reboot_now: bool,
+    force: bool,
+) -> Result<PersistedAbFlashState, String> {
     let _flock = acquire_ab_flock()?;
     let mtds = read_proc_mtd()?;
     let _ = detect_ab_layout(&mtds)?;
@@ -2217,6 +2557,26 @@ pub fn switch_slot(target: Option<Slot>, reboot_now: bool) -> Result<PersistedAb
         return Err(format!(
             "target slot {} is already the active boot slot",
             dest.suffix()
+        ));
+    }
+    let last_state = load_persisted_state();
+    if !force
+        && last_state.target_slot == Some(dest)
+        && matches!(
+            last_state.status.as_str(),
+            "flashing_in_progress" | "failed"
+        )
+    {
+        return Err(format!(
+            "refusing to activate dirty/half-flashed slot {} (last flash status='{}'{}); cleanly flash slot {} before activating (or pass force/--force to override)",
+            dest.suffix(),
+            last_state.status,
+            last_state
+                .message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default(),
+            dest.suffix(),
         ));
     }
     match read_ab_unbootable(dest) {
@@ -2238,7 +2598,7 @@ pub fn switch_slot(target: Option<Slot>, reboot_now: bool) -> Result<PersistedAb
     let idx = dest.index().to_string();
     run_tool_timeout("/sbin/abctl", &["--set_active", &idx], Duration::from_secs(10))?;
 
-    let mut st = load_persisted_state();
+    let mut st = last_state;
     st.status = "switched".into();
     st.last_flash_ts = Some(crate::auth::now_secs());
     st.previous_slot = Some(current);
@@ -2266,6 +2626,7 @@ pub fn switch_slot(target: Option<Slot>, reboot_now: bool) -> Result<PersistedAb
 }
 
 pub fn confirm_current_slot() -> Result<PersistedAbFlashState, String> {
+    let _flock = acquire_ab_flock()?;
     let current = detect_active_slot()?;
     run_tool_timeout("/sbin/abctl", &["--set_success"], Duration::from_secs(10))?;
 
@@ -2285,30 +2646,101 @@ pub fn confirm_current_slot() -> Result<PersistedAbFlashState, String> {
     Ok(st)
 }
 
-/// Automatically confirm the newly booted A/B slot on daemon startup if a prior flash/switch
-/// targeted the slot we are currently running on.
+/// Probation-gated boot auto-confirm for a newly booted A/B target slot.
+/// Waits until daemon/device uptime reaches `CELLCORE_AB_CONFIRM_DELAY_SECS`
+/// (default 90 s, polling every 5 s) and verifies SMD AT (`AT+CFUN?`),
+/// QRTR/dataplane health, and HTTP listener liveness before calling
+/// `/sbin/abctl --set_success`. If health checks fail, leaves trial-boot active
+/// so the bootloader can fall back cleanly instead of locking in a broken slot.
 pub fn spawn_boot_auto_confirm(state: AppState) {
     tokio::spawn(async move {
-        let res = crate::paths::spawn_blocking(|| -> Result<Option<String>, String> {
+        let check = crate::paths::spawn_blocking(|| -> Option<Slot> {
             let st = load_persisted_state();
             if st.verified_on_boot {
-                return Ok(None);
+                return None;
             }
-            let Some(target) = st.target_slot else {
-                return Ok(None);
-            };
-            let Ok(current) = detect_active_slot() else {
-                return Ok(None);
-            };
-            if current != target {
+            if matches!(st.status.as_str(), "failed" | "flashing_in_progress") {
+                return None;
+            }
+            let target = st.target_slot?;
+            let current = detect_active_slot().ok()?;
+            (current == target).then_some(current)
+        })
+        .await;
+
+        let Ok(Some(current_slot)) = check else {
+            return;
+        };
+
+        let delay_secs = std::env::var("CELLCORE_AB_CONFIRM_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CONFIRM_DELAY_SECS);
+        let started = tokio::time::Instant::now();
+
+        state.push_daemon_log(format!(
+            "firmware-ab: slot {} trial-boot probation started (waiting {}s before health verification)",
+            current_slot.suffix(),
+            delay_secs
+        ));
+
+        while started.elapsed() < Duration::from_secs(delay_secs) {
+            let rem = Duration::from_secs(delay_secs).saturating_sub(started.elapsed());
+            tokio::time::sleep(rem.min(Duration::from_secs(5))).await;
+        }
+
+        // Verify health checks with a short retry window (up to 6 checks @ 5s = 30s)
+        let mut at_ok = false;
+        let mut dp_ok = false;
+        let mut http_ok = false;
+        for attempt in 0..6 {
+            at_ok = state.smd.is_healthy()
+                && state
+                    .smd
+                    .exec("AT+CFUN?", crate::smd::Priority::Background, Duration::from_secs(5))
+                    .await
+                    .is_ok_and(|r| r.ok);
+            dp_ok = !crate::dataplane::is_native_mode() || crate::dataplane::is_wds_connected();
+            http_ok = state.hb_http_ms.load(std::sync::atomic::Ordering::Acquire) > 0;
+            if at_ok && dp_ok && http_ok {
+                break;
+            }
+            if attempt == 0 {
+                state.push_daemon_log(format!(
+                    "firmware-ab: slot {} probation waiting for healthy subsystem state (at_ok={at_ok}, dp_ok={dp_ok}, http_ok={http_ok})",
+                    current_slot.suffix()
+                ));
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+
+        if !(at_ok && dp_ok && http_ok) {
+            state.push_daemon_log(format!(
+                "firmware-ab: probation health check FAILED for slot {} (at_ok={at_ok}, dp_ok={dp_ok}, http_ok={http_ok}); leaving trial-boot active without confirming",
+                current_slot.suffix()
+            ));
+            return;
+        }
+
+        let _op_guard = state.ab_flash.op_lock.lock().await;
+        let res = crate::paths::spawn_blocking(move || -> Result<Option<String>, String> {
+            let st = load_persisted_state();
+            if st.verified_on_boot || st.target_slot != Some(current_slot) {
                 return Ok(None);
             }
             let updated = confirm_current_slot()?;
             Ok(updated.message)
         })
         .await;
-        if let Ok(Ok(Some(msg))) = res {
-            state.push_daemon_log(format!("firmware-ab: {msg}"));
+        match res {
+            Ok(Ok(Some(msg))) => state.push_daemon_log(format!("firmware-ab: {msg}")),
+            Ok(Err(e)) => state.push_daemon_log(format!(
+                "firmware-ab: probation confirm failed for slot {}: {e}",
+                current_slot.suffix()
+            )),
+            _ => {}
         }
     });
 }
@@ -2346,7 +2778,7 @@ pub struct InspectBody {
 }
 
 pub async fn post_firmware_ab_inspect(Json(body): Json<InspectBody>) -> Response {
-    let source = match validate_source_path(&body.path) {
+    let source = match validate_http_source_path(&body.path) {
         Ok(p) => p,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, e),
     };
@@ -2403,7 +2835,7 @@ pub async fn post_firmware_ab_flash(
     State(ctx): State<HttpCtx>,
     Json(body): Json<FlashBody>,
 ) -> Response {
-    let source = match validate_source_path(&body.path) {
+    let source = match validate_http_source_path(&body.path) {
         Ok(p) => p,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, e),
     };
@@ -2565,6 +2997,7 @@ pub async fn post_firmware_ab_flash(
 pub struct SwitchBody {
     pub slot: Option<String>,
     pub reboot: bool,
+    pub force: bool,
 }
 
 pub async fn post_firmware_ab_switch(
@@ -2590,7 +3023,8 @@ pub async fn post_firmware_ab_switch(
         );
     };
 
-    match crate::paths::spawn_blocking(move || switch_slot(target, false)).await {
+    let force = body.force;
+    match crate::paths::spawn_blocking(move || switch_slot(target, false, force)).await {
         Ok(Ok(st)) => {
             ctx.app.push_daemon_log(format!(
                 "firmware-ab: {}",
@@ -2621,6 +3055,12 @@ pub async fn post_firmware_ab_switch(
 }
 
 pub async fn post_firmware_ab_confirm(State(ctx): State<HttpCtx>) -> Response {
+    let Ok(_guard) = ctx.app.ab_flash.op_lock.try_lock() else {
+        return err_resp(
+            StatusCode::CONFLICT,
+            "An A/B firmware operation is already running",
+        );
+    };
     match crate::paths::spawn_blocking(confirm_current_slot).await {
         Ok(Ok(st)) => {
             ctx.app.push_daemon_log(format!(
@@ -2639,6 +3079,279 @@ pub async fn post_firmware_ab_confirm(State(ctx): State<HttpCtx>) -> Response {
         Ok(Err(e)) => err_resp(StatusCode::BAD_REQUEST, e),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("confirm task failed: {e}")),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedFirmwareFile {
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub mtime_secs: u64,
+}
+
+/// Scan `/tmp` and `/usrdata/cache` (non-recursive, capped at 50 entries) for
+/// regular `.zip` files >= `min_bytes`, sorted newest first.
+pub fn scan_staged_firmware_zips(min_bytes: u64) -> Vec<StagedFirmwareFile> {
+    let mut files = Vec::new();
+    for dir_virt in ["/tmp", UPLOAD_CACHE_DIR] {
+        let dir_real = PathBuf::from(crate::paths::p(dir_virt));
+        let Ok(rd) = fs::read_dir(&dir_real) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || !name.to_ascii_lowercase().ends_with(".zip") {
+                continue;
+            }
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            let size_bytes = meta.len();
+            if size_bytes < min_bytes {
+                continue;
+            }
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            files.push(StagedFirmwareFile {
+                path: format!("{dir_virt}/{name}"),
+                name,
+                size_bytes,
+                mtime_secs,
+            });
+        }
+    }
+    files.sort_by(|a, b| {
+        b.mtime_secs
+            .cmp(&a.mtime_secs)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    files.truncate(MAX_STAGED_ENTRIES);
+    files
+}
+
+pub async fn get_firmware_ab_staged() -> Response {
+    let min_bytes = if cfg!(test) { 1 } else { 1024 * 1024 + 1 };
+    match crate::paths::spawn_blocking(move || scan_staged_firmware_zips(min_bytes)).await {
+        Ok(files) => (StatusCode::OK, Json(serde_json::json!({ "files": files }))).into_response(),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("staged scan failed: {e}")),
+    }
+}
+
+pub fn sanitize_upload_filename(raw: Option<&str>) -> Result<String, String> {
+    let name = raw.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("firmware-upload.zip");
+    if name.len() > 128 {
+        return Err("filename exceeds 128 characters".into());
+    }
+    if name.starts_with('.') || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err("invalid firmware filename".into());
+    }
+    if !name.ends_with(".zip") || name.len() <= 4 {
+        return Err("firmware filename must match [A-Za-z0-9._-]+\\.zip".into());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("firmware filename must match [A-Za-z0-9._-]+\\.zip".into());
+    }
+    Ok(name.to_string())
+}
+
+pub async fn post_firmware_ab_upload(
+    State(ctx): State<HttpCtx>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Some(ct) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if !mime.is_empty()
+            && !matches!(
+                mime.as_str(),
+                "application/octet-stream" | "application/zip" | "application/x-zip-compressed"
+            )
+        {
+            return err_resp(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported Content-Type '{mime}' (expected application/octet-stream or application/zip)"),
+            );
+        }
+    }
+
+    let raw_name = headers
+        .get("x-firmware-filename")
+        .and_then(|v| v.to_str().ok());
+    let filename = match sanitize_upload_filename(raw_name) {
+        Ok(n) => n,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, e),
+    };
+
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(cl) = content_length
+        && cl > MAX_UPLOAD_ZIP_BYTES
+    {
+        return err_resp(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload exceeds maximum allowed size ({MAX_UPLOAD_ZIP_BYTES} bytes)"),
+        );
+    }
+
+    let cache_dir = PathBuf::from(crate::paths::p(UPLOAD_CACHE_DIR));
+    if let Err(e) = fs::create_dir_all(&cache_dir) {
+        return err_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create {}: {e}", cache_dir.display()),
+        );
+    }
+
+    let avail_bytes = match statvfs_avail_bytes("/usrdata").or_else(|| statvfs_avail_bytes(UPLOAD_CACHE_DIR)) {
+        Some(b) => b,
+        None => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unable to verify /usrdata available space",
+            );
+        }
+    };
+    let required_start = content_length
+        .unwrap_or(0)
+        .saturating_add(UPLOAD_MIN_HEADROOM_BYTES);
+    if avail_bytes < required_start {
+        return err_resp(
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "insufficient /usrdata space: {} bytes available, need at least {} bytes (32 MiB headroom)",
+                avail_bytes, required_start
+            ),
+        );
+    }
+
+    let tmp_name = format!(".{filename}.upload.{}.{}", std::process::id(), crate::state::mono_ms());
+    let tmp_path = cache_dir.join(&tmp_name);
+    let final_path = cache_dir.join(&filename);
+    let std_file = match crate::state::create_private_tmp(&tmp_path, 0o600) {
+        Ok(f) => f,
+        Err(e) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create upload temp file: {e}"),
+            );
+        }
+    };
+    let mut tmp_guard = RemoveFileGuard(Some(tmp_path.clone()));
+    let mut async_file = tokio::fs::File::from_std(std_file);
+
+    let mut stream = body.into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut magic4 = [0u8; 4];
+    let mut magic_checked = false;
+    let mut last_space_check: u64 = 0;
+
+    while let Some(next_chunk) = stream.next().await {
+        let chunk = match next_chunk {
+            Ok(c) => c,
+            Err(e) => return err_resp(StatusCode::BAD_REQUEST, format!("upload stream error: {e}")),
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        if total < 4 {
+            let need = (4 - total) as usize;
+            let take = need.min(chunk.len());
+            magic4[total as usize..total as usize + take].copy_from_slice(&chunk[..take]);
+        }
+        total = total.saturating_add(chunk.len() as u64);
+        if total > MAX_UPLOAD_ZIP_BYTES {
+            return err_resp(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("upload exceeded maximum allowed size ({MAX_UPLOAD_ZIP_BYTES} bytes)"),
+            );
+        }
+        if !magic_checked && total >= 4 {
+            if &magic4 != b"PK\x03\x04" {
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "invalid firmware upload: missing ZIP magic header (PK\\x03\\x04)",
+                );
+            }
+            magic_checked = true;
+        }
+        if total.saturating_sub(last_space_check) >= 16 * 1024 * 1024 {
+            last_space_check = total;
+            if statvfs_avail_bytes("/usrdata")
+                .or_else(|| statvfs_avail_bytes(UPLOAD_CACHE_DIR))
+                .is_none_or(|b| b < UPLOAD_MIN_HEADROOM_BYTES)
+            {
+                return err_resp(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "aborted upload: /usrdata free space dropped below 32 MiB headroom",
+                );
+            }
+        }
+        hasher.update(&chunk);
+        if let Err(e) = async_file.write_all(&chunk).await {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write upload temp file: {e}"),
+            );
+        }
+    }
+
+    if total < 4 || !magic_checked {
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            "invalid firmware upload: file is empty or missing ZIP magic header",
+        );
+    }
+    if let Err(e) = async_file.flush().await {
+        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("flush upload: {e}"));
+    }
+    if let Err(e) = async_file.sync_all().await {
+        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("sync upload: {e}"));
+    }
+    drop(async_file);
+
+    let tmp_mv = tmp_path.clone();
+    let dst_mv = final_path.clone();
+    match crate::paths::spawn_blocking(move || crate::state::atomic_rename_file(&tmp_mv, &dst_mv)).await {
+        Ok(Ok(())) => {
+            tmp_guard.0 = None;
+        }
+        Ok(Err(e)) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("install upload: {e}")),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("install task failed: {e}")),
+    }
+
+    let sha256 = hex::encode(hasher.finalize());
+    let reported_path = format!("{UPLOAD_CACHE_DIR}/{filename}");
+    ctx.app.push_daemon_log(format!(
+        "firmware-ab: uploaded {reported_path} ({total} bytes, sha256={}…)",
+        &sha256[..12]
+    ));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "path": reported_path,
+            "sizeBytes": total,
+            "sha256": sha256,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2955,6 +3668,7 @@ fn run_cli_switch(args: &[String], force_other: bool) -> i32 {
     let mut slot: Option<Slot> = None;
     let mut reboot = false;
     let mut yes = false;
+    let mut force = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2974,6 +3688,10 @@ fn run_cli_switch(args: &[String], force_other: bool) -> i32 {
                 reboot = true;
                 i += 1;
             }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
             "--yes" | "-y" => {
                 yes = true;
                 i += 1;
@@ -2988,7 +3706,7 @@ fn run_cli_switch(args: &[String], force_other: bool) -> i32 {
         eprintln!("Refusing to switch active boot slot without --yes.");
         return 2;
     }
-    match switch_slot(slot, reboot) {
+    match switch_slot(slot, reboot, force) {
         Ok(st) => {
             println!("{}", st.message.unwrap_or_else(|| "slot switched".into()));
             0
@@ -3381,5 +4099,134 @@ mtd36: 11200000 00040000 "usrdata"
         )
         .unwrap_err();
         assert!(err2.contains("invalid UBI magic"), "{err2}");
+    }
+
+    #[test]
+    fn switch_slot_refuses_dirty_target_slot_unless_forced() {
+        let sbx = crate::paths::TestSandbox::new("fw-ab-dirty-slot");
+        sbx.write("/proc/mtd", PROC_MTD_R02A02);
+        sbx.write("/proc/cmdline", "ubi.mtd=55 SLOT_SUFFIX=_a root=ubi0:rootfs\n");
+        sbx.write_exec(
+            "/sbin/abctl",
+            "#!/bin/sh\ncase \"$1\" in\n--boot_slot) echo _a ;;\n--get_unbootable) echo 0 ;;\n--set_active) exit 0 ;;\n*) exit 0 ;;\nesac\n",
+        );
+
+        for dirty_status in ["flashing_in_progress", "failed"] {
+            save_persisted_state(&PersistedAbFlashState {
+                status: dirty_status.into(),
+                target_slot: Some(Slot::B),
+                previous_slot: Some(Slot::A),
+                partitions_flashed: vec!["boot_b".into()],
+                message: Some("simulated partial failure".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+            let err = switch_slot(Some(Slot::B), false, false).unwrap_err();
+            assert!(
+                err.contains("dirty") && err.contains(dirty_status),
+                "expected dirty-slot refusal for {dirty_status}, got: {err}"
+            );
+        }
+
+        // Explicit force=true overrides the dirty-slot guard
+        let forced = switch_slot(Some(Slot::B), false, true).expect("forced switch");
+        assert_eq!(forced.status, "switched");
+        assert_eq!(forced.target_slot, Some(Slot::B));
+    }
+
+    #[test]
+    fn http_source_path_enforces_tmp_and_usrdata_confinement() {
+        let sbx = crate::paths::TestSandbox::new("fw-ab-path-confine");
+        sbx.write("/tmp/good.zip", "PK\x03\x04test");
+        sbx.write("/usrdata/cache/good2.zip", "PK\x03\x04test");
+        sbx.write("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
+
+        // Regular files inside /tmp and /usrdata pass
+        assert!(validate_http_source_path("/tmp/good.zip").is_ok());
+        assert!(validate_http_source_path("/usrdata/cache/good2.zip").is_ok());
+
+        // Paths outside /tmp and /usrdata are rejected
+        assert!(validate_http_source_path("/etc/passwd").is_err());
+        assert!(validate_http_source_path("/tmp/../etc/passwd").is_err());
+        assert!(validate_http_source_path("relative/fw.zip").is_err());
+        assert!(validate_http_source_path("/tmp").is_err());
+
+        // Symlinks are rejected even when inside /tmp
+        let sym_escape = sbx.root.join("tmp/escape.zip");
+        std::os::unix::fs::symlink(sbx.root.join("etc/passwd"), &sym_escape).unwrap();
+        assert!(validate_http_source_path("/tmp/escape.zip").is_err());
+
+        let sym_local = sbx.root.join("tmp/alias.zip");
+        std::os::unix::fs::symlink(sbx.root.join("tmp/good.zip"), &sym_local).unwrap();
+        assert!(validate_http_source_path("/tmp/alias.zip").is_err());
+
+        // FIFOs are rejected
+        let fifo_path = sbx.root.join("tmp/pipe.zip");
+        let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(validate_http_source_path("/tmp/pipe.zip").is_err());
+    }
+
+    #[test]
+    fn scans_staged_firmware_zips_and_detects_vendor_init_conflicts() {
+        let sbx = crate::paths::TestSandbox::new("fw-ab-staged-scan");
+        sbx.write("/tmp/older.zip", "PK\x03\x04older");
+        sbx.write("/usrdata/cache/newer.zip", "PK\x03\x04newer-payload");
+        sbx.write("/tmp/not-a-zip.txt", "ignore me");
+        sbx.write("/tmp/.hidden.zip", "PK\x03\x04hidden");
+        fs::create_dir_all(sbx.root.join("tmp/dir.zip")).unwrap();
+        std::os::unix::fs::symlink(
+            sbx.root.join("tmp/older.zip"),
+            sbx.root.join("tmp/symlink.zip"),
+        )
+        .unwrap();
+
+        // Set explicit mtimes so sorting is deterministic (newer.zip > older.zip)
+        let older_p = CString::new(sbx.root.join("tmp/older.zip").as_os_str().as_bytes()).unwrap();
+        let newer_p = CString::new(
+            sbx.root
+                .join("usrdata/cache/newer.zip")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        let old_tv = [
+            libc::timeval { tv_sec: 1_700_000_100, tv_usec: 0 },
+            libc::timeval { tv_sec: 1_700_000_100, tv_usec: 0 },
+        ];
+        let new_tv = [
+            libc::timeval { tv_sec: 1_700_000_200, tv_usec: 0 },
+            libc::timeval { tv_sec: 1_700_000_200, tv_usec: 0 },
+        ];
+        unsafe {
+            libc::utimes(older_p.as_ptr(), old_tv.as_ptr());
+            libc::utimes(newer_p.as_ptr(), new_tv.as_ptr());
+        }
+
+        let files = scan_staged_firmware_zips(1);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files[0].name, "newer.zip");
+        assert_eq!(files[0].path, "/usrdata/cache/newer.zip");
+        assert_eq!(files[1].name, "older.zip");
+        assert_eq!(files[1].path, "/tmp/older.zip");
+
+        // Filename sanitization
+        assert_eq!(sanitize_upload_filename(None).unwrap(), "firmware-upload.zip");
+        assert_eq!(
+            sanitize_upload_filename(Some("RM551E_R02A02-test.zip")).unwrap(),
+            "RM551E_R02A02-test.zip"
+        );
+        assert!(sanitize_upload_filename(Some("../evil.zip")).is_err());
+        assert!(sanitize_upload_filename(Some("bad name.zip")).is_err());
+        assert!(sanitize_upload_filename(Some("notzip.bin")).is_err());
+
+        // Vendor init & proc detection
+        sbx.write("/etc/rc.d/S90ab-updater", "");
+        sbx.write("/etc/rc.d/S95mirror_copy", "");
+        assert_eq!(detect_vendor_ab_init_enabled(), (true, true));
+        sbx.write("/proc/4321/comm", "mirror_copy\n");
+        let procs = detect_conflicting_vendor_ab_procs();
+        assert_eq!(procs, vec!["mirror_copy (pid 4321)".to_string()]);
     }
 }

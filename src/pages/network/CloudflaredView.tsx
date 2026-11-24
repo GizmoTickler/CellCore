@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, KeyRound, Play, RefreshCw, ShieldCheck, Square, Terminal, Trash2 } from "lucide-react";
-import { apiFetch } from "../../lib/api";
+import { Download, KeyRound, Play, RefreshCw, ShieldAlert, ShieldCheck, Square, Terminal, Trash2 } from "lucide-react";
+import { ApiError, apiFetch } from "../../lib/api";
 import { isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
-import { Badge, Button, Card, CardHeader, Input, LiveDot, Skeleton, Switch } from "../../components/ui";
+import { Badge, Button, Card, CardHeader, Input, LiveDot, Modal, Skeleton, Switch } from "../../components/ui";
 import { useToastStore } from "../../stores/toast-store";
-import { LoadError, Notice, errText, useGuarded } from "../admin/shared";
+import { LoadError, Notice, errText } from "../admin/shared";
 import { Fact } from "./VpnParts";
-import { VPN, vpnPost, type CloudflaredConfig, type CloudflaredStatus } from "./vpn-api";
+import { VPN, vpnPost, vpnPostGuarded, type CloudflaredConfig, type CloudflaredStatus } from "./vpn-api";
 
 const KEY = ["vpn", "cloudflared"];
 
@@ -63,7 +63,6 @@ function verdict(d: CloudflaredStatus) {
 export function CloudflaredView() {
   const toast = useToastStore((s) => s.push);
   const qc = useQueryClient();
-  const guard = useGuarded();
 
   const q = useQuery({
     queryKey: KEY,
@@ -80,6 +79,10 @@ export function CloudflaredView() {
   const [autostart, setAutostart] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removePhrase, setRemovePhrase] = useState("REMOVE CLOUDFLARE TUNNEL");
+  const [removeServerMsg, setRemoveServerMsg] = useState<string | null>(null);
+  const [removeTyped, setRemoveTyped] = useState("");
   const [delToken, setDelToken] = useState(false);
   const [delBin, setDelBin] = useState(false);
 
@@ -130,35 +133,43 @@ export function CloudflaredView() {
       "Tunnel configuration saved"
     );
 
-  const removeTunnel = () =>
-    guard.run({
-      title: "Remove Cloudflare Tunnel?",
-      body: (
-        <div className="space-y-3 text-[13px] text-ink-2">
-          <p>Stops and disables the cloudflared service and removes its init script and loopback IP.</p>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" checked={delToken} onChange={(e) => setDelToken(e.target.checked)} />
-            <span>Also delete the stored tunnel token (`/etc/cloudflared/token`)</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" checked={delBin} onChange={(e) => setDelBin(e.target.checked)} />
-            <span>Also delete the `cloudflared` binary (~36 MiB)</span>
-          </label>
-        </div>
-      ),
-      confirmLabel: "Remove",
-      action: (confirm) =>
-        vpnPost("/cloudflared/remove", {
-          confirm,
-          deleteToken: delToken,
-          deleteBinary: delBin,
-        }),
-      onDone: () => {
-        setDirty(false);
-        refresh();
-      },
-      success: "Cloudflare Tunnel removed",
-    });
+  const openRemoveModal = () => {
+    setDelToken(false);
+    setDelBin(false);
+    setRemoveTyped("");
+    setRemovePhrase("REMOVE CLOUDFLARE TUNNEL");
+    setRemoveServerMsg(null);
+    setRemoveOpen(true);
+  };
+
+  async function confirmRemove() {
+    setBusy("remove");
+    try {
+      await vpnPostGuarded("Remove Cloudflare Tunnel", "/cloudflared/remove", {
+        confirm: removeTyped.trim(),
+        deleteToken: delToken,
+        deleteBinary: delBin,
+      });
+      setRemoveOpen(false);
+      setDirty(false);
+      toast("Cloudflare Tunnel removed", "success");
+      await refresh();
+    } catch (e) {
+      if (isCancelled(e)) {
+        setRemoveOpen(false);
+        return;
+      }
+      if (e instanceof ApiError && e.status === 428 && typeof e.data?.confirm === "string") {
+        setRemovePhrase(e.data.confirm);
+        setRemoveServerMsg(e.message);
+        setRemoveTyped("");
+      } else {
+        toast("Remove Cloudflare Tunnel failed", "error", errText(e));
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
 
   return (
     <div className="grid gap-5 lg:grid-cols-12">
@@ -385,7 +396,7 @@ export function CloudflaredView() {
               )}
             </div>
             {(d.installed || d.tokenConfigured) && (
-              <Button variant="danger" size="sm" disabled={busy !== null} onClick={removeTunnel}>
+              <Button variant="danger" size="sm" disabled={busy !== null} onClick={openRemoveModal}>
                 <Trash2 className="h-3.5 w-3.5" />
                 Remove tunnel
               </Button>
@@ -444,7 +455,72 @@ export function CloudflaredView() {
         </Card>
       </div>
 
-      {guard.modal}
+      <Modal
+        open={removeOpen}
+        onClose={() => {
+          if (busy !== "remove") setRemoveOpen(false);
+        }}
+        title="Remove Cloudflare Tunnel?"
+      >
+        <div className="space-y-3 text-[13px] text-ink-2">
+          <p>Stops and disables the cloudflared service and removes its init script and loopback IP.</p>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={delToken}
+              onChange={(e) => setDelToken(e.target.checked)}
+              disabled={busy === "remove"}
+            />
+            <span>
+              Also delete the stored tunnel token (<code className="font-mono">/etc/cloudflared/token</code>)
+            </span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={delBin}
+              onChange={(e) => setDelBin(e.target.checked)}
+              disabled={busy === "remove"}
+            />
+            <span>
+              Also delete the <code className="font-mono">cloudflared</code> binary (~36 MiB)
+            </span>
+          </label>
+          <div className="rounded-xl border border-crimson/40 bg-crimson-soft p-3 space-y-2">
+            {removeServerMsg && (
+              <p className="flex gap-2 text-[12.5px] text-crimson-ink">
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{removeServerMsg}</span>
+              </p>
+            )}
+            <label className="block text-[12px] font-semibold text-ink-2">
+              Type <span className="font-mono text-ink">{removePhrase}</span> to continue
+              <Input
+                autoFocus
+                className="mt-1.5 font-mono"
+                value={removeTyped}
+                onChange={(e) => setRemoveTyped(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                disabled={busy === "remove"}
+                aria-label={`Type ${removePhrase} to confirm`}
+              />
+            </label>
+          </div>
+        </div>
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
+          <Button variant="secondary" onClick={() => setRemoveOpen(false)} disabled={busy === "remove"}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            onClick={confirmRemove}
+            disabled={busy === "remove" || removeTyped.trim() !== removePhrase}
+          >
+            {busy === "remove" ? "Removing…" : "Remove"}
+          </Button>
+        </div>
+      </Modal>
     </div>
   );
 }

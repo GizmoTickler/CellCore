@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Check, Circle, Eye, EyeOff, Lock, Ruler, ShieldCheck, Thermometer } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Button, Card, CardHeader, Input, SegmentedTabs, Switch } from "../../components/ui";
+import { Notice } from "../admin/shared";
 import type { SystemController } from "./useSystemController";
 import { Field } from "./parts";
 import { AcmeCertCard } from "./AcmeCertCard";
@@ -87,6 +88,10 @@ export function SecurityView({ ctl }: { ctl: SystemController }) {
               <Rule ok={longEnough}>At least 8 characters</Rule>
               <Rule ok={matches}>Both entries match</Rule>
             </ul>
+            <Notice tone="warn" title="Invalidates sessions and API tokens">
+              Changing the root password invalidates other browser sessions and revokes <strong>all</strong> API tokens (including Prometheus and automation
+              tokens).
+            </Notice>
             <div className="flex flex-wrap items-center gap-3 pt-1">
               <Button type="submit" variant="primary" disabled={ctl.busy === "pw"}>
                 {ctl.busy === "pw" ? "Updating…" : "Update password"}

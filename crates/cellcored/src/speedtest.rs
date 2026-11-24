@@ -3,7 +3,7 @@ use std::{
     os::fd::AsRawFd,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
     sync::watch,
+    task::JoinSet,
 };
 
 use crate::{
@@ -39,15 +40,17 @@ const NATIVE_WARMUP_SECS: f64 = 2.0;
 const SELF_TRAFFIC_SETTLE_MS: u64 = 10_000;
 
 static LAST_SPEEDTEST_END_MONO_MS: AtomicU64 = AtomicU64::new(0);
+static SPEEDTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+static NEXT_SPEEDTEST_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Returns true while CellCore's own speedtest is running (or within
-/// `SELF_TRAFFIC_SETTLE_MS` after it finished) so the failover throughput
-/// heuristic and standby-leak detector ignore self-generated test traffic.
-pub async fn is_self_traffic_active(state: &AppState) -> bool {
-    if state.speedtest_live.read().await.running {
+/// Lock-free check returning true while CellCore's own speedtest is running (or
+/// within `SELF_TRAFFIC_SETTLE_MS` after it finished) so the failover throughput
+/// heuristic and standby-leak detector handle self-generated test traffic safely.
+pub fn is_self_traffic_active() -> bool {
+    if SPEEDTEST_RUNNING.load(Ordering::Acquire) {
         return true;
     }
-    let ended = LAST_SPEEDTEST_END_MONO_MS.load(Ordering::Relaxed);
+    let ended = LAST_SPEEDTEST_END_MONO_MS.load(Ordering::Acquire);
     ended != 0 && mono_ms().saturating_sub(ended) < SELF_TRAFFIC_SETTLE_MS
 }
 
@@ -151,10 +154,18 @@ fn header_requests_close(headers_text: &str) -> bool {
     false
 }
 
-async fn finish_speedtest_slot(state: &AppState) {
-    LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Relaxed);
-    *state.speedtest_pid.lock().await = None;
+/// Release the speedtest ownership slot only if `run_id` still owns it.
+/// Returns `true` if `run_id` was still the active owner.
+async fn finish_speedtest_slot(state: &AppState, run_id: u64) -> bool {
+    let mut pid_guard = state.speedtest_pid.lock().await;
+    if *pid_guard != Some(run_id) {
+        return false;
+    }
+    *pid_guard = None;
     *state.speedtest_cancel.lock().await = None;
+    SPEEDTEST_RUNNING.store(false, Ordering::Release);
+    LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Release);
+    true
 }
 
 pub async fn start_speedtest(state: AppState) -> Result<(), String> {
@@ -320,13 +331,13 @@ async fn probe_http_rtt_typed(
     {
         let mut rem = cl - rest.len();
         let mut sink = [0u8; 2048];
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while rem > 0 {
             let take = rem.min(sink.len());
-            let n = stream.read(&mut sink[..take]).await.unwrap_or(0);
-            if n == 0 {
-                break;
+            match tokio::time::timeout_at(drain_deadline, stream.read(&mut sink[..take])).await {
+                Ok(Ok(n)) if n > 0 => rem -= n,
+                _ => break,
             }
-            rem -= n;
         }
     }
     Ok((rtt_ms, hdr))
@@ -360,25 +371,43 @@ async fn native_dl_worker(
     while !*stop_rx.borrow() {
         // 1 MiB SO_RCVBUF per stream × 8 streams = 8 MiB aggregate window (saturates 1.5+ Gbps
         // without over-filling carrier RLC queues and spiking loaded latency).
-        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), Some(1024 * 1024), None).await else {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            continue;
+        let conn = tokio::select! {
+            _ = stop_rx.changed() => break,
+            res = connect_native_socket(addr, bypass_dev.as_deref(), Some(1024 * 1024), None) => res,
+        };
+        let Ok(mut stream) = conn else {
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                _ = tokio::time::sleep(Duration::from_millis(120)) => continue,
+            }
         };
         while !*stop_rx.borrow() {
-            if stream.write_all(req.as_bytes()).await.is_err() {
+            let write_res = tokio::select! {
+                _ = stop_rx.changed() => break,
+                res = stream.write_all(req.as_bytes()) => res,
+            };
+            if write_res.is_err() {
                 break;
             }
-            let Ok((hdr, rest)) = read_http_headers(&mut stream).await else {
+            let hdr_res = tokio::select! {
+                _ = stop_rx.changed() => break,
+                res = read_http_headers(&mut stream) => res,
+            };
+            let Ok((hdr, rest)) = hdr_res else {
                 break;
             };
             let status = parse_http_status(&hdr);
             if status == 429 {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                break;
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(400)) => break,
+                }
             }
             if !(200..300).contains(&status) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                break;
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => break,
+                }
             }
             let target = parse_content_length(&hdr).unwrap_or(NATIVE_DL_CHUNK_BYTES);
             let mut got = rest.len();
@@ -462,14 +491,24 @@ async fn native_ul_worker(
     while !*stop_rx.borrow() {
         // Keep SO_SNDBUF bounded (128 KiB per stream) so cellular uploads don't
         // experience fake initial buffer-fill spikes followed by drain stalls.
-        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), None, Some(128 * 1024)).await else {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            continue;
+        let conn = tokio::select! {
+            _ = stop_rx.changed() => break,
+            res = connect_native_socket(addr, bypass_dev.as_deref(), None, Some(128 * 1024)) => res,
+        };
+        let Ok(mut stream) = conn else {
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                _ = tokio::time::sleep(Duration::from_millis(120)) => continue,
+            }
         };
         let mut last_acked: u64 = 0;
         let mut use_tcp_info = read_tcp_bytes_acked(stream.as_raw_fd()).is_some();
         while !*stop_rx.borrow() {
-            if stream.write_all(header.as_bytes()).await.is_err() {
+            let hdr_write = tokio::select! {
+                _ = stop_rx.changed() => break,
+                res = stream.write_all(header.as_bytes()) => res,
+            };
+            if hdr_write.is_err() {
                 break;
             }
             let mut sent = 0usize;
@@ -514,25 +553,36 @@ async fn native_ul_worker(
                 break;
             }
             // Drain the short 200 OK response before reusing keep-alive socket.
-            let Ok((hdr, rest)) = read_http_headers(&mut stream).await else {
+            let hdr_res = tokio::select! {
+                _ = stop_rx.changed() => break,
+                res = read_http_headers(&mut stream) => res,
+            };
+            let Ok((hdr, rest)) = hdr_res else {
                 break;
             };
             let status = parse_http_status(&hdr);
             if status == 429 {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                break;
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(400)) => break,
+                }
             }
             if let Some(cl) = parse_content_length(&hdr)
                 && cl > rest.len()
             {
                 let mut rem = cl - rest.len();
                 let mut sink = [0u8; 512];
-                while rem > 0 {
-                    let n = stream.read(&mut sink).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
+                let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while rem > 0 && !*stop_rx.borrow() {
+                    let take = rem.min(sink.len());
+                    let read_res = tokio::select! {
+                        _ = stop_rx.changed() => break,
+                        res = tokio::time::timeout_at(drain_deadline, stream.read(&mut sink[..take])) => res,
+                    };
+                    match read_res {
+                        Ok(Ok(n)) if n > 0 => rem = rem.saturating_sub(n),
+                        _ => break,
                     }
-                    rem = rem.saturating_sub(n);
                 }
             }
             if header_requests_close(&hdr) {
@@ -656,10 +706,12 @@ async fn start_native_speedtest(
     if pid_guard.is_some() {
         return Err("Speedtest is already running".into());
     }
+    let run_id = NEXT_SPEEDTEST_RUN_ID.fetch_add(1, Ordering::Relaxed);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    *pid_guard = Some(0);
-    drop(pid_guard);
+    *pid_guard = Some(run_id);
     *state.speedtest_cancel.lock().await = Some(cancel_tx);
+    SPEEDTEST_RUNNING.store(true, Ordering::Release);
+    drop(pid_guard);
 
     let hist_path = crate::paths::p(SPEEDTEST_HISTORY_PATH);
     let durs = custom_durations.unwrap_or_default();
@@ -680,8 +732,8 @@ async fn start_native_speedtest(
 
     tokio::spawn(async move {
         let res = run_native_pipeline(&state, &host, port, &hist_path, durs, cancel_rx).await;
-        finish_speedtest_slot(&state).await;
-        if let Err(msg) = res {
+        let still_owner = finish_speedtest_slot(&state, run_id).await;
+        if still_owner && let Err(msg) = res {
             let mut live = state.speedtest_live.write().await;
             if live.running && live.phase != "stopped" {
                 live.running = false;
@@ -701,16 +753,19 @@ async fn run_native_pipeline(
     port: u16,
     hist_path: &str,
     durs: NativePhaseDurations,
-    cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| format!("DNS lookup timed out for {host}"))?
-    .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
-    .collect();
+    let lookup_res = tokio::select! {
+        _ = cancel_rx.changed() => return Ok(()),
+        res = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::lookup_host((host, port)),
+        ) => res,
+    };
+    let addrs: Vec<SocketAddr> = lookup_res
+        .map_err(|_| format!("DNS lookup timed out for {host}"))?
+        .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
+        .collect();
     if addrs.is_empty() {
         return Err(format!("No IP address resolved for {host}"));
     }
@@ -719,12 +774,19 @@ async fn run_native_pipeline(
     let mut connected: Option<(SocketAddr, Option<String>, TcpStream)> = None;
     let mut last_err = format!("Failed to connect to {host}");
     for cand in addrs {
+        if *cancel_rx.borrow() {
+            return Ok(());
+        }
         let bypass_dev = if cand.ip().is_loopback() {
             None
         } else {
             crate::vpn::bypass_iface()
         };
-        match connect_native_socket(cand, bypass_dev.as_deref(), None, None).await {
+        let conn_res = tokio::select! {
+            _ = cancel_rx.changed() => return Ok(()),
+            res = connect_native_socket(cand, bypass_dev.as_deref(), None, None) => res,
+        };
+        match conn_res {
             Ok(stream) => {
                 connected = Some((cand, bypass_dev, stream));
                 break;
@@ -933,19 +995,19 @@ async fn run_native_transfer_phase(
     } else {
         NATIVE_UL_STREAMS
     };
-    let mut handles = Vec::with_capacity(streams + 1);
+    let mut workers = JoinSet::new();
     for _ in 0..streams {
         let b = Arc::clone(&bytes_total);
         let rx = phase_stop_rx.clone();
         let h = host.to_string();
         let dev = bypass_dev.clone();
         if phase == "download" {
-            handles.push(tokio::spawn(native_dl_worker(addr, h, meas_id, dev, b, rx)));
+            workers.spawn(native_dl_worker(addr, h, meas_id, dev, b, rx));
         } else {
-            handles.push(tokio::spawn(native_ul_worker(addr, h, meas_id, dev, b, rx)));
+            workers.spawn(native_ul_worker(addr, h, meas_id, dev, b, rx));
         }
     }
-    handles.push(tokio::spawn(native_loaded_ping_worker(
+    workers.spawn(native_loaded_ping_worker(
         addr,
         host.to_string(),
         meas_id,
@@ -954,7 +1016,7 @@ async fn run_native_transfer_phase(
         probes_sent,
         probes_failed,
         phase_stop_rx,
-    )));
+    ));
 
     let start = Instant::now();
     let total_dur = Duration::from_secs(duration_secs.max(1));
@@ -1028,8 +1090,16 @@ async fn run_native_transfer_phase(
     let _ = phase_stop_tx.send(true);
     let end = Instant::now();
     let final_bytes = bytes_total.load(Ordering::Relaxed);
-    for h in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    let join_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        match tokio::time::timeout_at(join_deadline, workers.join_next()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => {
+                workers.abort_all();
+                break;
+            }
+        }
     }
 
     let steady_mbps = match warmup_mark {
@@ -1047,11 +1117,15 @@ async fn run_native_transfer_phase(
 }
 
 pub async fn stop_speedtest(state: &AppState) -> Result<(), String> {
-    if let Some(cancel) = state.speedtest_cancel.lock().await.take() {
-        let _ = cancel.send(true);
+    {
+        let mut pid_guard = state.speedtest_pid.lock().await;
+        if let Some(cancel) = state.speedtest_cancel.lock().await.take() {
+            let _ = cancel.send(true);
+        }
+        *pid_guard = None;
+        SPEEDTEST_RUNNING.store(false, Ordering::Release);
+        LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Release);
     }
-    *state.speedtest_pid.lock().await = None;
-    LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Relaxed);
     let mut live = state.speedtest_live.write().await;
     live.running = false;
     live.phase = "stopped".into();
@@ -1206,7 +1280,7 @@ mod tests {
                 start_native_speedtest(app.clone(), "127.0.0.1".into(), addr.port(), Some(durs))
                     .await
                     .unwrap();
-                assert!(is_self_traffic_active(&app).await);
+                assert!(is_self_traffic_active());
                 for _ in 0..160 {
                     if !app.speedtest_live.read().await.running && app.speedtest_pid.lock().await.is_none() {
                         break;
@@ -1226,9 +1300,53 @@ mod tests {
                 assert_eq!(hist.len(), 1);
                 assert_eq!(hist[0].engine.as_deref(), Some("native"));
                 // Immediately after completion, settle window keeps self-traffic active
-                assert!(is_self_traffic_active(&app).await);
+                assert!(is_self_traffic_active());
             })
             .await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_and_restart_run_id_prevents_stale_finish_from_clobbering_new_run() {
+        let env = crate::paths::TestSandbox::new("speedtest-run-id-guard");
+        let auth = crate::auth::AuthStore::new(env.root.join("sessions"));
+        let app = AppState::for_tests(env.root.clone(), auth);
+
+        // Simulate run 1 acquiring the slot.
+        let run1 = NEXT_SPEEDTEST_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let (tx1, _rx1) = watch::channel(false);
+        {
+            let mut pid = app.speedtest_pid.lock().await;
+            *pid = Some(run1);
+            *app.speedtest_cancel.lock().await = Some(tx1);
+            SPEEDTEST_RUNNING.store(true, Ordering::Release);
+        }
+        assert!(is_self_traffic_active());
+
+        // Stop run 1, then immediately start run 2 before run 1 finishes cleanup.
+        stop_speedtest(&app).await.unwrap();
+        assert!(app.speedtest_pid.lock().await.is_none());
+
+        let run2 = NEXT_SPEEDTEST_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let (tx2, rx2) = watch::channel(false);
+        {
+            let mut pid = app.speedtest_pid.lock().await;
+            *pid = Some(run2);
+            *app.speedtest_cancel.lock().await = Some(tx2);
+            SPEEDTEST_RUNNING.store(true, Ordering::Release);
+        }
+
+        // Late finish from run 1 MUST NOT clear run 2's slot, cancel channel, or running flag.
+        assert!(!finish_speedtest_slot(&app, run1).await);
+        assert_eq!(*app.speedtest_pid.lock().await, Some(run2));
+        assert!(app.speedtest_cancel.lock().await.is_some());
+        assert!(!*rx2.borrow());
+        assert!(SPEEDTEST_RUNNING.load(Ordering::Acquire));
+
+        // Finishing run 2 cleanly releases the slot.
+        assert!(finish_speedtest_slot(&app, run2).await);
+        assert!(app.speedtest_pid.lock().await.is_none());
+        assert!(app.speedtest_cancel.lock().await.is_none());
+        assert!(!SPEEDTEST_RUNNING.load(Ordering::Acquire));
     }
 }

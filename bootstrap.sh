@@ -189,6 +189,23 @@ validate_mbn() {
   fi
 }
 
+validate_feed_url() {
+  local url="$1"
+  if [ -z "$url" ] || [ "${#url}" -gt 512 ]; then
+    echo "ERROR: invalid CELLCORE_FEED_URL (empty or too long)" >&2
+    return 1
+  fi
+  # Reject single quotes, whitespace, control characters, and shell metacharacters
+  if printf '%s' "$url" | LC_ALL=C grep -qE "[[:space:][:cntrl:]'\"\`\$;\|&<>()\\\\{}\*\?]"; then
+    echo "ERROR: invalid CELLCORE_FEED_URL (contains forbidden quotes, whitespace, or shell metacharacters): ${url}" >&2
+    return 1
+  fi
+  if ! printf '%s' "$url" | grep -qE '^https?://[A-Za-z0-9._~:/@%+-]+$'; then
+    echo "ERROR: invalid CELLCORE_FEED_URL (must be a clean http(s):// URL): ${url}" >&2
+    return 1
+  fi
+}
+
 validate_config_bundle() {
   local bundle="$1"
   if [ ! -f "$bundle" ]; then
@@ -340,6 +357,7 @@ derive_qmap_lanip_range() {
 }
 
 # Run all local validations immediately (even in --dry-run and before touching USB/SSH)
+validate_feed_url "$FEED_URL"
 if [ -n "$SSH_PUBKEY" ] && [ ! -f "$SSH_PUBKEY" ]; then
   echo "ERROR: SSH public key not found: $SSH_PUBKEY" >&2
   exit 1

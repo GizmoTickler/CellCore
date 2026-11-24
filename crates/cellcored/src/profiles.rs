@@ -892,6 +892,12 @@ pub async fn tick_profiles_and_schedules(state: &AppState) {
             if let Err(reason) = should_allow_scheduled_reboot(now, uptime, last_persisted) {
                 LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
                 state.push_daemon_log(format!("Scheduled reboot skipped: {reason}"));
+            } else if state.ab_flash.job.read().await.running {
+                LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
+                state.push_daemon_log(
+                    "Scheduled reboot deferred: A/B NAND firmware flash is in progress",
+                );
+                crate::obs::failover::defer_scheduled_reboot(now);
             } else if crate::obs::failover::is_active() {
                 LAST_REBOOT_MIN.store(this_min, std::sync::atomic::Ordering::Relaxed);
                 state.push_daemon_log("Scheduled reboot deferred: modem is carrying failover traffic");

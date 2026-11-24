@@ -26,7 +26,6 @@ pub const QM_PACKAGE_DEFAULT: &str = "sdxpinn-cellcore";
 pub const MIN_SELF_UPGRADE_BYTES: u64 = 15 * 1024 * 1024;
 pub const SELF_UPGRADE_STATE_PATH: &str = "/tmp/cellcore/self-upgrade.json";
 pub const SELF_UPGRADE_LOG_PATH: &str = "/tmp/cellcore/self-upgrade.log";
-const SELF_UPGRADE_SCRIPT_PATH: &str = "/tmp/cellcore/self-upgrade.sh";
 const OPKG_STATUS_PATH: &str = "/usr/lib/opkg/status";
 const CUSTOM_FEEDS_PATH: &str = "/etc/opkg/customfeeds.conf";
 const DIST_FEEDS_PATH: &str = "/etc/opkg/distfeeds.conf";
@@ -265,6 +264,28 @@ impl SelfUpgradeState {
 }
 
 pub(crate) fn read_self_upgrade_state() -> SelfUpgradeState {
+    if let Some(ota) = crate::ota::read_upgrade_status() {
+        let (pkg, installed) = find_qm_package_status();
+        let running = crate::ota::upgrade_running();
+        let eff = crate::ota::effective_upgrade_status(Some(ota), |_| running, installed.as_deref());
+        let active = eff.state == "running";
+        let rolled_back = eff
+            .message
+            .as_deref()
+            .is_some_and(|m| m.to_ascii_lowercase().contains("rolled back"));
+        return SelfUpgradeState {
+            active,
+            phase: eff.state,
+            package: pkg,
+            from_version: (!eff.from.is_empty()).then_some(eff.from),
+            target_version: (!eff.target.is_empty()).then_some(eff.target),
+            started_at: eff.started_at,
+            updated_at: eff.finished_at.unwrap_or(eff.started_at),
+            pid: eff.pid,
+            error: eff.message,
+            rolled_back,
+        };
+    }
     let path = crate::paths::p(SELF_UPGRADE_STATE_PATH);
     std::fs::read_to_string(&path)
         .ok()
@@ -279,119 +300,6 @@ fn tail_log_lines(path: &str, limit: usize) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(limit);
     lines[start..].iter().map(|s| (*s).to_string()).collect()
-}
-
-fn safe_script_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b':'))
-}
-
-pub(crate) fn build_self_upgrade_script(
-    pkg: &str,
-    from_ver: &str,
-    target_ver: &str,
-    state_path: &str,
-    log_path: &str,
-) -> String {
-    format!(
-        r#"#!/bin/sh
-set -u
-PKG='{pkg}'
-FROM_VER='{from_ver}'
-TARGET_VER='{target_ver}'
-STATE='{state_path}'
-LOG='{log_path}'
-RB='/tmp/qm-rollback'
-mkdir -p /tmp/cellcore
-exec >> "$LOG" 2>&1
-STARTED_AT=$(date +%s 2>/dev/null || echo 0)
-write_state() {{
-  now=$(date +%s 2>/dev/null || echo 0)
-  err_esc=$(printf '%s' "${{4:-}}" | tr '\r\n"' '   ')
-  tmp="${{STATE}}.tmp.$$"
-  if [ -n "$err_esc" ]; then
-    err_json="\"$err_esc\""
-  else
-    err_json="null"
-  fi
-  printf '{{"active":%s,"phase":"%s","package":"%s","fromVersion":"%s","targetVersion":"%s","startedAt":%s,"updatedAt":%s,"pid":%s,"error":%s,"rolledBack":%s}}\n' \
-    "$1" "$2" "$PKG" "$FROM_VER" "$TARGET_VER" "$STARTED_AT" "$now" "$$" "$err_json" "$3" > "$tmp" && mv -f "$tmp" "$STATE"
-}}
-echo "=== CellCore self-upgrade started ($PKG $FROM_VER -> $TARGET_VER) ==="
-write_state true "snapshotting" false ""
-rm -rf "$RB"
-mkdir -p "$RB/etc" "$RB/opkg-info"
-[ -x /usr/sbin/cellcored ] && cp -a /usr/sbin/cellcored "$RB/cellcored"
-[ -d /www ] && cp -a /www "$RB/www"
-[ -f /etc/init.d/cellcored ] && cp -a /etc/init.d/cellcored "$RB/init.d-cellcored"
-[ -f /etc/init.d/dropbear-lan-watchdog ] && cp -a /etc/init.d/dropbear-lan-watchdog "$RB/init.d-dropbear-lan-watchdog"
-[ -d /etc/cellcore ] && cp -a /etc/cellcore "$RB/etc/cellcore"
-[ -f /usr/lib/opkg/status ] && cp -a /usr/lib/opkg/status "$RB/opkg-status"
-cp -a /usr/lib/opkg/info/sdxpinn-cellcore.* "$RB/opkg-info/" 2>/dev/null || true
-rollback() {{
-  reason="$1"
-  echo "ERROR: $reason -- rolling back"
-  write_state true "rolling_back" true "$reason"
-  [ -x "$RB/cellcored" ] && cp -af "$RB/cellcored" /usr/sbin/cellcored
-  if [ -d "$RB/www" ]; then
-    rm -rf /www
-    cp -a "$RB/www" /www
-  fi
-  [ -f "$RB/init.d-cellcored" ] && cp -af "$RB/init.d-cellcored" /etc/init.d/cellcored
-  [ -f "$RB/init.d-dropbear-lan-watchdog" ] && cp -af "$RB/init.d-dropbear-lan-watchdog" /etc/init.d/dropbear-lan-watchdog
-  if [ -d "$RB/etc/cellcore" ]; then
-    mkdir -p /etc/cellcore
-    cp -af "$RB/etc/cellcore/." /etc/cellcore/
-  fi
-  [ -f "$RB/opkg-status" ] && cp -af "$RB/opkg-status" /usr/lib/opkg/status
-  if [ -d "$RB/opkg-info" ]; then
-    rm -f /usr/lib/opkg/info/sdxpinn-cellcore.* 2>/dev/null || true
-    cp -af "$RB/opkg-info/." /usr/lib/opkg/info/ 2>/dev/null || true
-  fi
-  /etc/init.d/cellcored restart >/dev/null 2>&1 || /etc/init.d/cellcored start >/dev/null 2>&1 || true
-  sleep 2
-  write_state false "rolled_back" true "$reason"
-  exit 1
-}}
-write_state true "updating_feeds" false ""
-if ! opkg update; then
-  rollback "opkg update failed"
-fi
-write_state true "upgrading" false ""
-if ! opkg upgrade "$PKG"; then
-  rollback "opkg upgrade $PKG failed"
-fi
-write_state true "verifying" false ""
-i=0
-verified=0
-while [ "$i" -lt 45 ]; do
-  if /usr/sbin/cellcored verify --expect-wan 0 >/dev/null 2>&1; then
-    verified=1
-    break
-  fi
-  sleep 1
-  i=$((i + 1))
-done
-if [ "$verified" -ne 1 ]; then
-  rollback "cellcored verify timed out after 45s"
-fi
-RESCUE_DL="/tmp/qm-rescue-dl.$$"
-mkdir -p "$RESCUE_DL" /etc/cellcore-rescue
-if (cd "$RESCUE_DL" && opkg download "$PKG" >/dev/null 2>&1); then
-  ipk_f=$(ls -1 "$RESCUE_DL"/"${{PKG}}"_*.ipk "$RESCUE_DL"/*.ipk 2>/dev/null | head -n 1)
-  if [ -n "$ipk_f" ] && [ -f "$ipk_f" ]; then
-    cp -f "$ipk_f" /etc/cellcore-rescue/cellcore.ipk.tmp && mv -f /etc/cellcore-rescue/cellcore.ipk.tmp /etc/cellcore-rescue/cellcore.ipk
-    echo "Staged verified rescue package -> /etc/cellcore-rescue/cellcore.ipk"
-  fi
-fi
-rm -rf "$RESCUE_DL"
-rm -rf "$RB"
-echo "=== CellCore self-upgrade succeeded ($PKG -> $TARGET_VER) ==="
-write_state false "succeeded" false ""
-"#
-    )
 }
 
 /// Parse installed packages and CellCore's `Depends` directly from `/usr/lib/opkg/status`
@@ -606,11 +514,8 @@ pub fn validate_feeds(content: &str) -> Result<String, String> {
             return Err(format!("Line {}: invalid feed name '{}'", idx + 1, parts[1]));
         }
         let url = parts[2];
-        if (!url.starts_with("http://") && !url.starts_with("https://"))
-            || url.len() > 512
-            || url.bytes().any(|b| b <= 0x20 || b >= 0x7f || matches!(b, b'"' | b'\'' | b'`'))
-        {
-            return Err(format!("Line {}: URL must be http:// or https:// without spaces or quotes", idx + 1));
+        if let Err(e) = crate::ota::validate_feed_url(url) {
+            return Err(format!("Line {}: {e}", idx + 1));
         }
     }
     if !normalized.is_empty() && !normalized.ends_with('\n') {
@@ -825,10 +730,16 @@ pub async fn get_self_upgrade_status() -> Response {
             st.error = Some("Upgrade worker timed out or exited unexpectedly".into());
         }
     }
+    let ota_log = tail_log_lines(crate::ota::UPGRADE_LOG_PATH, 100);
+    let log = if !ota_log.is_empty() {
+        ota_log
+    } else {
+        tail_log_lines(SELF_UPGRADE_LOG_PATH, 100)
+    };
     ok(serde_json::json!({
         "status": "ok",
         "state": st,
-        "log": tail_log_lines(SELF_UPGRADE_LOG_PATH, 100),
+        "log": log,
     }))
 }
 
@@ -839,7 +750,7 @@ pub struct UpgradeReq {
 }
 
 pub async fn post_self_upgrade(State(ctx): State<HttpCtx>, Json(req): Json<UpgradeReq>) -> Response {
-    let why = "Upgrades CellCore from the opkg feed, restarts cellcored briefly, and auto-rolls back if verification fails within 45s. Type UPGRADE to continue.";
+    let why = "Upgrades CellCore from the signed CellCore feed (verifying signature and pinned SHA-256), restarts cellcored briefly, and auto-rolls back if verification fails. Type UPGRADE to continue.";
     if let Err(resp) = require_confirm(req.confirm.as_deref(), "UPGRADE", why) {
         return resp;
     }
@@ -851,100 +762,36 @@ pub async fn post_self_upgrade(State(ctx): State<HttpCtx>, Json(req): Json<Upgra
             free / (1024 * 1024)
         ));
     }
-    let cur = read_self_upgrade_state();
-    let now = crate::auth::now_secs();
-    if cur.active && now.saturating_sub(cur.updated_at.max(cur.started_at)) < 300 {
+    if crate::ota::upgrade_running() {
         return conflict("A CellCore self-upgrade is already in progress");
     }
 
-    let (pkg, from_ver_opt) = find_qm_package_status();
-    if !safe_script_token(&pkg) {
-        return bad("Invalid CellCore package name");
-    }
-    let from_ver = from_ver_opt
-        .filter(|v| safe_script_token(v))
-        .unwrap_or_else(|| "unknown".into());
-    let avail_ver = available()
-        .await
-        .ok()
-        .and_then(|list| {
-            list.into_iter()
-                .filter(|p| p.name == pkg)
-                .max_by(|a, b| compare_opkg_versions(&a.version, &b.version))
-                .map(|p| p.version)
-        })
-        .filter(|v| safe_script_token(v))
-        .unwrap_or_else(|| "latest".into());
-
-    let state_path = crate::paths::p(SELF_UPGRADE_STATE_PATH);
-    let log_path = crate::paths::p(SELF_UPGRADE_LOG_PATH);
-    let script_path = crate::paths::p(SELF_UPGRADE_SCRIPT_PATH);
-
-    let init_state = SelfUpgradeState {
-        active: true,
-        phase: "starting".into(),
-        package: pkg.clone(),
-        from_version: Some(from_ver.clone()),
-        target_version: Some(avail_ver.clone()),
-        started_at: now,
-        updated_at: now,
-        pid: None,
-        error: None,
-        rolled_back: false,
-    };
-    if let Err(e) = crate::state::save_json_atomic(SELF_UPGRADE_STATE_PATH, &init_state, 0o600) {
-        return server(format!("save self-upgrade state: {e}"));
-    }
-
-    let script = build_self_upgrade_script(&pkg, &from_ver, &avail_ver, &state_path, &log_path);
-    if let Some(parent) = Path::new(&script_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&script_path, script.as_bytes()) {
-        return server(format!("write self-upgrade script: {e}"));
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
-
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg(&script_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // Detach from cellcored's process group/session so CONTROL/preinst stopping
-    // cellcored cannot kill the upgrade watcher before postinst/verify finish.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    match cmd.spawn() {
-        Ok(_) => {
+    let (pkg, _) = find_qm_package_status();
+    match crate::ota::trigger_verified_self_upgrade(&pkg, None, true).await {
+        Ok(st) => {
             audit(
                 &ctx,
-                format!("started detached self-upgrade for {pkg} ({from_ver} -> {avail_ver})"),
+                format!(
+                    "started verified signed self-upgrade for {pkg} ({} -> {})",
+                    st.from, st.target
+                ),
             );
             (
                 axum::http::StatusCode::ACCEPTED,
                 Json(serde_json::json!({
                     "status": "accepted",
-                    "phase": "starting",
+                    "phase": "running",
                     "package": pkg,
-                    "fromVersion": from_ver,
-                    "targetVersion": avail_ver,
-                    "logPath": SELF_UPGRADE_LOG_PATH,
+                    "fromVersion": st.from,
+                    "targetVersion": st.target,
+                    "logPath": crate::ota::UPGRADE_LOG_PATH,
+                    "signatureVerified": true,
                 })),
             )
                 .into_response()
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&state_path);
-            server(format!("spawn self-upgrade script: {e}"))
-        }
+        Err(e) if e.contains("already running") => conflict(e),
+        Err(e) => bad(e),
     }
 }
 
@@ -1051,12 +898,13 @@ Status: install user installed
         assert_eq!(pkgs[1].name, "sdxpinn-cellcore");
         assert_eq!(deps, vec!["libc", "uci", "ubus", "msmtp"]);
 
-        let valid = "# comment\nsrc/gz custom_feed https://example.com/feed\r\nsrc raw http://127.0.0.1:8000/pkgs";
+        let valid = "# comment\nsrc/gz custom_feed https://example.com/feed\r\nsrc raw http://127.0.0.1:8000/pkgs\nsrc lan http://192.168.1.50/pkgs";
         assert_eq!(
             validate_feeds(valid).unwrap(),
-            "# comment\nsrc/gz custom_feed https://example.com/feed\nsrc raw http://127.0.0.1:8000/pkgs\n"
+            "# comment\nsrc/gz custom_feed https://example.com/feed\nsrc raw http://127.0.0.1:8000/pkgs\nsrc lan http://192.168.1.50/pkgs\n"
         );
         assert!(validate_feeds("src/gz bad;name https://example.com/a").is_err());
+        assert!(validate_feeds("src/gz pub_http http://example.com/a").is_err());
         assert!(validate_feeds("ftp custom ftp://example.com/a").is_err());
         assert!(validate_feeds("src custom file:///etc/passwd").is_err());
         assert!(validate_feeds("src custom https://example.com/a extra").is_err());
@@ -1071,21 +919,5 @@ Status: install user installed
         assert_eq!(compare_opkg_versions("4.2.1-2", "4.2.1-10"), Ordering::Less);
         assert_eq!(compare_opkg_versions("1:4.2.0-1", "4.2.9-1"), Ordering::Greater);
         assert_eq!(compare_opkg_versions("4.2.1~rc1-1", "4.2.1-1"), Ordering::Less);
-    }
-
-    #[test]
-    fn self_upgrade_script_snapshots_opkg_metadata_watchdog_and_stages_rescue_ipk() {
-        let s = build_self_upgrade_script(
-            "sdxpinn-cellcore",
-            "1.5.0-1",
-            "1.6.0-1",
-            "/tmp/cellcore/self-upgrade.json",
-            "/tmp/cellcore/self-upgrade.log",
-        );
-        assert!(s.contains("/usr/lib/opkg/status"));
-        assert!(s.contains("/usr/lib/opkg/info/sdxpinn-cellcore.*"));
-        assert!(s.contains("/etc/init.d/dropbear-lan-watchdog"));
-        assert!(s.contains("/etc/cellcore-rescue/cellcore.ipk"));
-        assert!(s.contains("cellcored verify --expect-wan 0"));
     }
 }

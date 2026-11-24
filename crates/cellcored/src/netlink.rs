@@ -1150,11 +1150,22 @@ pub(crate) fn build_del_default_route_msg(family: u8, ifindex: i32, table: u32) 
     b.finish()
 }
 
-pub fn del_default_routes(iface: &str, ifindex: i32, table: u32) -> Result<(), String> {
+pub fn del_default_routes_family(
+    iface: &str,
+    ifindex: i32,
+    table: u32,
+    family: Option<u8>,
+) -> Result<(), String> {
     validate_managed_iface(iface)?;
     validate_managed_table(table)?;
-    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
-        let req = build_del_default_route_msg(family, ifindex, table);
+    let families: &[u8] = match family {
+        Some(f) if f == libc::AF_INET as u8 => &[libc::AF_INET as u8],
+        Some(f) if f == libc::AF_INET6 as u8 => &[libc::AF_INET6 as u8],
+        Some(other) => return Err(format!("unsupported address family {other}")),
+        None => &[libc::AF_INET as u8, libc::AF_INET6 as u8],
+    };
+    for &fam in families {
+        let req = build_del_default_route_msg(fam, ifindex, table);
         // Loop so multiple residual default routes (e.g. differing metrics/protocols)
         // on the same interface/table are all evicted until kernel reports ESRCH/ENOENT.
         for _ in 0..16 {
@@ -1166,6 +1177,11 @@ pub fn del_default_routes(iface: &str, ifindex: i32, table: u32) -> Result<(), S
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub fn del_default_routes(iface: &str, ifindex: i32, table: u32) -> Result<(), String> {
+    del_default_routes_family(iface, ifindex, table, None)
 }
 
 #[cfg(test)]

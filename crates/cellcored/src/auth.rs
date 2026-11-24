@@ -65,6 +65,11 @@ pub enum VerifyError {
     Busy,
 }
 
+fn session_filename_hash(token: &str) -> String {
+    let digest = hex::encode(Sha256::digest(token.as_bytes()));
+    digest[..32].to_string()
+}
+
 fn is_session_expired_mono(rec: &SessionRecord, now_mono: Instant) -> bool {
     now_mono.saturating_duration_since(rec.created_mono) > Duration::from_secs(SESSION_MAX_AGE_SECS)
         || now_mono.saturating_duration_since(rec.last_seen_mono) > Duration::from_secs(SESSION_IDLE_AGE_SECS)
@@ -119,6 +124,7 @@ impl AuthStore {
                 break;
             };
             loaded.remove(&oldest);
+            let _ = fs::remove_file(dir.join(format!("{}.json", session_filename_hash(&oldest))));
             let _ = fs::remove_file(dir.join(format!("{oldest}.json")));
         }
         Self {
@@ -233,7 +239,7 @@ impl AuthStore {
                 .collect();
             for tok in expired {
                 sessions.remove(&tok);
-                let _ = fs::remove_file(self.session_path(&tok));
+                self.remove_session_files(&tok);
                 evicted_any = true;
             }
             while sessions.len() >= MAX_SESSIONS {
@@ -245,7 +251,7 @@ impl AuthStore {
                     break;
                 };
                 sessions.remove(&oldest_tok);
-                let _ = fs::remove_file(self.session_path(&oldest_tok));
+                self.remove_session_files(&oldest_tok);
                 evicted_any = true;
             }
             sessions.insert(token, rec.clone());
@@ -269,7 +275,7 @@ impl AuthStore {
             .is_some_and(|rec| is_session_expired_mono(rec, now_mono));
         if expired {
             sessions.remove(token);
-            let _ = fs::remove_file(self.session_path(token));
+            self.remove_session_files(token);
             return None;
         }
         let rec = sessions.get_mut(token)?;
@@ -296,7 +302,7 @@ impl AuthStore {
             return;
         }
         self.sessions.lock().await.remove(token);
-        let _ = fs::remove_file(self.session_path(token));
+        self.remove_session_files(token);
         self.notify_revoked();
     }
 
@@ -309,7 +315,7 @@ impl AuthStore {
             .collect();
         for tok in to_remove {
             sessions.remove(&tok);
-            let _ = fs::remove_file(self.session_path(&tok));
+            self.remove_session_files(&tok);
         }
         drop(sessions);
         self.notify_revoked();
@@ -326,7 +332,7 @@ impl AuthStore {
         let any_expired = !expired.is_empty();
         for tok in expired {
             sessions.remove(&tok);
-            let _ = fs::remove_file(self.session_path(&tok));
+            self.remove_session_files(&tok);
         }
         drop(sessions);
         if any_expired {
@@ -338,16 +344,29 @@ impl AuthStore {
     }
 
     fn session_path(&self, token: &str) -> PathBuf {
+        self.session_dir.join(format!("{}.json", session_filename_hash(token)))
+    }
+
+    fn legacy_session_path(&self, token: &str) -> PathBuf {
         self.session_dir.join(format!("{token}.json"))
+    }
+
+    fn remove_session_files(&self, token: &str) {
+        let _ = fs::remove_file(self.session_path(token));
+        let _ = fs::remove_file(self.legacy_session_path(token));
     }
 
     fn persist_session(&self, rec: &SessionRecord) {
         let path = self.session_path(&rec.token);
-        if let Ok(json) = serde_json::to_vec(rec)
-            && crate::state::atomic_write_tmpfs(&path, &json, 0o600).is_err()
-        {
-            self.ensure_dir();
-            let _ = crate::state::atomic_write_tmpfs(&path, &json, 0o600);
+        if let Ok(json) = serde_json::to_vec(rec) {
+            if crate::state::atomic_write_tmpfs(&path, &json, 0o600).is_err() {
+                self.ensure_dir();
+                let _ = crate::state::atomic_write_tmpfs(&path, &json, 0o600);
+            }
+            let legacy = self.legacy_session_path(&rec.token);
+            if legacy != path {
+                let _ = fs::remove_file(legacy);
+            }
         }
     }
 }
@@ -954,13 +973,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let store = AuthStore::new(&dir);
         let sess = store.create_session().await.unwrap();
-        let path = dir.join(format!("{}.json", sess.token));
-        assert!(path.exists());
+        let hashed_path = dir.join(format!("{}.json", session_filename_hash(&sess.token)));
+        let legacy_path = dir.join(format!("{}.json", sess.token));
+        assert!(hashed_path.exists(), "session must persist under sha256[..32].json");
+        assert!(!legacy_path.exists(), "plaintext token filename must not be written");
 
         // Remove the file to observe whether a rapid touch rewrites it.
-        fs::remove_file(&path).unwrap();
+        fs::remove_file(&hashed_path).unwrap();
         assert!(store.validate_token(&sess.token, true).await.is_some());
-        assert!(!path.exists(), "rapid touch within 120s must not rewrite session file");
+        assert!(!hashed_path.exists(), "rapid touch within 120s must not rewrite session file");
 
         // Age last_persisted_mono beyond 120s and touch again -> rewrites file.
         {
@@ -969,7 +990,30 @@ mod tests {
             rec.last_persisted_mono = Instant::now() - Duration::from_secs(SESSION_PERSIST_INTERVAL_SECS + 1);
         }
         assert!(store.validate_token(&sess.token, true).await.is_some());
-        assert!(path.exists(), "touch after 120s must persist updated session file");
+        assert!(hashed_path.exists(), "touch after 120s must persist updated session file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_session_file_survives_restart_and_cleans_up_on_revoke() {
+        let dir = std::env::temp_dir().join(format!("qm-auth-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let tok = random_hex(32).unwrap();
+        let now = now_secs();
+        let legacy = dir.join(format!("{tok}.json"));
+        let rec_json = serde_json::json!({
+            "token": tok,
+            "csrf_token": "0123456789abcdef0123456789abcdef",
+            "created_at": now,
+            "last_seen": now,
+        });
+        fs::write(&legacy, rec_json.to_string()).unwrap();
+
+        let store = AuthStore::new(&dir);
+        assert!(store.validate_token(&tok, false).await.is_some(), "legacy session file must load");
+        store.revoke_session(&tok).await;
+        assert!(!legacy.exists(), "revoking legacy session must remove legacy file");
         let _ = fs::remove_dir_all(&dir);
     }
 }

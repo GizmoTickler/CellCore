@@ -855,15 +855,18 @@ if os.path.isfile(target):
                 fail(f"MD5 mismatch for {rel}: expected {expected_md5}, got {got_md5}")
             verified_count += 1
 
-        # Locate rawprogram_nand_*.xml
+        # Locate rawprogram_nand_*.xml deterministically (sorted, preferring p4k_b256k)
         rp_candidates = [
             n for n in names
             if re.match(r"^rawprogram_nand_.*\.xml$", os.path.basename(n.replace("\\", "/")), re.IGNORECASE)
         ]
         if not rp_candidates:
             fail("rawprogram_nand_*.xml not found in firmware zip")
-        # Prefer factory if present alongside update? No: pick exact single or deterministic sorted match
-        rp_member = sorted(rp_candidates)[0]
+        rp_sorted = sorted(rp_candidates)
+        rp_member = next(
+            (c for c in rp_sorted if "p4k_b256k" in os.path.basename(c.replace("\\", "/")).lower()),
+            rp_sorted[0],
+        )
         rawprogram_name = os.path.basename(rp_member.replace("\\", "/"))
         rawprogram_bytes = zf.read(rp_member)
 
@@ -920,7 +923,11 @@ elif os.path.isdir(target):
     ]
     if not rp_candidates:
         fail("rawprogram_nand_*.xml not found in firmware directory")
-    rp_rel, rp_full = sorted(rp_candidates, key=lambda x: x[0])[0]
+    rp_sorted = sorted(rp_candidates, key=lambda x: x[0])
+    rp_rel, rp_full = next(
+        (pair for pair in rp_sorted if "p4k_b256k" in os.path.basename(pair[0]).lower()),
+        rp_sorted[0],
+    )
     rawprogram_name = os.path.basename(rp_rel)
     with open(rp_full, "rb") as f:
         rawprogram_bytes = f.read()
@@ -1033,6 +1040,7 @@ cmd_backup() {
   ) > "$sum_file"
   chmod 0600 "$sum_file"
 
+  LAST_BACKUP_XQCN="$xqcn_out"
   echo "==> Backup complete & verified:"
   echo "    XQCN : ${xqcn_out}"
   echo "    TAR  : ${tar_out}"
@@ -1052,9 +1060,13 @@ unpack_firmware_to_update_dir() {
   else
     cp -a "$src"/. "$dest"/
   fi
-  # Locate directory containing firehose/rawprogram_nand_*.xml (QFirehose expects the parent of firehose/ or the dir itself)
-  local rp_file
-  rp_file=$(find "$dest" -type f -iname 'rawprogram_nand_*.xml' | head -n 1)
+  # Locate directory containing firehose/rawprogram_nand_*.xml deterministically (sorted, preferring p4k_b256k)
+  local rp_list rp_file
+  rp_list=$(find "$dest" -type f -iname 'rawprogram_nand_*.xml' | LC_ALL=C sort)
+  rp_file=$(printf '%s\n' "$rp_list" | grep -i 'p4k_b256k' | head -n 1 || true)
+  if [ -z "$rp_file" ]; then
+    rp_file=$(printf '%s\n' "$rp_list" | head -n 1 || true)
+  fi
   if [ -z "$rp_file" ]; then
     echo "ERROR: could not locate rawprogram_nand_*.xml after unpacking ${src}" >&2
     return 1
@@ -1224,9 +1236,10 @@ cmd_flash() {
     local bk_args=(--out "$backup_dir" --qfenix "$qfenix_bin")
     [ -n "$adb_serial" ] && bk_args+=(--adb-serial "$adb_serial")
     [ "$stop_mm" -eq 1 ] && bk_args+=(--stop-mm)
+    LAST_BACKUP_XQCN=""
     cmd_backup "${bk_args[@]}"
-    xqcn_to_restore=$(ls -1t "${backup_dir}"/*.xqcn 2>/dev/null | head -n 1 || true)
-    [ -n "$xqcn_to_restore" ] || { echo "ERROR: failed to locate captured .xqcn in ${backup_dir}" >&2; exit 1; }
+    xqcn_to_restore="$LAST_BACKUP_XQCN"
+    [ -n "$xqcn_to_restore" ] && [ -f "$xqcn_to_restore" ] || { echo "ERROR: failed to locate captured .xqcn from backup in ${backup_dir}" >&2; exit 1; }
   fi
 
   # Re-verify XQCN NV 550 IMEI and capture its full IMEI internally for post-restore check

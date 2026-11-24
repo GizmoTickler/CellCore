@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     auth::now_secs,
     parsers::{
-        ServingCellInfo, clean_at_lines, mask_secret_id, merge_nr5g_mimo_layers,
+        MimoSignalData, ServingCellInfo, clean_at_lines, mask_secret_id, merge_nr5g_mimo_layers,
         overlay_native_bearer, parse_3gpp_rel, parse_active_wwan, parse_carrier_aggregation,
         parse_mimo_signal, parse_neighbor_cells, parse_nr5g_mimo_info, parse_nr5g_pathloss,
         parse_qspn_operator, parse_scalar_at_value, parse_serving_cell, parse_ssb_beam_id,
@@ -1259,7 +1259,6 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
             }
             let _ = crate::radio_tuning::poll_phy_telemetry(&st_prof).await;
             let dsp = crate::qmi::dsp::probe_dsp_telemetry().await;
-            crate::obs::events::on_dsp_telemetry(&dsp);
             *st_prof.dsp_telemetry.write().await = dsp;
             st_prof
                 .dsp_telemetry_updated_ms
@@ -2111,6 +2110,12 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
     let mut modem = state.modem.write().await;
     modem.updated_at = now_secs();
     modem.updated_mono_ms = mono_ms();
+    stabilize_idle_mimo_chains(
+        &mut mimo,
+        &modem.mimo,
+        serving.as_ref(),
+        modem.serving.as_ref(),
+    );
     modem.operator = operator;
     modem.serving = serving;
     modem.carriers = carriers;
@@ -2820,6 +2825,66 @@ pub async fn flush_persistent_state(state: &AppState) {
     .await;
 }
 
+/// During RRC Idle (`NOCONN`) 4x4 MIMO power-save, Qualcomm modems power down
+/// RX2/RX3 so `AT+QRSRP` reports `-140 dBm` (`None`) on chains 2 & 3 while
+/// chains 0 & 1 remain healthy. Retain the last connected chain 2/3 readings
+/// while remaining on the same serving cell so Prometheus `antenna_chain_present`
+/// and `antenna_active_chains` do not falsely flap to 2 chains during idle.
+pub(crate) fn stabilize_idle_mimo_chains(
+    mimo: &mut MimoSignalData,
+    prev_mimo: &MimoSignalData,
+    serving: Option<&ServingCellInfo>,
+    prev_serving: Option<&ServingCellInfo>,
+) {
+    let is_idle = serving.is_some_and(|s| s.state.eq_ignore_ascii_case("NOCONN"));
+    if !is_idle {
+        return;
+    }
+    let same_cell = match (serving, prev_serving) {
+        (Some(cur), Some(prev)) => {
+            cur.rat == prev.rat
+                && cur.band == prev.band
+                && cur.pci == prev.pci
+                && cur.arfcn == prev.arfcn
+        }
+        _ => false,
+    };
+    if !same_cell {
+        return;
+    }
+    let rx0_ok = mimo.rsrp.first().and_then(|v| *v).is_some_and(f64::is_finite);
+    let rx1_ok = mimo.rsrp.get(1).and_then(|v| *v).is_some_and(f64::is_finite);
+    if !rx0_ok || !rx1_ok {
+        return;
+    }
+    for idx in 2..4 {
+        if mimo.rsrp.get(idx).and_then(|v| *v).is_none()
+            && let Some(prev_r) = prev_mimo.rsrp.get(idx).and_then(|v| *v).filter(|x| x.is_finite())
+        {
+            if mimo.rsrp.len() <= idx {
+                mimo.rsrp.resize(idx + 1, None);
+            }
+            mimo.rsrp[idx] = Some(prev_r);
+            if mimo.rsrq.get(idx).and_then(|v| *v).is_none()
+                && let Some(prev_q) = prev_mimo.rsrq.get(idx).and_then(|v| *v).filter(|x| x.is_finite())
+            {
+                if mimo.rsrq.len() <= idx {
+                    mimo.rsrq.resize(idx + 1, None);
+                }
+                mimo.rsrq[idx] = Some(prev_q);
+            }
+            if mimo.sinr.get(idx).and_then(|v| *v).is_none()
+                && let Some(prev_s) = prev_mimo.sinr.get(idx).and_then(|v| *v).filter(|x| x.is_finite())
+            {
+                if mimo.sinr.len() <= idx {
+                    mimo.sinr.resize(idx + 1, None);
+                }
+                mimo.sinr[idx] = Some(prev_s);
+            }
+        }
+    }
+}
+
 async fn query_wan_uptime_ubus() -> Option<UptimeTelemetry> {
     if !crate::dataplane::is_native_mode() {
         for iface in ["network.interface.wan", "network.interface.wan_v6"] {
@@ -2838,7 +2903,10 @@ async fn query_wan_uptime_ubus() -> Option<UptimeTelemetry> {
             }
         }
     }
-    if let Ok(Some(_)) = tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live).await {
+    if (!crate::dataplane::is_native_mode() || crate::dataplane::is_wds_connected())
+        && let Ok(Some(_)) =
+            tokio::task::spawn_blocking(crate::netlink::detect_active_rmnet_wan_live).await
+    {
         let secs = crate::dataplane::native_wan_uptime_secs().unwrap_or(1);
         return Some(UptimeTelemetry {
             uptime_seconds: secs,
@@ -5055,5 +5123,58 @@ mod tests {
                 assert_eq!(app.sim_switched_at_ms.load(Ordering::Acquire), 0);
             })
             .await;
+    }
+
+    #[test]
+    fn idle_mimo_stabilization_retains_rx2_rx3_only_during_same_cell_noconn() {
+        let prev_cell = ServingCellInfo {
+            state: "CONNECT".into(),
+            rat: "NR5G-SA".into(),
+            band: "n41".into(),
+            pci: Some(42),
+            arfcn: Some(521310),
+            ..Default::default()
+        };
+        let prev_mimo = MimoSignalData {
+            rsrp: vec![Some(-90.0), Some(-92.0), Some(-94.0), Some(-96.0)],
+            rsrq: vec![Some(-10.0), Some(-11.0), Some(-12.0), Some(-13.0)],
+            sinr: vec![Some(18.0), Some(17.0), Some(16.0), Some(15.0)],
+            rat: "NR5G".into(),
+        };
+
+        // RRC Idle (NOCONN) on same cell with RX2/RX3 powered down (-140 -> None) retains chains 2 & 3.
+        let mut idle_same = ServingCellInfo { state: "NOCONN".into(), ..prev_cell.clone() };
+        let mut cur = MimoSignalData {
+            rsrp: vec![Some(-91.0), Some(-93.0), None, None],
+            rsrq: vec![Some(-10.0), Some(-11.0), None, None],
+            sinr: vec![Some(17.0), Some(16.0), None, None],
+            rat: "NR5G".into(),
+        };
+        stabilize_idle_mimo_chains(&mut cur, &prev_mimo, Some(&idle_same), Some(&prev_cell));
+        assert_eq!(cur.rsrp, vec![Some(-91.0), Some(-93.0), Some(-94.0), Some(-96.0)]);
+        assert_eq!(cur.sinr, vec![Some(17.0), Some(16.0), Some(16.0), Some(15.0)]);
+
+        // Real chain drop while RRC CONNECT must NOT be masked.
+        let mut cur_conn = MimoSignalData {
+            rsrp: vec![Some(-91.0), Some(-93.0), None, None],
+            rsrq: vec![Some(-10.0), Some(-11.0), None, None],
+            sinr: vec![Some(17.0), Some(16.0), None, None],
+            rat: "NR5G".into(),
+        };
+        stabilize_idle_mimo_chains(&mut cur_conn, &prev_mimo, Some(&prev_cell), Some(&prev_cell));
+        assert_eq!(cur_conn.rsrp[2], None);
+        assert_eq!(cur_conn.rsrp[3], None);
+
+        // Handover to a different PCI in NOCONN must NOT carry over old cell's chains.
+        idle_same.pci = Some(99);
+        let mut cur_ho = MimoSignalData {
+            rsrp: vec![Some(-91.0), Some(-93.0), None, None],
+            rsrq: vec![None; 4],
+            sinr: vec![None; 4],
+            rat: "NR5G".into(),
+        };
+        stabilize_idle_mimo_chains(&mut cur_ho, &prev_mimo, Some(&idle_same), Some(&prev_cell));
+        assert_eq!(cur_ho.rsrp[2], None);
+        assert_eq!(cur_ho.rsrp[3], None);
     }
 }

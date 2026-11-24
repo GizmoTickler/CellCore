@@ -325,9 +325,8 @@ async fn run_obs_loop(state: AppState) {
             }
         };
         let (drx, dtx) = if iface.is_empty() { (0, 0) } else { usage_probe.observe(&iface, rx, tx) };
-        let st_active = crate::speedtest::is_self_traffic_active(&state).await;
-        let (fo_bps, fo_bytes) = if st_active { (0, 0) } else { (bps, drx.saturating_add(dtx)) };
-        failover::on_tick(now, fo_bps, fo_bytes);
+        let st_active = crate::speedtest::is_self_traffic_active();
+        failover::on_tick_with_self_traffic(now, bps, drx.saturating_add(dtx), st_active);
         usage_cycle::on_bytes(drx, dtx, failover::is_active() || st_active);
 
         if tick.is_multiple_of(15) {

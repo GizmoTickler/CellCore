@@ -40,7 +40,13 @@ async function postArchive<T>(path: string, file: File): Promise<T> {
 }
 
 export function BackupView() {
-  const q = useAdmin<{ files: string[]; count: number; luciAvailable?: boolean }>("/backup");
+  const q = useAdmin<{
+    files: string[];
+    count: number;
+    luciAvailable?: boolean;
+    luciInstalled?: boolean;
+    luciProxyEnabled?: boolean;
+  }>("/backup");
   const toast = useToastStore((s) => s.push);
   const guard = useGuarded();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -185,7 +191,13 @@ export function BackupView() {
                 Paths are all under etc/. {inspect.sensitive.length > 0 && <>It overwrites {inspect.sensitive.length} sensitive files (passwords, SSH, firewall, network/QCMAP).</>}
               </Notice>
             )}
-            <Notice tone="danger">Firmware flashing is deliberately not offered here; it is unsafe on this QSDK build.</Notice>
+            <Notice tone="info">
+              Sysupgrade image flashing is disabled here. For R02A02+ dual-slot modems, use Zero-USB A/B firmware flashing under{" "}
+              <a href="#/system/ota" className="font-semibold text-ember-ink underline underline-offset-2 hover:opacity-80">
+                System › Updates
+              </a>
+              .
+            </Notice>
             <div className="flex justify-end">
               <Button variant="danger" onClick={restore} disabled={!inspect || guard.busy}>
                 Restore…
@@ -195,7 +207,7 @@ export function BackupView() {
         </Card>
       </div>
 
-      {q.data?.luciAvailable !== false ? (
+      {q.data?.luciAvailable === true ? (
         <Card>
           <CardHeader title="Legacy LuCI" subtitle="Escape hatch for anything not covered here" />
           <p className="mb-3 text-[13px] text-ink-2">LuCI still runs behind CellCore. It has its own login and shows the same configuration files.</p>
@@ -208,9 +220,14 @@ export function BackupView() {
             Open legacy LuCI <ExternalLink className="h-3.5 w-3.5" />
           </a>
         </Card>
-      ) : (
+      ) : q.data?.luciInstalled && !q.data?.luciProxyEnabled ? (
+        <Notice tone="info">
+          Legacy LuCI is installed, but the same-origin proxy is disabled by default for origin isolation (set{" "}
+          <Mono>CELLCORE_ENABLE_LUCI_PROXY=1</Mono> to opt in).
+        </Notice>
+      ) : q.data ? (
         <Notice tone="info">LuCI is not installed on this gateway; CellCore manages the system directly.</Notice>
-      )}
+      ) : null}
 
       <Modal open={rebootAsk} onClose={() => !rebooting && setRebootAsk(false)} title="Backup restored. Reboot now?">
         <FailoverWarning action="Rebooting" />

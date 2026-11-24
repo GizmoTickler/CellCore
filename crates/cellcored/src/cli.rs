@@ -378,7 +378,16 @@ fn direct_r10_status_fallback(started: Instant) -> String {
     )
 }
 
+fn restore_native_dataplane_if_needed() {
+    if crate::dataplane::load_persisted_native_state().is_some_and(|st| st.native_active)
+        && let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+    {
+        let _ = rt.block_on(crate::dataplane::restore_from_persisted_state());
+    }
+}
+
 fn direct_wan_restart() {
+    restore_native_dataplane_if_needed();
     if let Ok(mut s) = DirectSession::open(&smd_device()) {
         let cfun = s.exec("AT+CFUN?", Duration::from_secs(5)).map(|r| r.body).unwrap_or_default();
         if crate::parsers::parse_scalar_at_value(&cfun, "+CFUN:").trim() != "1" {
@@ -393,6 +402,7 @@ fn direct_wan_restart() {
 }
 
 fn direct_modem_reset() {
+    restore_native_dataplane_if_needed();
     if let Ok(mut s) = DirectSession::open(&smd_device()) {
         let _ = s.exec("AT+CFUN=0", Duration::from_secs(10));
         std::thread::sleep(Duration::from_secs(3));
@@ -614,74 +624,7 @@ fn run_upgrade(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (pkg, installed) = crate::admin::opkg::find_qm_package_status();
-    if parsed.check {
-        let _ = run_cmd_blocking_timeout("opkg", &["update"], Duration::from_secs(120));
-        let avail = run_cmd_blocking_timeout("opkg", &["list", &pkg], Duration::from_secs(30))
-            .ok()
-            .and_then(|out| {
-                crate::admin::opkg::parse_pkg_lines(&out)
-                    .into_iter()
-                    .filter(|p| p.name == pkg)
-                    .max_by(|a, b| crate::admin::opkg::compare_opkg_versions(&a.version, &b.version))
-                    .map(|p| p.version)
-            });
-        let update_available = avail.as_deref().is_some_and(|av| {
-            installed
-                .as_deref()
-                .is_none_or(|inst| crate::admin::opkg::compare_opkg_versions(av, inst) == std::cmp::Ordering::Greater)
-        });
-        println!(
-            "package={pkg} installed={} available={} update_available={}",
-            installed.as_deref().unwrap_or("none"),
-            avail.as_deref().unwrap_or("none"),
-            if update_available { 1 } else { 0 }
-        );
-        return 0;
-    }
-    if !parsed.yes {
-        eprintln!("Usage: cellctl upgrade [--check] | cellctl upgrade --yes");
-        return 2;
-    }
-    if let Some(free) = crate::admin::opkg::overlay_free_bytes()
-        && free < crate::admin::opkg::MIN_SELF_UPGRADE_BYTES
-    {
-        eprintln!(
-            "error=insufficient_overlay_space free_bytes={free} required_bytes={}",
-            crate::admin::opkg::MIN_SELF_UPGRADE_BYTES
-        );
-        return 1;
-    }
-    let from_ver = installed.as_deref().unwrap_or("unknown");
-    let script = crate::admin::opkg::build_self_upgrade_script(
-        &pkg,
-        from_ver,
-        "latest",
-        crate::admin::opkg::SELF_UPGRADE_STATE_PATH,
-        crate::admin::opkg::SELF_UPGRADE_LOG_PATH,
-    );
-    let script_path = "/tmp/cellcore/self-upgrade.sh";
-    let _ = fs::create_dir_all("/tmp/cellcore");
-    if let Err(e) = fs::write(script_path, script.as_bytes()) {
-        eprintln!("error=write_script detail={e}");
-        return 1;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(script_path, fs::Permissions::from_mode(0o700));
-    match process::Command::new("/bin/sh").arg(script_path).status() {
-        Ok(s) if s.success() => {
-            println!("ok=1 package={pkg} upgraded_from={from_ver}");
-            0
-        }
-        Ok(s) => {
-            eprintln!("error=upgrade_failed code={:?}", s.code());
-            1
-        }
-        Err(e) => {
-            eprintln!("error=exec_failed detail={e}");
-            1
-        }
-    }
+    crate::ota::run_verified_cli_upgrade(parsed.check, parsed.yes)
 }
 
 #[cfg(test)]

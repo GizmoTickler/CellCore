@@ -400,21 +400,90 @@ async fn acme_http01_handler(axum::extract::Path(token): axum::extract::Path<Str
     }
 }
 
+/// Extract and validate the host component (without port) from an HTTP `Host`
+/// header or URI authority for HTTPS redirect construction. Handles bracketed
+/// IPv6 literals (`[fd00::1]:80` -> `[fd00::1]`) and rejects `@`, path,
+/// whitespace, control, or malformed-port injections by falling back safely.
+pub(crate) fn sanitize_redirect_host(raw: Option<&str>, fallback_host: &str) -> String {
+    let fallback = || {
+        if fallback_host.contains(':') && !fallback_host.starts_with('[') {
+            format!("[{fallback_host}]")
+        } else {
+            fallback_host.to_string()
+        }
+    };
+    let Some(host) = raw else {
+        return fallback();
+    };
+    if host.is_empty()
+        || host.len() > 260
+        || host
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#'))
+    {
+        return fallback();
+    }
+    if host.starts_with('[') {
+        let Some(close) = host.find(']') else {
+            return fallback();
+        };
+        let inner = &host[1..close];
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return fallback();
+        }
+        let rest = &host[close + 1..];
+        if !rest.is_empty() {
+            let Some(port_s) = rest.strip_prefix(':') else {
+                return fallback();
+            };
+            if port_s.is_empty()
+                || !port_s.bytes().all(|b| b.is_ascii_digit())
+                || port_s.parse::<u16>().is_err()
+            {
+                return fallback();
+            }
+        }
+        return host[..=close].to_string();
+    }
+    let (h, port_opt) = match host.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (host, None),
+    };
+    if let Some(p) = port_opt
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err())
+    {
+        return fallback();
+    }
+    if h.is_empty()
+        || h.len() > 253
+        || h.starts_with(['.', '-'])
+        || h.ends_with(['.', '-'])
+        || h.contains("..")
+        || !h
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return fallback();
+    }
+    h.to_string()
+}
+
 async fn http_redirect_handler(req: Request, fallback_host: &str) -> Response {
-    let host = req
+    let raw_host = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .unwrap_or(fallback_host);
-    let host_no_port = host.split(':').next().unwrap_or(host);
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let safe_host = sanitize_redirect_host(raw_host, fallback_host);
     let path_q = req
         .uri()
         .path_and_query()
         .map(|p| p.as_str())
+        .filter(|p| p.starts_with('/') && !p.bytes().any(|b| b.is_ascii_control()))
         .unwrap_or("/");
-    let target = format!("https://{host_no_port}{path_q}");
-    let fallback_url = HeaderValue::from_str(&format!("https://{fallback_host}/"))
+    let target = format!("https://{safe_host}{path_q}");
+    let safe_fb = sanitize_redirect_host(None, fallback_host);
+    let fallback_url = HeaderValue::from_str(&format!("https://{safe_fb}/"))
         .unwrap_or_else(|_| HeaderValue::from_static("https://localhost/"));
     (
         StatusCode::PERMANENT_REDIRECT,
@@ -470,6 +539,12 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/system/reboot", post(handlers::post_reboot))
         .route("/api/v1/system/ota", get(handlers::get_ota).post(handlers::post_ota))
         .route("/api/v1/system/firmware-ab", get(crate::firmware_ab::get_firmware_ab))
+        .route("/api/v1/system/firmware-ab/staged", get(crate::firmware_ab::get_firmware_ab_staged))
+        .route(
+            "/api/v1/system/firmware-ab/upload",
+            post(crate::firmware_ab::post_firmware_ab_upload)
+                .layer(axum::extract::DefaultBodyLimit::max(260 * 1024 * 1024)),
+        )
         .route("/api/v1/system/firmware-ab/inspect", post(crate::firmware_ab::post_firmware_ab_inspect))
         .route("/api/v1/system/firmware-ab/flash", post(crate::firmware_ab::post_firmware_ab_flash))
         .route("/api/v1/system/firmware-ab/switch", post(crate::firmware_ab::post_firmware_ab_switch))
@@ -2477,6 +2552,57 @@ mod tests {
         let exp = parse_pem_leaf_not_after_unix(&fs::read(&chosen_c).unwrap()).unwrap();
         assert!(exp > crate::auth::now_secs() as i64 + 86_400 * 3000, "exp={exp}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_redirect_handles_ipv6_and_rejects_host_injection() {
+        assert_eq!(sanitize_redirect_host(Some("192.168.228.1:80"), "192.168.228.1"), "192.168.228.1");
+        assert_eq!(sanitize_redirect_host(Some("modem.local:8080"), "192.168.228.1"), "modem.local");
+        assert_eq!(sanitize_redirect_host(Some("[fd00::1]:80"), "192.168.228.1"), "[fd00::1]");
+        assert_eq!(sanitize_redirect_host(Some("[fd00::1]"), "192.168.228.1"), "[fd00::1]");
+        assert_eq!(sanitize_redirect_host(Some("[::1]:8080"), "192.168.228.1"), "[::1]");
+        for bad in [
+            "evil.example@192.168.228.1",
+            "192.168.228.1/evil",
+            "192.168.228.1\\evil",
+            "192.168.228.1 evil",
+            "192.168.228.1:99999",
+            "192.168.228.1:abc",
+            "[not-ipv6]:80",
+            "[fd00::1]:99999",
+            "fd00::1",
+            "",
+        ] {
+            assert_eq!(
+                sanitize_redirect_host(Some(bad), "192.168.228.1"),
+                "192.168.228.1",
+                "malicious/invalid Host {bad:?} must fall back"
+            );
+        }
+
+        let req_v6 = Request::builder()
+            .uri("/dashboard?tab=rf")
+            .header(header::HOST, "[fd00::1]:80")
+            .body(Body::empty())
+            .unwrap();
+        let resp_v6 = http_redirect_handler(req_v6, "192.168.228.1").await;
+        assert_eq!(resp_v6.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp_v6.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("https://[fd00::1]/dashboard?tab=rf")
+        );
+
+        let req_inj = Request::builder()
+            .uri("/login")
+            .header(header::HOST, "evil.example@192.168.228.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp_inj = http_redirect_handler(req_inj, "192.168.228.1").await;
+        assert_eq!(resp_inj.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp_inj.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("https://192.168.228.1/login")
+        );
     }
 
     impl super::HttpCtx {

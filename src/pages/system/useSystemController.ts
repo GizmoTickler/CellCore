@@ -430,14 +430,24 @@ export function useSystemController(tab: SysTab) {
     }
     setBusy("pw");
     try {
-      await apiFetch("/api/v1/system/password", {
+      const res = await apiFetch<{ status?: string; revokedTokens?: number }>("/api/v1/system/password", {
         method: "POST",
         body: JSON.stringify({ currentPassword: oldPassword, newPassword }),
       });
       setOldPassword("");
       setNewPassword("");
       setConfirmPassword("");
-      notify("ok", "OpenWrt root password updated cleanly");
+      await qc.invalidateQueries({ queryKey: ["security", "tokens"] });
+      const revoked = typeof res.revokedTokens === "number" ? res.revokedTokens : 0;
+      if (revoked > 0) {
+        pushToast(
+          "OpenWrt root password updated cleanly",
+          "success",
+          `Revoked ${revoked} API token${revoked === 1 ? "" : "s"}.`
+        );
+      } else {
+        notify("ok", "OpenWrt root password updated cleanly");
+      }
     } catch (err) {
       notify("err", err instanceof Error ? err.message : "Password update failed");
     } finally {

@@ -70,6 +70,9 @@ const SENSITIVE_FILES: &[&str] = &[
     "/etc/cellcore/settings.json",
     "/etc/cellcore/tower_finder.json",
     "/etc/cellcore/dataplane.json",
+    "/etc/cellcore/observability.json",
+    "/etc/msmtprc",
+    "/etc/cellcore/warp/",
     "/etc/ssl/acme/privkey.pem",
     "/etc/cellcore/tls/key.pem",
     "/etc/dropbear/authorized_keys",
@@ -214,18 +217,27 @@ pub(crate) fn update_firewall_user_ssh_guard(existing: &str, port: u16) -> Strin
 }
 
 pub(crate) fn has_wan_ssh_drop_rule(port: u16) -> bool {
-    let nft_path = crate::paths::p(NFT_SSH_LAN_PATH);
-    if let Ok(nft_body) = fs::read_to_string(&nft_path) {
-        let want = format!("tcp dport {port} drop");
-        if nft_body.contains(&want) {
+    if let Ok(nft_out) = run_hardening_cmd(
+        "nft",
+        &["list", "chain", "inet", "fw4", "cellcore_ssh_wan_guard"],
+        Duration::from_secs(2),
+    ) {
+        let want_num = format!("tcp dport {port} drop");
+        let want_svc = (port == 22).then_some("tcp dport ssh drop");
+        let port_matched =
+            nft_out.contains(&want_num) || want_svc.is_some_and(|s| nft_out.contains(s));
+        if port_matched && (nft_out.contains("rmnet") || nft_out.contains("wwan")) {
             return true;
         }
     }
-    let v4 = run_hardening_cmd("iptables", &["-S", "INPUT"], Duration::from_secs(2))
-        .unwrap_or_default();
-    let needle = format!("--dport {port}");
-    (v4.contains("rmnet+") && v4.contains(&needle) && v4.contains("DROP"))
-        || (v4.contains("rmnet") && v4.contains("MGW1_WAN_IN"))
+    let has_ipt_port = |bin: &str| -> bool {
+        let out = run_hardening_cmd(bin, &["-S", "INPUT"], Duration::from_secs(2))
+            .unwrap_or_default();
+        let needle = format!("--dport {port}");
+        (out.contains("rmnet+") && out.contains(&needle) && out.contains("DROP"))
+            || (out.contains("rmnet") && out.contains("MGW1_WAN_IN"))
+    };
+    has_ipt_port("iptables") && has_ipt_port("ip6tables")
 }
 
 /// Update live iptables/ip6tables rules, `/etc/nftables.d/25-cellcore-ssh-lan.nft`,
@@ -370,24 +382,69 @@ fn check_dropbear_key_only() -> SecurityCheck {
 }
 
 fn check_wan_firewall() -> SecurityCheck {
-    let v4 = run_hardening_cmd("iptables", &["-S", "INPUT"], Duration::from_secs(2))
-        .unwrap_or_default();
-    let has_wan_drop = v4.contains("rmnet") && (v4.contains("WAN_IN") || v4.contains("DROP") || v4.contains("zone_wan"));
-    if has_wan_drop {
+    // Prefer live kernel nftables fw4 chain inspection when `nft` is available.
+    if let Ok(guard_out) = run_hardening_cmd(
+        "nft",
+        &["list", "chain", "inet", "fw4", "cellcore_ssh_wan_guard"],
+        Duration::from_secs(2),
+    ) && guard_out.contains("rmnet")
+        && guard_out.contains("drop")
+    {
+        return SecurityCheck {
+            id: "wan_firewall".into(),
+            title: "Cellular WAN inbound firewall".into(),
+            status: "pass".into(),
+            detail: "Active nftables (fw4) rmnet inbound guard chain drops unsolicited WAN traffic".into(),
+            fix_action: None,
+        };
+    }
+    if let Ok(input_out) = run_hardening_cmd(
+        "nft",
+        &["list", "chain", "inet", "fw4", "input"],
+        Duration::from_secs(2),
+    ) && input_out.contains("rmnet")
+        && (input_out.contains("input_wan") || input_out.contains("drop") || input_out.contains("reject"))
+    {
+        return SecurityCheck {
+            id: "wan_firewall".into(),
+            title: "Cellular WAN inbound firewall".into(),
+            status: "pass".into(),
+            detail: "Active nftables (fw4) rmnet inbound filter chain drops unsolicited WAN traffic".into(),
+            fix_action: None,
+        };
+    }
+
+    let has_ipt_wan_drop = |bin: &str| -> bool {
+        let out = run_hardening_cmd(bin, &["-S", "INPUT"], Duration::from_secs(2))
+            .unwrap_or_default();
+        out.contains("rmnet") && (out.contains("WAN_IN") || out.contains("DROP") || out.contains("zone_wan"))
+    };
+    let v4_ok = has_ipt_wan_drop("iptables");
+    let v6_ok = has_ipt_wan_drop("ip6tables");
+    if v4_ok && v6_ok {
         SecurityCheck {
             id: "wan_firewall".into(),
             title: "Cellular WAN inbound firewall".into(),
             status: "pass".into(),
-            detail: "Active rmnet inbound filter chain drops unsolicited WAN traffic".into(),
+            detail: "Active iptables & ip6tables rmnet inbound filter chains drop unsolicited WAN traffic".into(),
             fix_action: None,
+        }
+    } else if v4_ok || v6_ok {
+        let missing = if v4_ok { "ip6tables" } else { "iptables" };
+        SecurityCheck {
+            id: "wan_firewall".into(),
+            title: "Cellular WAN inbound firewall".into(),
+            status: "warn".into(),
+            detail: format!("Live rmnet INPUT drop chain missing in {missing}"),
+            fix_action: Some("dropbear_lan_only".into()),
         }
     } else {
         SecurityCheck {
             id: "wan_firewall".into(),
             title: "Cellular WAN inbound firewall".into(),
             status: "warn".into(),
-            detail: "Could not verify rmnet INPUT drop chain in iptables".into(),
-            fix_action: None,
+            detail: "Could not verify live rmnet INPUT drop chain in nftables or iptables/ip6tables".into(),
+            fix_action: Some("dropbear_lan_only".into()),
         }
     }
 }
@@ -464,6 +521,23 @@ fn check_file_permissions() -> SecurityCheck {
             if (mode & 0o077) != 0 {
                 loose.push(format!("{path} ({mode:04o})"));
             }
+            if meta.is_dir()
+                && let Ok(entries) = fs::read_dir(&mapped)
+            {
+                let base = path.trim_end_matches('/');
+                for ent in entries.flatten() {
+                    if let Ok(em) = ent.metadata() {
+                        let emode = em.permissions().mode() & 0o777;
+                        if (emode & 0o077) != 0 {
+                            let name = ent.file_name();
+                            loose.push(format!(
+                                "{base}/{} ({emode:04o})",
+                                name.to_string_lossy()
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
     if loose.is_empty() {
@@ -471,7 +545,7 @@ fn check_file_permissions() -> SecurityCheck {
             id: "file_perms".into(),
             title: "Secret file permissions (0600)".into(),
             status: "pass".into(),
-            detail: "All keys, API tokens, ACME secrets, and authorized_keys are owner-only (0600)".into(),
+            detail: "All keys, API tokens, ACME/observability/WARP secrets, and authorized_keys are owner-only".into(),
             fix_action: None,
         }
     } else {
@@ -620,10 +694,28 @@ pub fn tighten_sensitive_permissions() -> Vec<String> {
         let mapped = crate::paths::p(path);
         if let Ok(meta) = fs::metadata(&mapped) {
             let mode = meta.permissions().mode() & 0o777;
+            let target = if meta.is_dir() { 0o700 } else { 0o600 };
             if (mode & 0o077) != 0
-                && fs::set_permissions(&mapped, fs::Permissions::from_mode(0o600)).is_ok()
+                && fs::set_permissions(&mapped, fs::Permissions::from_mode(target)).is_ok()
             {
                 fixed.push((*path).to_string());
+            }
+            if meta.is_dir()
+                && let Ok(entries) = fs::read_dir(&mapped)
+            {
+                let base = path.trim_end_matches('/');
+                for ent in entries.flatten() {
+                    if let Ok(em) = ent.metadata() {
+                        let emode = em.permissions().mode() & 0o777;
+                        let etarget = if em.is_dir() { 0o700 } else { 0o600 };
+                        if (emode & 0o077) != 0
+                            && fs::set_permissions(ent.path(), fs::Permissions::from_mode(etarget))
+                                .is_ok()
+                        {
+                            fixed.push(format!("{base}/{}", ent.file_name().to_string_lossy()));
+                        }
+                    }
+                }
             }
         }
     }
@@ -928,15 +1020,37 @@ mod tests {
         fs::write(&p, "{}").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
 
+        let obs = sbx.root.join("etc/cellcore/observability.json");
+        fs::write(&obs, "{}").unwrap();
+        fs::set_permissions(&obs, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let msmtp = sbx.root.join("etc/msmtprc");
+        fs::write(&msmtp, "password secret\n").unwrap();
+        fs::set_permissions(&msmtp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let warp_dir = sbx.root.join("etc/cellcore/warp");
+        fs::create_dir_all(&warp_dir).unwrap();
+        let warp_key = warp_dir.join("account.json");
+        fs::write(&warp_key, "{}").unwrap();
+        fs::set_permissions(&warp_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&warp_key, fs::Permissions::from_mode(0o644)).unwrap();
+
         crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
             let before = check_file_permissions();
             assert_eq!(before.status, "fail");
             let fixed = tighten_sensitive_permissions();
             assert!(fixed.contains(&"/etc/cellcore/acme.json".to_string()));
+            assert!(fixed.contains(&"/etc/cellcore/observability.json".to_string()));
+            assert!(fixed.contains(&"/etc/msmtprc".to_string()));
+            assert!(fixed.contains(&"/etc/cellcore/warp/".to_string()));
+            assert!(fixed.contains(&"/etc/cellcore/warp/account.json".to_string()));
             let after = check_file_permissions();
             assert_eq!(after.status, "pass");
-            let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&obs).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&msmtp).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&warp_dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(&warp_key).unwrap().permissions().mode() & 0o777, 0o600);
         });
     }
 
@@ -985,11 +1099,29 @@ mod tests {
         sbx.write_exec("/bin/iptables", "#!/bin/sh\nexit 1\n");
         sbx.write_exec("/bin/ip6tables", "#!/bin/sh\nexit 1\n");
         sbx.write_exec("/bin/fw4", "#!/bin/sh\nexit 0\n");
+        let nft_file = sbx.root.join("etc/nftables.d/25-cellcore-ssh-lan.nft");
+        // Without live `nft` / `iptables`+`ip6tables`, an .nft file on disk alone MUST NOT pass!
+        sbx.write_exec("/bin/nft", "#!/bin/sh\nexit 1\n");
 
         crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
             apply_wan_ssh_drop_rules(22);
+            assert!(
+                !has_wan_ssh_drop_rule(22),
+                ".nft file on disk alone must not satisfy live kernel firewall check"
+            );
+            assert_eq!(check_wan_firewall().status, "warn");
+        });
+
+        // Now simulate live kernel `nft list chain inet fw4 cellcore_ssh_wan_guard` returning loaded rules.
+        sbx.write_exec(
+            "/bin/nft",
+            &format!("#!/bin/sh\ncat \"{}\"\n", nft_file.display()),
+        );
+
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
             assert!(has_wan_ssh_drop_rule(22));
             assert!(!has_wan_ssh_drop_rule(2222), "stale port 22 rule must not satisfy port 2222");
+            assert_eq!(check_wan_firewall().status, "pass");
 
             sync_wan_ssh_drop_rules(Some(22), 2222);
             assert!(has_wan_ssh_drop_rule(2222));
@@ -1003,10 +1135,35 @@ mod tests {
             assert!(!fw_user.contains("--dport 22 -j DROP"));
             assert_eq!(fw_user.matches(FW_USER_SSH_BEGIN).count(), 1);
 
-            let nft = fs::read_to_string(sbx.root.join("etc/nftables.d/25-cellcore-ssh-lan.nft")).unwrap();
+            let nft = fs::read_to_string(&nft_file).unwrap();
             assert!(nft.contains("tcp dport 2222 drop"));
             assert!(nft.contains("tcp dport 80 drop"));
             assert!(nft.contains("tcp dport 443 drop"));
+        });
+    }
+
+    #[test]
+    fn wan_firewall_requires_both_iptables_and_ip6tables_when_nft_absent() {
+        let sbx = TestSandbox::new("hardening-ipt-dual");
+        sbx.write_exec("/bin/nft", "#!/bin/sh\nexit 1\n");
+        sbx.write_exec(
+            "/bin/iptables",
+            "#!/bin/sh\necho '-A INPUT -i rmnet+ -p tcp --dport 22 -j DROP'\n",
+        );
+        sbx.write_exec("/bin/ip6tables", "#!/bin/sh\necho '-P INPUT ACCEPT'\n");
+
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            assert!(!has_wan_ssh_drop_rule(22), "IPv4-only rule must not satisfy dual-stack check");
+            assert_eq!(check_wan_firewall().status, "warn");
+        });
+
+        sbx.write_exec(
+            "/bin/ip6tables",
+            "#!/bin/sh\necho '-A INPUT -i rmnet+ -p tcp --dport 22 -j DROP'\n",
+        );
+        crate::paths::TEST_ENV.sync_scope(sbx.env(), || {
+            assert!(has_wan_ssh_drop_rule(22));
+            assert_eq!(check_wan_firewall().status, "pass");
         });
     }
 

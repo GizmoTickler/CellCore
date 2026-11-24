@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CornerDownLeft, Eraser, ShieldAlert, Terminal } from "lucide-react";
-import { ApiError, classifyAtCommand, sendAtCommand, type AtClass, type AtClassification } from "../../lib/api";
+import { ApiError, apiFetch, classifyAtCommand, type AtClass, type AtClassification } from "../../lib/api";
+import type { AtCommandItem } from "../../types/cellcore";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Card, CopyButton, Input, Kbd, LiveDot, Modal } from "../../components/ui";
 import { useLiveness } from "../../stores/ws-store";
@@ -36,13 +37,60 @@ const AT_PRESETS: Array<{ group: string; items: Array<{ label: string; cmd: stri
   },
 ];
 
-const CLASS_BADGE: Record<AtClass, { label: string; variant: "success" | "warning" | "danger" }> = {
+type ExtendedAtClass = AtClass | "blocked";
+
+const CLASS_BADGE: Record<ExtendedAtClass, { label: string; variant: "success" | "warning" | "danger" }> = {
   read: { label: "read-only", variant: "success" },
   caution: { label: "caution", variant: "warning" },
   dangerous: { label: "dangerous", variant: "danger" },
+  blocked: { label: "blocked", variant: "danger" },
 };
 
+function badgeForClass(cls: string) {
+  return CLASS_BADGE[cls as ExtendedAtClass] ?? { label: cls, variant: "danger" as const };
+}
+
 const CONFIRM_WORD = "SEND";
+const STANDARD_TIMEOUT_SECS = 30;
+const SCAN_TIMEOUT_SECS = 60;
+const STANDARD_CLIENT_TIMEOUT_MS = 35_000;
+const SCAN_CLIENT_TIMEOUT_MS = 65_000;
+
+function isLongBlockingScan(cmd: string, v?: AtClassification | null): boolean {
+  if (
+    v?.parts?.some(
+      (p) => (p.name === "+COPS" && p.text.endsWith("=?")) || (p.name === "+QSCAN" && p.class === "caution")
+    )
+  ) {
+    return true;
+  }
+  const compact = cmd.toUpperCase().replace(/\s+/g, "");
+  return /\+COPS=\?(?:$|;)/.test(compact) || /\+QSCAN(?:$|;|=(?!\?))/.test(compact);
+}
+
+async function execAtCommand(
+  command: string,
+  timeoutSecs: number,
+  clientTimeoutMs: number,
+  confirm: boolean
+): Promise<AtCommandItem> {
+  const ac = new AbortController();
+  const timer = window.setTimeout(() => ac.abort(), clientTimeoutMs);
+  try {
+    return await apiFetch<AtCommandItem>("/api/v1/modem/at", {
+      method: "POST",
+      body: JSON.stringify(confirm ? { command, timeoutSecs, confirm: true } : { command, timeoutSecs }),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error(`AT request timed out after ${Math.round(clientTimeoutMs / 1000)} s`);
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
 
 /** Colour the modem's reply: final result codes get status colour, `+TAG:` prefixes go bold. */
 function ResponseLines({ text, failed }: { text: string; failed: boolean }) {
@@ -123,30 +171,37 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
     const cmd = (cmdToRun ?? atInput).trim();
     if (!cmd || running) return;
     const ts = () => new Date().toLocaleTimeString([], { hour12: false });
+    let v: AtClassification | null = verdict?.cmd === cmd ? verdict.v : null;
     if (!confirmed) {
-      // Ask before anything dangerous leaves the browser; the daemon enforces it again (HTTP 428).
-      let v: AtClassification | null = verdict?.cmd === cmd ? verdict.v : null;
+      // Ask before anything dangerous or long-blocking leaves the browser; the daemon enforces it again (HTTP 428).
       if (!v) {
         try {
           v = await classifyAtCommand(cmd);
         } catch (e) {
-          if (e instanceof ApiError && e.status === 400) {
+          if (e instanceof ApiError && (e.status === 400 || e.status === 403)) {
             addAt({ cmd, resp: e.message, ok: false, latencyMs: 0, ts: ts() });
             return;
           }
         }
       }
-      if (v?.class === "dangerous") {
+      if ((v?.class as string) === "blocked") {
+        addAt({ cmd, resp: `Blocked AT command: ${v!.reason}`, ok: false, latencyMs: 0, ts: ts() });
+        return;
+      }
+      if (v?.class === "dangerous" || isLongBlockingScan(cmd, v)) {
         setTyped("");
         setPending({ cmd, v });
         return;
       }
     }
+    const scan = isLongBlockingScan(cmd, v);
+    const timeoutSecs = scan ? SCAN_TIMEOUT_SECS : STANDARD_TIMEOUT_SECS;
+    const clientTimeoutMs = scan ? SCAN_CLIENT_TIMEOUT_MS : STANDARD_CLIENT_TIMEOUT_MS;
     setAtInput("");
     setRecallIdx(-1);
     setRunning(cmd);
     try {
-      const res = await sendAtCommand(cmd, 12, confirmed);
+      const res = await execAtCommand(cmd, timeoutSecs, clientTimeoutMs, confirmed);
       addAt({
         cmd,
         resp: res.response || res.status || "OK",
@@ -158,6 +213,10 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
       if (e instanceof ApiError && e.status === 428 && !confirmed) {
         setTyped("");
         setPending({ cmd, v: (e.data?.classification as AtClassification | undefined) ?? null });
+        return;
+      }
+      if (e instanceof ApiError && (e.status === 400 || e.status === 403)) {
+        addAt({ cmd, resp: e.message, ok: false, latencyMs: 0, ts: ts() });
         return;
       }
       addAt({ cmd, resp: e instanceof Error ? e.message : "Error", ok: false, latencyMs: 0, ts: ts() });
@@ -329,8 +388,8 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
               <div className="flex min-w-0 items-center gap-2 border-t border-line bg-raised px-3 sm:px-4 py-2 text-[12px]" aria-live="polite">
                 {verdict.v ? (
                   <>
-                    <Badge variant={CLASS_BADGE[verdict.v.class].variant} dot>
-                      {CLASS_BADGE[verdict.v.class].label}
+                    <Badge variant={badgeForClass(verdict.v.class).variant} dot>
+                      {badgeForClass(verdict.v.class).label}
                     </Badge>
                     <span className="min-w-0 truncate text-muted">
                       {verdict.v.parts.length > 1 ? `${verdict.v.parts.length} commands · ` : ""}
@@ -351,7 +410,7 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
             <span className="flex items-center gap-1"><Kbd>↑</Kbd><Kbd>↓</Kbd> recall</span>
             <span className="flex items-center gap-1"><Kbd>Esc</Kbd> clear line</span>
             <span className="flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>L</Kbd> clear screen</span>
-            <span className="ml-auto">Keeps the last 15 replies · 12 s timeout</span>
+            <span className="ml-auto">Keeps the last 15 replies · 30 s timeout (60 s scans)</span>
           </div>
         </div>
 
@@ -382,7 +441,11 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
           )}
         </Card>
       </div>
-      <Modal open={pending !== null} onClose={() => setPending(null)} title="Send a dangerous AT command?">
+      <Modal
+        open={pending !== null}
+        onClose={() => setPending(null)}
+        title={pending?.v?.class === "caution" ? "Run a long-blocking scan command?" : "Send a dangerous AT command?"}
+      >
         {pending && (
           <div className="space-y-3">
             <div className="rounded-xl border border-line bg-sunk px-3 py-2 font-mono text-[12.5px] text-ink break-all">{pending.cmd}</div>
@@ -392,7 +455,7 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
                   .filter((p) => p.class !== "read")
                   .map((p, i) => (
                     <li key={i} className="flex items-start gap-2 text-[12.5px]">
-                      <Badge variant={CLASS_BADGE[p.class].variant}>{CLASS_BADGE[p.class].label}</Badge>
+                      <Badge variant={badgeForClass(p.class).variant}>{badgeForClass(p.class).label}</Badge>
                       <span>
                         <span className="font-mono text-ink">{p.name}</span> {p.reason}
                       </span>

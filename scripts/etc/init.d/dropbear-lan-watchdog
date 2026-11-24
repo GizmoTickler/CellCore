@@ -10,11 +10,31 @@ START=99
 enforce_wan_ssh_drop() {
 	port=$(uci -q get dropbear.@dropbear[0].Port)
 	[ -n "$port" ] || port=22
+	ports="$port"
+	for extra in 80 443; do
+		[ "$port" = "$extra" ] || ports="$ports $extra"
+	done
+	if command -v nft >/dev/null 2>&1 && nft list table inet fw4 >/dev/null 2>&1; then
+		if ! nft list chain inet fw4 cellcore_ssh_wan_guard >/dev/null 2>&1; then
+			nft add chain inet fw4 cellcore_ssh_wan_guard '{ type filter hook input priority -5; policy accept; }' 2>/dev/null || true
+		fi
+		cur=$(nft list chain inet fw4 cellcore_ssh_wan_guard 2>/dev/null || true)
+		for p in $ports; do
+			case "$cur" in
+				*"tcp dport $p drop"*) ;;
+				*)
+					nft add rule inet fw4 cellcore_ssh_wan_guard iifname '{ "rmnet*", "wwan*" }' tcp dport "$p" drop comment '"cellcore: block WAN guard"' 2>/dev/null || true
+					;;
+			esac
+		done
+	fi
 	for bin in iptables ip6tables; do
 		command -v "$bin" >/dev/null 2>&1 || continue
 		for ifp in rmnet+ wwan+; do
-			"$bin" -C INPUT -i "$ifp" -p tcp --dport "$port" -j DROP 2>/dev/null || \
-				"$bin" -I INPUT 1 -i "$ifp" -p tcp --dport "$port" -j DROP 2>/dev/null || true
+			for p in $ports; do
+				"$bin" -C INPUT -i "$ifp" -p tcp --dport "$p" -j DROP 2>/dev/null || \
+					"$bin" -I INPUT 1 -i "$ifp" -p tcp --dport "$p" -j DROP 2>/dev/null || true
+			done
 		done
 	done
 }

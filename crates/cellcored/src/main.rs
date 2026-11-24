@@ -372,6 +372,7 @@ async fn async_main() {
         sched_boot_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spn_cache: Arc::new(RwLock::new((String::new(), String::new(), String::new()))),
         ab_flash: Arc::new(firmware_ab::AbFlashState::new()),
+        console_at_window: Arc::new(std::sync::Mutex::new(state::ConsoleAtWindow::default())),
     };
     state.audit.spawn_flusher();
 
