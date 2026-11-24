@@ -82,4 +82,4 @@ npm ci && npm run build
 
 ## License & Acknowledgments
 
-Released under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`). Clean-room Rust + TypeScript implementation inspired by concepts from `QuecManager-JS` (MIT) and the SDX75 OpenWrt modem community.
+Released under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`). Clean-room Rust + TypeScript implementation inspired by concepts from `QuecManager-JS` (Copyright 2024 Russel Yasol, MIT License) and the SDX75 OpenWrt modem community.

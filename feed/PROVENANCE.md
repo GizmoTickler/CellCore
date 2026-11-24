@@ -21,24 +21,7 @@ sha256sum feed/<package>.ipk
 
 None of the third-party `.ipk` archives below are installed automatically by `sdxpinn-cellcore`. They are optional packages kept in the signed feed only for operators who explicitly opt in.
 
-### 1. `ookla-speedtest` (v1.2.0) — **Optional**
-
-| Field | Value |
-| --- | --- |
-| Filename | `ookla-speedtest_1.2.0_aarch64_cortex-a53.ipk` |
-| Architecture | `aarch64_cortex-a53` |
-| Size | 1,075,696 bytes |
-| SHA-256 | `ebe16686e6cf4e0753679d0bbb6e7010e37df61d58690a22c0f421002dfdda82` |
-| MD5 | `b26e1909599f73cab40ea0281c5a6283` |
-| Upstream / Origin | Ookla Speedtest CLI (`https://www.speedtest.net/apps/cli`), proprietary prebuilt `aarch64` binary packaged as an OpenWrt `.ipk` (`/usr/bin/speedtest`) |
-| License | Proprietary (Ookla EULA) |
-
-**Security & Dependency Note:**
-- Removed from `sdxpinn-cellcore`'s `Depends:` list in v1.8.0 so it is **strictly optional** and no longer installed by default.
-- The proprietary v1.2.0 binary statically links legacy **mbed TLS 3.1.0**.
-- CellCore ships a built-in native Rust Cloudflare speedtest engine (using up-to-date TLS) as the default speedtest backend, and gracefully detects `/usr/bin/speedtest` at runtime only if an operator explicitly installs `ookla-speedtest`.
-
-### 2. `tailscale-tiny` (v1.104.7) — **Optional**
+### 1. `tailscale-tiny` (v1.104.7) — **Optional**
 
 | Field | Value |
 | --- | --- |
@@ -55,7 +38,7 @@ None of the third-party `.ipk` archives below are installed automatically by `sd
 - Installed only when explicitly requested by the operator (via the Network › Tailscale UI or `opkg install tailscale-tiny`).
 - Ships `/usr/sbin/tailscaled`, `/usr/bin/tailscale`, `/etc/init.d/tailscale`, `/etc/config/tailscale`, and `/lib/upgrade/keep.d/tailscaled`.
 
-### 3. `wgcf` (v2.3.1) — **Optional**
+### 2. `wgcf` (v2.3.1) — **Optional**
 
 | Field | Value |
 | --- | --- |
@@ -74,6 +57,11 @@ None of the third-party `.ipk` archives below are installed automatically by `sd
 ---
 
 ## Removed Packages
+
+### `ookla-speedtest` (v1.2.0) — **Removed from feed & repo history**
+
+- Former filename: `ookla-speedtest_1.2.0_aarch64_cortex-a53.ipk` (1,075,696 bytes, SHA-256 `ebe16686e6cf4e0753679d0bbb6e7010e37df61d58690a22c0f421002dfdda82`).
+- Reason for removal: Proprietary Ookla EULA binary statically linked against outdated mbed TLS 3.1.0. CellCore ships a built-in native Rust Cloudflare speedtest engine (using up-to-date TLS) as the default speedtest backend, and still gracefully detects `/usr/bin/speedtest` at runtime if an operator installs it separately on their device.
 
 ### `kmod-wireguard` (v1) — **Removed in v1.8.0**
 
