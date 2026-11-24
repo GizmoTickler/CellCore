@@ -4803,7 +4803,12 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     }
 
                     // 4. Per-family active data-plane liveness probe ("Zombie PDN" detection).
+                    // Wait 3 s after fresh connect so routes & IPv6 DAD settle before the
+                    // initial probe runs, preventing a transient 60 s false-down window.
                     let probe_now_ms = crate::state::mono_ms();
+                    let connected_since_ms = NATIVE_CONNECTED_SINCE.load(Ordering::Acquire);
+                    let initial_settled = connected_since_ms > 0
+                        && probe_now_ms.saturating_sub(connected_since_ms) >= 3_000;
                     let probe_interval_ms = if crate::obs::failover::is_active() {
                         LIVENESS_PROBE_FAILOVER_MS
                     } else {
@@ -4811,6 +4816,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     };
                     let mut zombie_reconnected = false;
                     if (v4_rt.is_some() || v6_rt.is_some())
+                        && initial_settled
                         && !crate::speedtest::is_self_traffic_active()
                         && (nh.last_liveness_probe_ms == 0
                             || probe_now_ms.saturating_sub(nh.last_liveness_probe_ms) >= probe_interval_ms)

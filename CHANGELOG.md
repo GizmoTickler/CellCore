@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.1 — QMI WDS Sentinel Filter & Initial Liveness Probe Settle Guard
+
+- **QMI WDS Packet Statistics (`crates/cellcored/src/qmi/wds.rs`):** Filtered QMI `"not available"` sentinel values (`0xFFFF_FFFF` / `0xFFFF_FFFF_FFFF_FFFF`) in `parse_pkt_statistics_tlvs()` so unsupported SDX75 overflow counters never export `4294967295` to Prometheus.
+- **Data-Plane Liveness Probe (`crates/cellcored/src/dataplane.rs`):** Added a 3 s post-connect settle window before the initial IPv4/IPv6 liveness probe fires (allowing kernel route & IPv6 DAD convergence on `rmnet_data*`) so `wan_v4_usable` / `wan_v6_usable` go `1` immediately after connect instead of waiting for the 60 s second tick.
+
 ## 2.0.0 — Deep-Dive Reliability, 2-Worker Performance, Flash Longevity & Autonomous Features
 
 - **Wave 1 — Correctness, Reliability & Security Fixes:**

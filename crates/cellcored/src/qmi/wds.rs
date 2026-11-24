@@ -303,17 +303,22 @@ pub fn parse_channel_rate_tlvs(tlvs: &[(u8, Vec<u8>)]) -> Result<WdsChannelRate,
 }
 
 pub fn parse_pkt_statistics_tlvs(tlvs: &[(u8, Vec<u8>)]) -> WdsPktStatistics {
+    // Per QMI WDS spec, 0xFFFF_FFFF (u32::MAX) and 0xFFFF_FFFF_FFFF_FFFF (u64::MAX)
+    // mean "statistic not supported / unavailable" on the baseband (e.g. SDX75
+    // tx/rx_overflows). Filter sentinels so metrics never export 4.29B fake counts.
+    let valid_u32 = |tag| read_u32_le(tlvs, tag).filter(|&v| v != u32::MAX);
+    let valid_u64 = |tag| read_u64_le(tlvs, tag).filter(|&v| v != u64::MAX);
     WdsPktStatistics {
-        tx_packets_ok: read_u32_le(tlvs, 0x10),
-        rx_packets_ok: read_u32_le(tlvs, 0x11),
-        tx_errors: read_u32_le(tlvs, 0x12),
-        rx_errors: read_u32_le(tlvs, 0x13),
-        tx_overflows: read_u32_le(tlvs, 0x14),
-        rx_overflows: read_u32_le(tlvs, 0x15),
-        tx_bytes_ok: read_u64_le(tlvs, 0x19),
-        rx_bytes_ok: read_u64_le(tlvs, 0x1A),
-        tx_dropped: read_u32_le(tlvs, 0x1B),
-        rx_dropped: read_u32_le(tlvs, 0x1C),
+        tx_packets_ok: valid_u32(0x10),
+        rx_packets_ok: valid_u32(0x11),
+        tx_errors: valid_u32(0x12),
+        rx_errors: valid_u32(0x13),
+        tx_overflows: valid_u32(0x14),
+        rx_overflows: valid_u32(0x15),
+        tx_bytes_ok: valid_u64(0x19),
+        rx_bytes_ok: valid_u64(0x1A),
+        tx_dropped: valid_u32(0x1B),
+        rx_dropped: valid_u32(0x1C),
     }
 }
 
@@ -600,5 +605,24 @@ mod tests {
         assert_eq!(stats.rx_bytes_ok, Some(9_876_543_210));
         assert_eq!(stats.tx_dropped, Some(4));
         assert_eq!(stats.rx_dropped, Some(5));
+    }
+
+    #[test]
+    fn pkt_statistics_filters_unavailable_max_sentinels() {
+        let mut w = TlvWriter::new();
+        w.push_u32(0x14, u32::MAX)
+            .push_u32(0x15, u32::MAX)
+            .push_u32(0x1B, 0)
+            .push_u32(0x1C, u32::MAX);
+        w.push_bytes(0x19, &u64::MAX.to_le_bytes()).unwrap();
+        w.push_bytes(0x1A, &42u64.to_le_bytes()).unwrap();
+        let tlvs = parse_tlvs(&w.finish()).unwrap();
+        let stats = parse_pkt_statistics_tlvs(&tlvs);
+        assert_eq!(stats.tx_overflows, None);
+        assert_eq!(stats.rx_overflows, None);
+        assert_eq!(stats.tx_dropped, Some(0));
+        assert_eq!(stats.rx_dropped, None);
+        assert_eq!(stats.tx_bytes_ok, None);
+        assert_eq!(stats.rx_bytes_ok, Some(42));
     }
 }
