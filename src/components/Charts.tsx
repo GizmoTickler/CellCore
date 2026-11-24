@@ -1,4 +1,4 @@
-import React, { useId, useMemo, useRef, useState } from "react";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 
 interface PointCoord {
   x: number;
@@ -171,9 +171,21 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
     return { x: pt.x, y: pt.y, text };
   }, [computedSeries, showPeakBadge, span]);
 
+  useEffect(() => {
+    if (hoverIdx == null) return;
+    const onOutsidePointerDown = (e: PointerEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setHoverIdx(null);
+      }
+    };
+    document.addEventListener("pointerdown", onOutsidePointerDown);
+    return () => document.removeEventListener("pointerdown", onOutsidePointerDown);
+  }, [hoverIdx]);
+
   function handlePointerMove(e: React.PointerEvent<SVGSVGElement>) {
     if (count === 0) return;
     const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
     const relX = ((e.clientX - rect.left) / rect.width) * width;
     const clampedX = Math.max(padL, Math.min(padL + plotW, relX));
     const idx = count <= 1 ? 0 : Math.round(((clampedX - padL) / plotW) * (count - 1));
@@ -207,8 +219,13 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
         viewBox={`0 0 ${width} ${height}`}
         className="w-full overflow-visible touch-pan-y"
         style={{ height }}
+        onPointerDown={handlePointerMove}
         onPointerMove={handlePointerMove}
-        onPointerLeave={() => setHoverIdx(null)}
+        onPointerLeave={(e) => {
+          if (e.pointerType !== "touch") setHoverIdx(null);
+        }}
+        onPointerCancel={() => setHoverIdx(null)}
+        onLostPointerCapture={() => setHoverIdx(null)}
       >
         <defs>
           {computedSeries.map((s, idx) => (
@@ -422,7 +439,7 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
   );
 });
 
-export function SmoothAreaChart({
+export const SmoothAreaChart = React.memo(function SmoothAreaChart({
   values,
   labels,
   label = "Value",
@@ -443,9 +460,13 @@ export function SmoothAreaChart({
   maxOverride?: number;
   emptyLabel?: string;
 }) {
+  const series = useMemo<SeriesConfig[]>(
+    () => [{ label, values, stroke, fillStart: stroke, unit }],
+    [label, values, stroke, unit]
+  );
   return (
     <InteractiveAreaChart
-      series={[{ label, values, stroke, fillStart: stroke, unit }]}
+      series={series}
       labels={labels}
       height={height}
       minOverride={minOverride}
@@ -453,9 +474,9 @@ export function SmoothAreaChart({
       emptyLabel={emptyLabel}
     />
   );
-}
+});
 
-export function DualAreaChart({
+export const DualAreaChart = React.memo(function DualAreaChart({
   primaryValues,
   secondaryValues,
   labels,
@@ -476,18 +497,22 @@ export function DualAreaChart({
   unit?: string;
   height?: number;
 }) {
+  const series = useMemo<SeriesConfig[]>(
+    () => [
+      { label: primaryLabel, values: primaryValues, stroke: primaryColor, fillStart: primaryColor, unit },
+      { label: secondaryLabel, values: secondaryValues, stroke: secondaryColor, fillStart: secondaryColor, unit },
+    ],
+    [primaryLabel, primaryValues, primaryColor, secondaryLabel, secondaryValues, secondaryColor, unit]
+  );
   return (
     <InteractiveAreaChart
-      series={[
-        { label: primaryLabel, values: primaryValues, stroke: primaryColor, fillStart: primaryColor, unit },
-        { label: secondaryLabel, values: secondaryValues, stroke: secondaryColor, fillStart: secondaryColor, unit },
-      ]}
+      series={series}
       labels={labels}
       height={height}
       minOverride={0}
     />
   );
-}
+});
 
 const PLUM_PALETTE = ["var(--qm-ember)", "var(--qm-berry)", "var(--qm-saffron)", "var(--qm-jade)", "var(--qm-muted)"];
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, History, Minus, Play, Radio, Square, Trash2 } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
@@ -69,6 +69,47 @@ function Delta({ latest, base }: { latest: number; base: number | null }) {
   );
 }
 
+const LiveRadioStrip = React.memo(function LiveRadioStrip() {
+  const modem = useWsStore((s) => s.modem);
+  if (!modem || modem.carriers.length === 0) return null;
+
+  const totalMhz = Math.round(modem.carriers.reduce((acc, c) => acc + (c.bandwidthMhz ?? 0), 0));
+
+  return (
+    <div className="rounded-2xl border border-line bg-sunk/50 px-3.5 py-2.5 space-y-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px] font-semibold text-muted">
+        <span className="inline-flex items-center gap-1.5">
+          <Radio className="h-3.5 w-3.5 text-ember-ink" />
+          Live Radio · {modem.carriers.length}CA · {totalMhz} MHz
+        </span>
+        {modem.serving?.sinr != null && (
+          <span className="font-mono qm-tabular text-ink-2">
+            {modem.serving.rat} · SINR {modem.serving.sinr} dB
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {modem.carriers.map((c, idx) => {
+          const isPcc = c.role === "PCC";
+          const sccActive = !isPcc && c.pcellState === 2;
+          const sccDormant = !isPcc && c.pcellState === 1;
+          return (
+            <Badge
+              key={`${c.role}-${c.arfcn}-${idx}`}
+              variant={isPcc ? "info" : sccActive ? "success" : "neutral"}
+            >
+              {c.role} {c.band}
+              {c.bandwidthMhz ? ` ${c.bandwidthMhz}MHz` : ""}
+              {c.dlMimoLayers ? ` ${c.dlMimoLayers}×${c.ulMimoLayers || 0}` : ""}
+              {sccActive ? " · Active" : sccDormant ? " · Dormant" : ""}
+            </Badge>
+          );
+        })}
+      </div>
+    </div>
+  );
+});
+
 export function SpeedtestView({ header }: { header: HeaderFn }) {
   const push = useToastStore((s) => s.push);
   const [busy, setBusy] = useState<string | null>(null);
@@ -76,7 +117,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
 
   const speedtest = useWsStore((s) => s.speedtest);
   const speedtestHistory = useWsStore((s) => s.speedtestHistory);
-  const modem = useWsStore((s) => s.modem);
   const refreshSpeedtestHistory = useWsStore((s) => s.refreshSpeedtestHistory);
   const resetSpeedtest = useWsStore((s) => s.resetSpeedtest);
 
@@ -254,43 +294,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
             )}
 
             {/* Live Carrier Aggregation & SCC activation strip (1s refresh during test) */}
-            {modem && modem.carriers.length > 0 && (
-              <div className="rounded-2xl border border-line bg-sunk/50 px-3.5 py-2.5 space-y-1.5">
-                <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px] font-semibold text-muted">
-                  <span className="inline-flex items-center gap-1.5">
-                    <Radio className="h-3.5 w-3.5 text-ember-ink" />
-                    Live Radio · {modem.carriers.length}CA ·{" "}
-                    {Math.round(
-                      modem.carriers.reduce((acc, c) => acc + (c.bandwidthMhz ?? 0), 0)
-                    )}{" "}
-                    MHz
-                  </span>
-                  {modem.serving?.sinr != null && (
-                    <span className="font-mono qm-tabular text-ink-2">
-                      {modem.serving.rat} · SINR {modem.serving.sinr} dB
-                    </span>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {modem.carriers.map((c, idx) => {
-                    const isPcc = c.role === "PCC";
-                    const sccActive = !isPcc && c.pcellState === 2;
-                    const sccDormant = !isPcc && c.pcellState === 1;
-                    return (
-                      <Badge
-                        key={`${c.role}-${c.arfcn}-${idx}`}
-                        variant={isPcc ? "info" : sccActive ? "success" : "neutral"}
-                      >
-                        {c.role} {c.band}
-                        {c.bandwidthMhz ? ` ${c.bandwidthMhz}MHz` : ""}
-                        {c.dlMimoLayers ? ` ${c.dlMimoLayers}×${c.ulMimoLayers || 0}` : ""}
-                        {sccActive ? " · Active" : sccDormant ? " · Dormant" : ""}
-                      </Badge>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
+            <LiveRadioStrip />
 
             {/* Controls */}
             <div className="flex flex-col sm:flex-row gap-2.5">

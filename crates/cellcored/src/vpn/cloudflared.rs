@@ -802,7 +802,7 @@ fn append_job_log(line: &str) {
 }
 
 fn save_job(job: &InstallJob) {
-    let _ = crate::state::atomic_write(
+    let _ = crate::state::atomic_write_tmpfs(
         &job_file(),
         &serde_json::to_vec(job).unwrap_or_default(),
         0o644,
@@ -906,15 +906,20 @@ async fn run_verified_install(action: String, started: u64) {
             return Err("downloaded binary returned empty --version output".into());
         }
 
-        if let Some(parent) = bp.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        crate::state::atomic_rename_file(&tmp, &bp)
-            .map_err(|e| format!("install binary to {}: {e}", bp.display()))?;
+        let tmp_install = tmp.clone();
+        let bp_install = bp.clone();
+        crate::paths::spawn_blocking(move || {
+            if let Some(parent) = bp_install.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            crate::state::atomic_rename_file(&tmp_install, &bp_install)
+                .map_err(|e| format!("install binary to {}: {e}", bp_install.display()))
+        })
+        .await
+        .map_err(|e| format!("install task panicked: {e}"))??;
         if let Ok(mut g) = VERSION_CACHE.lock() {
             *g = None;
         }
-        let _ = run("sync", &[], ExecOpts::new(10, 4 * KIB)).await;
         append_job_log(&format!("Installed verified cloudflared {ver}"));
 
         if init_path().is_file()
@@ -981,7 +986,7 @@ pub async fn post_install(State(ctx): State<HttpCtx>) -> Response {
     };
     let _ = std::fs::create_dir_all(paths().run);
     let _ = std::fs::write(log_file(), b"");
-    if let Err(e) = crate::state::atomic_write(
+    if let Err(e) = crate::state::atomic_write_tmpfs(
         &job_file(),
         &serde_json::to_vec(&job).unwrap_or_default(),
         0o644,

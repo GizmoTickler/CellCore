@@ -43,7 +43,7 @@ use crate::{
             WdsProfileSummary, WdsRuntimeSettings,
         },
     },
-    state::{AppState, atomic_write, save_json_atomic, save_json_compact_tmpfs},
+    state::{AppState, atomic_write_tmpfs, save_json_atomic, save_json_compact_tmpfs},
 };
 
 pub const DATAPLANE_CONFIG_PATH: &str = "/etc/cellcore/dataplane.json";
@@ -799,21 +799,32 @@ pub(crate) async fn apply_native_dns(
     if dns.is_empty() {
         return Ok(false);
     }
-    if saved_resolv.is_none() {
-        let mut snap = Vec::with_capacity(RESOLV_PATHS.len());
-        for &rel in &RESOLV_PATHS {
-            snap.push((rel.to_string(), fs::read(crate::paths::p(rel)).ok()));
-        }
-        *saved_resolv = Some(snap);
-    }
+    let need_snap = saved_resolv.is_none();
     let mut body = String::from("# Managed by cellcored native dataplane\n");
     for s in dns {
         body.push_str("nameserver ");
         body.push_str(s);
         body.push('\n');
     }
-    for &rel in &RESOLV_PATHS {
-        atomic_write(Path::new(rel), body.as_bytes(), 0o644)?;
+    let snap_out = crate::paths::spawn_blocking(move || -> Result<Option<SavedResolvSnapshot>, String> {
+        let snap = if need_snap {
+            let mut s = Vec::with_capacity(RESOLV_PATHS.len());
+            for &rel in &RESOLV_PATHS {
+                s.push((rel.to_string(), fs::read(crate::paths::p(rel)).ok()));
+            }
+            Some(s)
+        } else {
+            None
+        };
+        for &rel in &RESOLV_PATHS {
+            atomic_write_tmpfs(Path::new(&crate::paths::p(rel)), body.as_bytes(), 0o644)?;
+        }
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("apply_native_dns task panicked: {e}"))??;
+    if let Some(snap) = snap_out {
+        *saved_resolv = Some(snap);
     }
     reload_dnsmasq_if_present().await;
     Ok(true)
@@ -825,15 +836,20 @@ pub(crate) async fn restore_native_dns(
     let Some(entries) = saved_resolv.take() else {
         return Ok(());
     };
-    for (rel, orig) in entries {
-        match orig {
-            Some(bytes) => atomic_write(Path::new(&rel), &bytes, 0o644)?,
-            None => {
-                let real = Path::new(&crate::paths::p(&rel)).to_path_buf();
-                let _ = fs::remove_file(&real);
+    crate::paths::spawn_blocking(move || -> Result<(), String> {
+        for (rel, orig) in entries {
+            let real = crate::paths::p(&rel);
+            match orig {
+                Some(bytes) => atomic_write_tmpfs(Path::new(&real), &bytes, 0o644)?,
+                None => {
+                    let _ = fs::remove_file(&real);
+                }
             }
         }
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("restore_native_dns task panicked: {e}"))??;
     reload_dnsmasq_if_present().await;
     Ok(())
 }
@@ -870,7 +886,11 @@ pub(crate) async fn write_ippt_dnsmasq_conf(
     gw: Option<Ipv4Addr>,
 ) -> Result<(), String> {
     let body = build_ippt_dnsmasq_conf(mac, ip, gw)?;
-    atomic_write(Path::new(IPPT_DNSMASQ_CONF_PATH), body.as_bytes(), 0o644)?;
+    crate::paths::spawn_blocking(move || {
+        atomic_write_tmpfs(Path::new(&crate::paths::p(IPPT_DNSMASQ_CONF_PATH)), body.as_bytes(), 0o644)
+    })
+    .await
+    .map_err(|e| format!("write_ippt_dnsmasq_conf task panicked: {e}"))??;
     reload_dnsmasq_if_present().await;
     Ok(())
 }
@@ -1486,10 +1506,20 @@ fn collect_ipa_offload_telemetry() -> IpaOffloadTelemetry {
     }
 }
 
+#[cfg(test)]
 pub fn collect_kernel_telemetry(
     profile: KernelTuningProfile,
     warnings: Vec<String>,
     active_iface: Option<&str>,
+) -> KernelTelemetry {
+    collect_kernel_telemetry_with_procs(profile, warnings, active_iface, None)
+}
+
+fn collect_kernel_telemetry_with_procs(
+    profile: KernelTuningProfile,
+    warnings: Vec<String>,
+    active_iface: Option<&str>,
+    pre_scanned_procs: Option<[bool; 3]>,
 ) -> KernelTelemetry {
     let mut rps_paths: Vec<String> = [
         "/sys/class/net/eth0/queues/rx-0/rps_cpus",
@@ -1539,7 +1569,13 @@ pub fn collect_kernel_telemetry(
             xps_maps.insert(short, v);
         }
     }
-    let procs = proc_comms_present(&["ipacm", "QCMAP_ConnectionManager", "netmgrd"]);
+    let procs = match pre_scanned_procs {
+        Some(p) => p,
+        None => {
+            let v = proc_comms_present(&["ipacm", "QCMAP_ConnectionManager", "netmgrd"]);
+            [v[0], v[1], v[2]]
+        }
+    };
     KernelTelemetry {
         tcp_congestion_control: read_trimmed("/proc/sys/net/ipv4/tcp_congestion_control")
             .unwrap_or_default(),
@@ -3079,10 +3115,13 @@ async fn collect_kernel_telemetry_async(
     profile: KernelTuningProfile,
     warnings: Vec<String>,
     iface: Option<String>,
+    pre_scanned_procs: Option<[bool; 3]>,
 ) -> KernelTelemetry {
-    tokio::task::spawn_blocking(move || collect_kernel_telemetry(profile, warnings, iface.as_deref()))
-        .await
-        .unwrap_or_default()
+    crate::paths::spawn_blocking(move || {
+        collect_kernel_telemetry_with_procs(profile, warnings, iface.as_deref(), pre_scanned_procs)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn kernel_tuning_drifted(active_iface: &str) -> bool {
@@ -3533,13 +3572,17 @@ impl Drop for SupervisorRunGuard {
     }
 }
 
+/// Apply a single QMI indication to the cached snapshot / native handles.
+/// Returns `true` if the supervisor should wake immediately for a full pass
+/// (`WDS_PKT_SRVC_STATUS_IND` or an actual `NAS_SYS_INFO_IND` registration transition).
 async fn apply_qmi_indication(
     h: &DataplaneHub,
     nh: &mut NativeHandles,
     cfg: &DataplaneConfig,
     ind: QmiIndication,
-) {
+) -> bool {
     let mut flush_fam: Option<Option<u8>> = None;
+    let mut should_wake = false;
     {
         let mut s = h.snapshot.write().await;
         s.indications_received += 1;
@@ -3550,39 +3593,43 @@ async fn apply_qmi_indication(
             ind.tag
         ));
         if ind.service == SVC_NAS && ind.msg_id == nas::NAS_SYS_INFO_IND {
-            s.nas_sys = Some(nas::parse_sys_info_tlvs(&ind.tlvs));
-        } else if ind.service == SVC_WDS
-            && ind.msg_id == WDS_PKT_SRVC_STATUS_IND
-            && let Ok(ps) = wds::parse_pkt_srvc_status_tlvs(&ind.tlvs)
-            && (ps.reconfig_required || ps.status == PktConnStatus::Disconnected)
-        {
-            if ind.tag == "WDS_V4" {
-                nh.v4_client = None;
-                nh.v4_handle = None;
-                nh.last_v4_ip = None;
-                NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
-                s.wds_v4.state = "disconnected";
-                s.wds_v4.pkt_status = Some(ps);
-                flush_fam = Some(if is_wds_connected() {
-                    Some(libc::AF_INET as u8)
-                } else {
-                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
-                    None
-                });
-            } else if ind.tag == "WDS_V6" {
-                nh.v6_client = None;
-                nh.v6_handle = None;
-                nh.last_v6_ip = None;
-                nh.last_v6_key = None;
-                NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
-                s.wds_v6.state = "disconnected";
-                s.wds_v6.pkt_status = Some(ps);
-                flush_fam = Some(if is_wds_connected() {
-                    Some(libc::AF_INET6 as u8)
-                } else {
-                    NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
-                    None
-                });
+            let prev_reg = s.nas_sys.as_ref().map(|n| n.registered);
+            let parsed = nas::parse_sys_info_tlvs(&ind.tlvs);
+            should_wake = prev_reg != Some(parsed.registered);
+            s.nas_sys = Some(parsed);
+        } else if ind.service == SVC_WDS && ind.msg_id == WDS_PKT_SRVC_STATUS_IND {
+            should_wake = true;
+            if let Ok(ps) = wds::parse_pkt_srvc_status_tlvs(&ind.tlvs)
+                && (ps.reconfig_required || ps.status == PktConnStatus::Disconnected)
+            {
+                if ind.tag == "WDS_V4" {
+                    nh.v4_client = None;
+                    nh.v4_handle = None;
+                    nh.last_v4_ip = None;
+                    NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                    s.wds_v4.state = "disconnected";
+                    s.wds_v4.pkt_status = Some(ps);
+                    flush_fam = Some(if is_wds_connected() {
+                        Some(libc::AF_INET as u8)
+                    } else {
+                        NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                        None
+                    });
+                } else if ind.tag == "WDS_V6" {
+                    nh.v6_client = None;
+                    nh.v6_handle = None;
+                    nh.last_v6_ip = None;
+                    nh.last_v6_key = None;
+                    NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                    s.wds_v6.state = "disconnected";
+                    s.wds_v6.pkt_status = Some(ps);
+                    flush_fam = Some(if is_wds_connected() {
+                        Some(libc::AF_INET6 as u8)
+                    } else {
+                        NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
+                        None
+                    });
+                }
             }
         }
     }
@@ -3606,6 +3653,7 @@ async fn apply_qmi_indication(
         flush_rmnet_stale_family(flush_if, flush_tbl, fam).await;
         persist_native_handoff_state(nh, cfg, true);
     }
+    should_wake
 }
 
 async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
@@ -3643,6 +3691,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
             break;
         }
         loop_tick = loop_tick.wrapping_add(1);
+        let mut cached_tick_procs: Option<[bool; 3]> = None;
         let cfg = h.config.read().await.clone();
         if bus.is_none() {
             match qmi::qrtr::shared_bus() {
@@ -3671,7 +3720,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
                     snap.sfe_loaded = is_sfe_loaded();
                     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone())).await;
+                    snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone()), None).await;
                     refresh_netlink_into(&mut snap, &cfg.iface).await;
                     *h.snapshot.write().await = snap;
                     tokio::select! {
@@ -3831,22 +3880,24 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                 }
 
                 NATIVE_MODE_ACTIVE.store(true, Ordering::Release);
-                let vendor_procs = tokio::task::spawn_blocking(|| {
-                    proc_comms_present(&["QCMAP_ConnectionManager", "netmgrd"])
+                let scanned_procs = crate::paths::spawn_blocking(|| {
+                    proc_comms_present(&["ipacm", "QCMAP_ConnectionManager", "netmgrd"])
                 })
                 .await
-                .unwrap_or_else(|_| vec![false, false]);
+                .unwrap_or_else(|_| vec![false, false, false]);
                 let (need_vendor_stop, late_vendor) =
-                    should_re_stop_vendor_cm(nh.vendor_daemons_stopped, vendor_procs[0], vendor_procs[1]);
+                    should_re_stop_vendor_cm(nh.vendor_daemons_stopped, scanned_procs[1], scanned_procs[2]);
                 if need_vendor_stop {
                     if late_vendor {
                         state.push_daemon_log(format!(
                             "dataplane: re-stopping late-started vendor CM daemons in native mode (qcmap={}, netmgrd={})",
-                            vendor_procs[0], vendor_procs[1]
+                            scanned_procs[1], scanned_procs[2]
                         ));
                     }
                     stop_vendor_cm_daemons().await;
                     nh.vendor_daemons_stopped = true;
+                } else {
+                    cached_tick_procs = Some([scanned_procs[0], scanned_procs[1], scanned_procs[2]]);
                 }
                 if mwan3_is_active() {
                     let was_stopped = nh.mwan3_stopped;
@@ -4430,7 +4481,7 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         snap.ipa_ippt_active = nh.ipa_ippt_active;
         snap.ipa_v6_sharing_prefix = nh.ipa_v6_sharing_prefix.clone();
         let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(active_iface)).await;
+        snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(active_iface), cached_tick_procs).await;
         if cfg.preserve_ipa_offload && !snap.kernel.ipa_dev_present {
             snap.warnings.push("/dev/ipa device not present".into());
         }
@@ -4443,31 +4494,47 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
             break;
         }
 
-        tokio::select! {
-            _ = tokio::time::sleep(next_sleep) => {}
-            _ = h.wake.notified() => {}
-            Some(ind) = ind_rx.recv() => {
-                // Process first indication immediately (so WDS PDN drop strips stale rmnet state in <1 ms),
-                // then debounce/coalesce any indication burst for 300 ms before running a full supervisor pass.
-                apply_qmi_indication(&h, &mut nh, &cfg, ind).await;
-                let burst = drain_coalesced_indications(&mut ind_rx, &h.wake, QMI_IND_DEBOUNCE_WINDOW).await;
-                for extra in burst {
-                    apply_qmi_indication(&h, &mut nh, &cfg, extra).await;
-                }
-            }
-            ev = recv_bus_wakeup(bus_rx.as_mut(), Some(b.as_ref()), last_ssr_count, need_services) => {
-                if let QrtrBusEvent::Ssr { node, reason } = ev {
-                    let cur_ssr = b.snapshot().ssr_count;
-                    if cur_ssr > last_ssr_count {
-                        last_ssr_count = cur_ssr;
-                        handle_modem_ssr(&state, &mut ph, &mut nh, node, last_ssr_count, &reason);
-                        if cfg.mode == DataplaneMode::Native {
-                            let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
-                            let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
-                            flush_rmnet_stale_state(flush_if, flush_tbl).await;
+        let sleep_deadline = tokio::time::Instant::now() + next_sleep;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(sleep_deadline) => break,
+                _ = h.wake.notified() => break,
+                Some(ind) = ind_rx.recv() => {
+                    // Process first indication immediately (so WDS PDN drop strips stale rmnet state in <1 ms).
+                    // Routine informational NAS_SYS_INFO_IND updates where registration state did not change
+                    // update the cached snapshot in place without waking a full heavy supervisor pass.
+                    let mut wake_now = apply_qmi_indication(&h, &mut nh, &cfg, ind).await;
+                    if wake_now {
+                        let burst = drain_coalesced_indications(&mut ind_rx, &h.wake, QMI_IND_DEBOUNCE_WINDOW).await;
+                        for extra in burst {
+                            let _ = apply_qmi_indication(&h, &mut nh, &cfg, extra).await;
                         }
-                        pending_phy_reenable = true;
+                        break;
                     }
+                    while let Ok(extra) = ind_rx.try_recv() {
+                        if apply_qmi_indication(&h, &mut nh, &cfg, extra).await {
+                            wake_now = true;
+                        }
+                    }
+                    if wake_now {
+                        break;
+                    }
+                }
+                ev = recv_bus_wakeup(bus_rx.as_mut(), Some(b.as_ref()), last_ssr_count, need_services) => {
+                    if let QrtrBusEvent::Ssr { node, reason } = ev {
+                        let cur_ssr = b.snapshot().ssr_count;
+                        if cur_ssr > last_ssr_count {
+                            last_ssr_count = cur_ssr;
+                            handle_modem_ssr(&state, &mut ph, &mut nh, node, last_ssr_count, &reason);
+                            if cfg.mode == DataplaneMode::Native {
+                                let flush_if = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                                let flush_tbl = nh.last_applied_sig.as_ref().map(|s| s.route_table).unwrap_or(cfg.route_table);
+                                flush_rmnet_stale_state(flush_if, flush_tbl).await;
+                            }
+                            pending_phy_reenable = true;
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -4509,7 +4576,7 @@ async fn get_status() -> Response {
     let cfg = h.config.read().await.clone();
     let mut snap = h.snapshot.read().await.clone();
     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone())).await;
+    snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(cfg.iface.clone()), None).await;
     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
     snap.sfe_loaded = is_sfe_loaded();
     Json(serde_json::json!({
@@ -4561,7 +4628,11 @@ pub async fn apply_config_from_backup(app: &AppState, mut next: DataplaneConfig)
 
     let h = hub();
     let prev = h.config.read().await.clone();
-    save_config(&next).map_err(|e| format!("save dataplane config: {e}"))?;
+    let next_to_save = next.clone();
+    crate::paths::spawn_blocking(move || save_config(&next_to_save))
+        .await
+        .map_err(|e| format!("save dataplane config task panicked: {e}"))?
+        .map_err(|e| format!("save dataplane config: {e}"))?;
     if next.kernel_tuning != prev.kernel_tuning || next.iface != prev.iface {
         let iface_s = next.iface.clone();
         let kt = next.kernel_tuning;
@@ -4771,8 +4842,11 @@ async fn post_config(
         return r;
     }
 
-    if let Err(e) = save_config(&next) {
-        return server(format!("save dataplane config: {e}"));
+    let next_to_save = next.clone();
+    match crate::paths::spawn_blocking(move || save_config(&next_to_save)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return server(format!("save dataplane config: {e}")),
+        Err(e) => return server(format!("save dataplane config task panicked: {e}")),
     }
     if next.kernel_tuning != prev.kernel_tuning || (next.iface != prev.iface && next.kernel_tuning == KernelTuningProfile::HighThroughput) {
         let iface_s = next.iface.clone();
@@ -4826,7 +4900,7 @@ async fn post_config(
     let mut snap = h.snapshot.read().await.clone();
     snap.warnings.extend(sfe_warns);
     let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    snap.kernel = collect_kernel_telemetry_async(next.kernel_tuning, tw, Some(next.iface.clone())).await;
+    snap.kernel = collect_kernel_telemetry_async(next.kernel_tuning, tw, Some(next.iface.clone()), None).await;
     snap.ipa_cli_present = Path::new(&crate::paths::p("/usr/bin/ipa")).exists();
     snap.sfe_loaded = is_sfe_loaded();
     Json(serde_json::json!({

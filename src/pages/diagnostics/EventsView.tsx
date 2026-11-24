@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, ChevronDown, RefreshCw } from "lucide-react";
 import { apiFetch } from "../../lib/api";
@@ -150,10 +150,39 @@ export function EventsView({ header }: { header: HeaderFn }) {
     refetchInterval: 60_000,
   });
 
-  // A pushed event means the list is stale.
+  // Prepend matching incoming WS events directly into the query cache (deduped by id, capped at 1000)
+  // instead of invalidating and re-fetching GET /api/v1/events?limit=1000 on every event.
+  const prevSeqRef = useRef(eventSeq);
   useEffect(() => {
-    if (eventSeq > 0) void qc.invalidateQueries({ queryKey: ["obs-events"] });
-  }, [eventSeq, qc]);
+    const delta = eventSeq - prevSeqRef.current;
+    prevSeqRef.current = eventSeq;
+    if (delta <= 0) return;
+
+    const recent = useObsStore.getState().recent;
+    const incoming = recent.slice(0, Math.min(delta, recent.length));
+    if (incoming.length === 0) return;
+
+    const allowedTypes = groups.length ? new Set(typesFor(groups)) : null;
+    const minTs = sinceSecs != null ? Math.floor(Date.now() / 1000) - sinceSecs : null;
+    const matching = incoming.filter((e) => {
+      if (allowedTypes && !allowedTypes.has(e.type)) return false;
+      if (minTs != null && e.ts < minTs) return false;
+      return true;
+    });
+    if (matching.length === 0) return;
+
+    qc.setQueryData<EventsResponse>(["obs-events", range, typeParam], (old) => {
+      if (!old) return old;
+      const existingIds = new Set(old.events.map((x) => x.id));
+      const fresh = matching.filter((e) => !existingIds.has(e.id));
+      if (fresh.length === 0) return old;
+      return {
+        ...old,
+        events: [...fresh, ...old.events].slice(0, 1000),
+        stored: Math.min(1000, (old.stored ?? old.events.length) + fresh.length),
+      };
+    });
+  }, [eventSeq, groups, range, sinceSecs, typeParam, qc]);
 
   const events = useMemo(() => {
     const all = q.data?.events ?? [];

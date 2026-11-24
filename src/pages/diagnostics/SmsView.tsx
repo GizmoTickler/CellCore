@@ -373,7 +373,7 @@ export function SmsView({ header }: { header: HeaderFn }) {
                   }}
                   placeholder={recipient ? `Text ${recipient}` : "Write a message"}
                   aria-label="Message body"
-                  className="min-h-[44px] max-h-40 flex-1 resize-y rounded-2xl border border-line bg-raised px-3.5 py-2.5 text-[13.5px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember"
+                  className="min-h-[44px] max-h-40 flex-1 resize-y rounded-2xl border border-line bg-raised px-3.5 py-2.5 text-[16px] sm:text-[13.5px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember"
                   required
                 />
                 <Button

@@ -751,7 +751,7 @@ pub async fn tick_cell_lock_scheduler(
                     .store(true, std::sync::atomic::Ordering::Release);
                 if modem_locked {
                     engaged = true;
-                    let _ = crate::state::atomic_write(
+                    let _ = crate::state::atomic_write_tmpfs(
                         std::path::Path::new(&marker_path),
                         b"1\n",
                         0o600,
@@ -813,8 +813,8 @@ pub async fn tick_cell_lock_scheduler(
                     }
                 }
                 if any_sent && all_ok {
-                    let _ = crate::state::atomic_write(std::path::Path::new(&marker_path), b"1\n", 0o600);
-                    let _ = crate::state::atomic_write(
+                    let _ = crate::state::atomic_write_tmpfs(std::path::Path::new(&marker_path), b"1\n", 0o600);
+                    let _ = crate::state::atomic_write_tmpfs(
                         std::path::Path::new(&status_path),
                         b"{\"status\":\"active\",\"locked\":1}",
                         0o600,
@@ -841,7 +841,7 @@ pub async fn tick_cell_lock_scheduler(
                 );
                 if ok5 && ok4 {
                     let _ = fs::remove_file(&marker_path);
-                    let _ = crate::state::atomic_write(
+                    let _ = crate::state::atomic_write_tmpfs(
                         std::path::Path::new(&status_path),
                         b"{\"status\":\"inactive\",\"locked\":0}",
                         0o600,

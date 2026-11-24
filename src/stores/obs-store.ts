@@ -4,6 +4,10 @@ import type { EventsResponse, FailoverStatus, ObsEvent } from "../types/obs";
 
 /** Recent events kept client-side for the Now card and live pushes. */
 const RECENT_CAP = 50;
+const LOAD_DEDUP_MS = 1_500;
+
+let loadInFlight: Promise<void> | null = null;
+let lastLoadedAt = 0;
 
 interface PendingConfirm {
   label: string;
@@ -38,16 +42,26 @@ export const useObsStore = create<ObsState>((set, get) => ({
       return { recent: [e, ...s.recent].slice(0, RECENT_CAP), eventSeq: s.eventSeq + 1 };
     }),
 
-  load: async () => {
-    try {
-      const [f, ev] = await Promise.all([
-        apiFetch<FailoverStatus>("/api/v1/failover"),
-        apiFetch<EventsResponse>(`/api/v1/events?limit=${RECENT_CAP}`),
-      ]);
-      set({ failover: f, recent: Array.isArray(ev.events) ? ev.events : [] });
-    } catch {
-      // older daemon or transient error: badges simply stay hidden
+  load: () => {
+    if (loadInFlight) return loadInFlight;
+    if (lastLoadedAt > 0 && Date.now() - lastLoadedAt < LOAD_DEDUP_MS) {
+      return Promise.resolve();
     }
+    loadInFlight = (async () => {
+      try {
+        const [f, ev] = await Promise.all([
+          apiFetch<FailoverStatus>("/api/v1/failover"),
+          apiFetch<EventsResponse>(`/api/v1/events?limit=${RECENT_CAP}`),
+        ]);
+        lastLoadedAt = Date.now();
+        set({ failover: f, recent: Array.isArray(ev.events) ? ev.events : [] });
+      } catch {
+        // older daemon or transient error: badges simply stay hidden
+      } finally {
+        loadInFlight = null;
+      }
+    })();
+    return loadInFlight;
   },
 
   requestConfirm: (label) => {

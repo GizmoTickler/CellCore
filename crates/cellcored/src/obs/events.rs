@@ -181,6 +181,7 @@ pub struct EventStore {
     ring: VecDeque<Event>,
     next_id: u64,
     dirty: bool,
+    urgent_dirty: bool,
     pub counts: BTreeMap<EventKind, u64>,
 }
 
@@ -205,11 +206,31 @@ impl EventStore {
         self.ring.push_back(ev.clone());
         *self.counts.entry(kind).or_insert(0) += 1;
         self.dirty = true;
+        if severity >= Severity::Warning {
+            self.urgent_dirty = true;
+        }
         ev
     }
 
+    #[allow(dead_code)]
     pub fn take_dirty(&mut self) -> bool {
+        self.urgent_dirty = false;
         std::mem::replace(&mut self.dirty, false)
+    }
+
+    /// Take dirty snapshot if `force` is set, any `Warning`/`Critical` event arrived
+    /// (`urgent_dirty`), or `allow_info_flush` (6 h routine flush) is true.
+    pub fn take_flush_snapshot(&mut self, force: bool, allow_info_flush: bool) -> Option<StoredEvents> {
+        if !self.dirty {
+            return None;
+        }
+        if force || self.urgent_dirty || allow_info_flush {
+            self.dirty = false;
+            self.urgent_dirty = false;
+            Some(self.to_stored())
+        } else {
+            None
+        }
     }
 
     pub fn to_stored(&self) -> StoredEvents {

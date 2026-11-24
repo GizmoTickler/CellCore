@@ -35,15 +35,17 @@ pub const SAR_RF_GET_STATE: u16 = 0x0002;
 #[derive(Default)]
 struct DspClientCache {
     ssr_epoch: u64,
+    tmd_conn_epoch: u64,
     tmd_client: Option<Arc<QrtrServiceClient>>,
     sar_client: Option<Arc<QrtrServiceClient>>,
-    tmd_device_list: Option<Vec<(String, u8)>>,
+    tmd_device_list: Option<(u64, Vec<(String, u8)>)>,
 }
 
 impl DspClientCache {
     fn reset_if_ssr(&mut self, ssr_count: u64) {
         if self.ssr_epoch != ssr_count {
             self.ssr_epoch = ssr_count;
+            self.tmd_conn_epoch = self.tmd_conn_epoch.wrapping_add(1);
             self.tmd_client = None;
             self.sar_client = None;
             self.tmd_device_list = None;
@@ -53,6 +55,7 @@ impl DspClientCache {
 
 static DSP_CACHE: Mutex<DspClientCache> = Mutex::const_new(DspClientCache {
     ssr_epoch: 0,
+    tmd_conn_epoch: 0,
     tmd_client: None,
     sar_client: None,
     tmd_device_list: None,
@@ -95,12 +98,19 @@ async fn ensure_cached_client(
     let client = bus.open_service(service, tag, ind_tx, QMI_TIMEOUT).await?;
     let mut cache = DSP_CACHE.lock().await;
     cache.reset_if_ssr(ssr_count);
-    let slot = match service {
-        SVC_TMD => &mut cache.tmd_client,
-        SVC_SAR => &mut cache.sar_client,
-        _ => &mut cache.tmd_client,
-    };
-    *slot = Some(Arc::clone(&client));
+    match service {
+        SVC_TMD => {
+            cache.tmd_conn_epoch = cache.tmd_conn_epoch.wrapping_add(1);
+            cache.tmd_client = Some(Arc::clone(&client));
+            cache.tmd_device_list = None;
+        }
+        SVC_SAR => {
+            cache.sar_client = Some(Arc::clone(&client));
+        }
+        _ => {
+            cache.tmd_client = Some(Arc::clone(&client));
+        }
+    }
     Ok(client)
 }
 
@@ -109,6 +119,7 @@ async fn invalidate_cached_client(service: u32, clear_tmd_list: bool) {
     match service {
         SVC_TMD => {
             cache.tmd_client = None;
+            cache.tmd_conn_epoch = cache.tmd_conn_epoch.wrapping_add(1);
             if clear_tmd_list {
                 cache.tmd_device_list = None;
             }
@@ -204,34 +215,48 @@ pub async fn query_tmd_device_list(client: &dyn QmiClient) -> Result<Vec<(String
         .collect())
 }
 
+const TMD_PIPELINE_CHUNK: usize = 6;
+
 pub async fn query_tmd_levels(
     client: &dyn QmiClient,
     devices: &[(String, u8)],
 ) -> Result<Vec<TmdDeviceInfo>, QmiError> {
-    let mut out = Vec::with_capacity(devices.len());
-    for (name, max_level) in devices.iter().take(24) {
-        let mut w = TlvWriter::new();
-        let mut dev_tlv = Vec::with_capacity(1 + name.len());
-        dev_tlv.push(name.len().min(255) as u8);
-        dev_tlv.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
-        w.push_bytes(0x01, &dev_tlv)?;
-
-        let (cur, req) = match client.rpc(TMD_GET_MITIGATION_LEVEL, w.finish(), QMI_TIMEOUT).await {
-            Ok(rt) if check_result_tlv(&rt).is_ok() => {
-                let c = find_tlv(&rt, 0x10).and_then(|b| b.first().copied()).unwrap_or(0);
-                let r = find_tlv(&rt, 0x11).and_then(|b| b.first().copied()).unwrap_or(0);
-                (c, r)
-            }
-            Err(e) if is_transport_err(&e) => return Err(e),
-            _ => (0, 0),
-        };
-        out.push(TmdDeviceInfo {
-            name: name.clone(),
-            max_level: *max_level,
-            current_level: cur,
-            requested_level: req,
-            throttling: cur > 0,
-        });
+    let limited = &devices[..devices.len().min(24)];
+    let mut out = Vec::with_capacity(limited.len());
+    for chunk in limited.chunks(TMD_PIPELINE_CHUNK) {
+        let mut futs = Vec::with_capacity(chunk.len());
+        for (name, max_level) in chunk {
+            let mut w = TlvWriter::new();
+            let mut dev_tlv = Vec::with_capacity(1 + name.len());
+            dev_tlv.push(name.len().min(255) as u8);
+            dev_tlv.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
+            w.push_bytes(0x01, &dev_tlv)?;
+            let payload = w.finish();
+            let dev_name = name.clone();
+            let dev_max = *max_level;
+            futs.push(async move {
+                let res = client.rpc(TMD_GET_MITIGATION_LEVEL, payload, QMI_TIMEOUT).await;
+                (dev_name, dev_max, res)
+            });
+        }
+        for (name, max_level, res) in futures_util::future::join_all(futs).await {
+            let (cur, req) = match res {
+                Ok(rt) if check_result_tlv(&rt).is_ok() => {
+                    let c = find_tlv(&rt, 0x10).and_then(|b| b.first().copied()).unwrap_or(0);
+                    let r = find_tlv(&rt, 0x11).and_then(|b| b.first().copied()).unwrap_or(0);
+                    (c, r)
+                }
+                Err(e) if is_transport_err(&e) => return Err(e),
+                _ => (0, 0),
+            };
+            out.push(TmdDeviceInfo {
+                name,
+                max_level,
+                current_level: cur,
+                requested_level: req,
+                throttling: cur > 0,
+            });
+        }
     }
     Ok(out)
 }
@@ -309,10 +334,16 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
     let tmd_devices = if caps.tmd {
         match ensure_cached_client(&bus, SVC_TMD, "TMD", ssr_count).await {
             Ok(ep) => {
-                let cached_list = {
+                let (conn_epoch, cached_list) = {
                     let mut cache = DSP_CACHE.lock().await;
                     cache.reset_if_ssr(ssr_count);
-                    cache.tmd_device_list.clone()
+                    let ep_epoch = cache.tmd_conn_epoch;
+                    let list = cache
+                        .tmd_device_list
+                        .as_ref()
+                        .filter(|(e, _)| *e == ep_epoch)
+                        .map(|(_, l)| l.clone());
+                    (ep_epoch, list)
                 };
                 let dev_list = match cached_list {
                     Some(list) => Ok(list),
@@ -320,12 +351,14 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
                         Ok(list) => {
                             let mut cache = DSP_CACHE.lock().await;
                             cache.reset_if_ssr(ssr_count);
-                            cache.tmd_device_list = Some(list.clone());
+                            if cache.tmd_conn_epoch == conn_epoch {
+                                cache.tmd_device_list = Some((conn_epoch, list.clone()));
+                            }
                             Ok(list)
                         }
                         Err(e) => {
                             if is_transport_err(&e) {
-                                invalidate_cached_client(SVC_TMD, matches!(e, QmiError::Ssr)).await;
+                                invalidate_cached_client(SVC_TMD, true).await;
                             }
                             Err(e)
                         }
@@ -336,7 +369,7 @@ pub async fn probe_dsp_telemetry() -> DspTelemetrySnapshot {
                         Ok(devs) => devs,
                         Err(e) => {
                             if is_transport_err(&e) {
-                                invalidate_cached_client(SVC_TMD, matches!(e, QmiError::Ssr)).await;
+                                invalidate_cached_client(SVC_TMD, true).await;
                             }
                             Vec::new()
                         }

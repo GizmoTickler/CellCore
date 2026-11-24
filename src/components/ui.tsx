@@ -116,6 +116,12 @@ export function PageHeader({
 }) {
   const sec = sectionFor(section);
   const active = sec.subs.length ? subFor(section, sub ?? null) : null;
+  const activeChipRef = useRef<HTMLAnchorElement>(null);
+
+  useEffect(() => {
+    activeChipRef.current?.scrollIntoView?.({ inline: "center", block: "nearest", behavior: "smooth" });
+  }, [section, active?.id]);
+
   return (
     <header className="qm-rise space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -139,6 +145,7 @@ export function PageHeader({
               return (
                 <a
                   key={s.id}
+                  ref={on ? activeChipRef : undefined}
                   href={hrefFor(section, s.id)}
                   onClick={(e) => {
                     if (onSubChange) {
@@ -351,7 +358,7 @@ export function Input({ className, ...rest }: React.InputHTMLAttributes<HTMLInpu
   return (
     <input
       className={cn(
-        "w-full h-10 rounded-xl border border-line bg-raised px-3.5 text-[13px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition",
+        "w-full h-10 rounded-xl border border-line bg-raised px-3.5 text-[16px] sm:text-[13px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition",
         className
       )}
       {...rest}
@@ -363,7 +370,7 @@ export function Select({ className, children, ...rest }: React.SelectHTMLAttribu
   return (
     <select
       className={cn(
-        "w-full h-10 rounded-xl border border-line bg-raised px-3 text-[13px] text-ink focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition cursor-pointer",
+        "w-full h-10 rounded-xl border border-line bg-raised px-3 text-[16px] sm:text-[13px] text-ink focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition cursor-pointer",
         className
       )}
       {...rest}
@@ -648,6 +655,9 @@ export function SignalGauge({ rsrp, sinr, rat }: { rsrp: number | null; sinr: nu
 
 /* ───────────────────────── Overlays ───────────────────────── */
 
+const FOCUSABLE_SELECTOR =
+  'a[href], area[href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), iframe, object, embed, [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+
 const modalStack: string[] = [];
 
 export function Modal({
@@ -688,9 +698,31 @@ export function Modal({
     });
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && modalStack[modalStack.length - 1] === modalId) {
+      if (modalStack[modalStack.length - 1] !== modalId) return;
+      if (e.key === "Escape") {
         e.stopPropagation();
         onCloseRef.current();
+      } else if (e.key === "Tab") {
+        const container = dialogRef.current;
+        if (!container) return;
+        const focusables = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+        if (focusables.length === 0) {
+          e.preventDefault();
+          container.focus();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const activeEl = document.activeElement;
+        if (e.shiftKey) {
+          if (activeEl === first || activeEl === container || !container.contains(activeEl)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else if (activeEl === last || !container.contains(activeEl)) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -720,7 +752,7 @@ export function Modal({
       <div
         ref={dialogRef}
         tabIndex={-1}
-        className="qm-card qm-dialog qm-rise w-full max-w-md max-h-[90vh] overflow-y-auto p-6 shadow-[var(--qm-shadow-pop)] focus:outline-none"
+        className="qm-card qm-dialog qm-rise w-full max-w-md max-h-[90vh] overflow-y-auto px-6 pt-6 pb-[calc(1.25rem+env(safe-area-inset-bottom))] sm:p-6 shadow-[var(--qm-shadow-pop)] focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-2">
@@ -748,7 +780,7 @@ export function ToastViewport() {
   const resume = useToastStore((s) => s.resume);
   if (toasts.length === 0) return null;
   return (
-    <div className="fixed bottom-20 lg:bottom-5 right-0 lg:right-5 z-[70] flex flex-col gap-2 max-w-sm w-full pointer-events-none px-4 lg:px-0">
+    <div className="fixed bottom-[calc(4.75rem+env(safe-area-inset-bottom))] lg:bottom-5 right-0 lg:right-5 z-[70] flex flex-col gap-2 max-w-sm w-full pointer-events-none px-4 lg:px-0">
       {toasts.map((t) => (
         <div
           key={t.id}

@@ -73,7 +73,7 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
   }
 
   return (
-    <div className="min-h-screen lg:grid lg:grid-cols-2">
+    <div className="flex flex-col min-h-screen lg:grid lg:grid-cols-2">
       {/* ── Signal panel ─────────────────────────────────────────── */}
       <section className="relative overflow-hidden qm-sun-ink qm-grain text-on-ember px-6 py-8 sm:px-10 lg:px-14 lg:py-12 flex flex-col">
         <div aria-hidden className="pointer-events-none absolute -bottom-48 -left-32 h-[520px] w-[520px] rounded-full bg-ember/25 blur-3xl" />
@@ -138,7 +138,7 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
       </section>
 
       {/* ── Sign-in ──────────────────────────────────────────────── */}
-      <section className="flex flex-col px-6 py-10 sm:px-10 lg:px-16">
+      <section className="order-first lg:order-none flex flex-col px-6 py-10 sm:px-10 lg:px-16">
         <div className="flex justify-end">
           <Button variant="ghost" size="sm" className="px-2.5" onClick={onToggleTheme} aria-label="Toggle light or dark mode">
             {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -161,11 +161,11 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
                   id="qm-password"
                   type={showPassword ? "text" : "password"}
                   autoComplete="current-password"
-                  autoFocus
+                  autoFocus={typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(min-width: 1024px)").matches}
                   placeholder="Root password"
                   value={password}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
-                  className="h-11 pl-10 pr-11 text-[14px]"
+                  className="h-11 pl-10 pr-11 text-[16px] sm:text-[14px]"
                   aria-invalid={Boolean(error)}
                   aria-describedby={error ? "qm-login-error" : undefined}
                 />
@@ -204,7 +204,7 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
                 title={sk.hint}
                 aria-pressed={skin === sk.id}
                 className={cn(
-                  "rounded-xl border px-2 py-2 text-[11.5px] font-bold transition cursor-pointer",
+                  "min-w-0 truncate rounded-xl border px-2 py-2 text-[11.5px] font-bold transition cursor-pointer",
                   skin === sk.id ? "border-ember bg-ember-soft text-ember-ink" : "border-line text-muted hover:text-ink"
                 )}
               >

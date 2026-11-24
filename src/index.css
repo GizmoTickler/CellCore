@@ -1164,6 +1164,18 @@
     font-size: 14px;
   }
 
+  @media (hover: none), (pointer: coarse) {
+    body {
+      background-attachment: scroll;
+    }
+  }
+
+  @supports (-webkit-touch-callout: none) {
+    body {
+      background-attachment: scroll;
+    }
+  }
+
   ::selection {
     background: color-mix(in oklab, var(--qm-ember) 28%, transparent);
   }

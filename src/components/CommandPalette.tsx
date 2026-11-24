@@ -196,7 +196,7 @@ function CommandPaletteDialog({
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={onKey}
             placeholder="Jump to a page, setting or action…"
-            className="h-14 w-full bg-transparent text-[15px] text-ink placeholder:text-muted focus:outline-none"
+            className="h-14 w-full bg-transparent text-[16px] sm:text-[15px] text-ink placeholder:text-muted focus:outline-none"
             aria-label="Search commands"
           />
           <Kbd>esc</Kbd>

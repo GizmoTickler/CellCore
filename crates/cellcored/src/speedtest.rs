@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     os::fd::AsRawFd,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -367,7 +367,7 @@ async fn native_dl_worker(
     let req = format!(
         "GET /__down?measId={meas_id}&bytes={NATIVE_DL_CHUNK_BYTES} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
     );
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     while !*stop_rx.borrow() {
         // 1 MiB SO_RCVBUF per stream × 8 streams = 8 MiB aggregate window (saturates 1.5+ Gbps
         // without over-filling carrier RLC queues and spiking loaded latency).
@@ -437,11 +437,7 @@ async fn native_dl_worker(
     }
 }
 
-static NATIVE_UL_PAYLOAD: OnceLock<Vec<u8>> = OnceLock::new();
-
-fn native_ul_payload() -> &'static [u8] {
-    NATIVE_UL_PAYLOAD.get_or_init(|| vec![0x5Au8; 128 * 1024])
-}
+const NATIVE_UL_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 fn read_tcp_bytes_acked(fd: std::os::fd::RawFd) -> Option<u64> {
@@ -481,13 +477,13 @@ async fn native_ul_worker(
     host: String,
     meas_id: u64,
     bypass_dev: Option<String>,
+    payload: Arc<[u8]>,
     bytes_total: Arc<AtomicU64>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let header = format!(
         "POST /__up?measId={meas_id} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nContent-Type: application/octet-stream\r\nContent-Length: {NATIVE_UL_CHUNK_BYTES}\r\nConnection: keep-alive\r\n\r\n"
     );
-    let payload = native_ul_payload();
     while !*stop_rx.borrow() {
         // Keep SO_SNDBUF bounded (128 KiB per stream) so cellular uploads don't
         // experience fake initial buffer-fill spikes followed by drain stalls.
@@ -995,6 +991,11 @@ async fn run_native_transfer_phase(
     } else {
         NATIVE_UL_STREAMS
     };
+    let ul_payload: Option<Arc<[u8]>> = if phase == "download" {
+        None
+    } else {
+        Some(vec![0x5Au8; NATIVE_UL_PAYLOAD_BYTES].into())
+    };
     let mut workers = JoinSet::new();
     for _ in 0..streams {
         let b = Arc::clone(&bytes_total);
@@ -1004,7 +1005,8 @@ async fn run_native_transfer_phase(
         if phase == "download" {
             workers.spawn(native_dl_worker(addr, h, meas_id, dev, b, rx));
         } else {
-            workers.spawn(native_ul_worker(addr, h, meas_id, dev, b, rx));
+            let payload = Arc::clone(ul_payload.as_ref().expect("upload payload initialized"));
+            workers.spawn(native_ul_worker(addr, h, meas_id, dev, payload, b, rx));
         }
     }
     workers.spawn(native_loaded_ping_worker(

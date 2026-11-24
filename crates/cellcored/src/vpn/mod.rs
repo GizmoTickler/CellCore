@@ -22,7 +22,7 @@ mod warp;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Mutex, RwLock,
+        Mutex, OnceLock, RwLock,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -70,6 +70,7 @@ pub(crate) fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
 }
 
 pub use policy::{BYPASS_MARK, Mode};
+pub use tailscale::cached_pulse as cached_tailscale_pulse;
 
 /// `/api/v1/vpn/...`; merged into the protected router in `http.rs`.
 /// (Kept above every test-only item: the route-enumeration test scans
@@ -135,6 +136,9 @@ pub fn paths() -> Paths {
 pub fn set_paths(p: Option<Paths>) {
     if let Ok(mut g) = PATHS.write() {
         *g = p;
+    }
+    if let Ok(mut g) = warp_state_cache().write() {
+        *g = None;
     }
 }
 
@@ -212,19 +216,44 @@ impl WarpState {
     }
 }
 
+static WARP_STATE_CACHE: OnceLock<RwLock<Option<(PathBuf, WarpState)>>> = OnceLock::new();
+
+fn warp_state_cache() -> &'static RwLock<Option<(PathBuf, WarpState)>> {
+    WARP_STATE_CACHE.get_or_init(|| RwLock::new(None))
+}
+
 pub fn state_file() -> PathBuf {
     paths().state.join("warp.json")
 }
 
 pub fn load_state() -> WarpState {
-    std::fs::read(state_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let p = state_file();
+    if let Ok(g) = warp_state_cache().read()
+        && let Some((cached_path, cached_state)) = g.as_ref()
+        && *cached_path == p
+    {
+        return cached_state.clone();
+    }
+    let st: WarpState = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    MODE.store(mode_code(st.policy), Ordering::Relaxed);
+    if let Ok(mut g) = warp_state_cache().write() {
+        *g = Some((p, st.clone()));
+    }
+    st
 }
 
 pub fn save_state(st: &WarpState) -> Result<(), String> {
     ensure_state_dir()?;
+    let p = state_file();
     let json = serde_json::to_vec_pretty(st).map_err(|e| e.to_string())?;
-    crate::state::atomic_write(&state_file(), &json, 0o600)?;
+    crate::state::atomic_write(&p, &json, 0o600)?;
     MODE.store(mode_code(st.policy), Ordering::Relaxed);
+    if let Ok(mut g) = warp_state_cache().write() {
+        *g = Some((p, st.clone()));
+    }
     Ok(())
 }
 

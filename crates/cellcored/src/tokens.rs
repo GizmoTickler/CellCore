@@ -411,10 +411,7 @@ impl TokenStore {
         crate::state::atomic_write(p, &json, 0o600)
     }
 
-    fn persist_tmp_usage(&self, tokens: &[TokenRecord]) {
-        if self.path.is_none() {
-            return;
-        }
+    fn build_tmp_usage_json(tokens: &[TokenRecord]) -> Option<Vec<u8>> {
         let mut map = HashMap::with_capacity(tokens.len());
         for t in tokens {
             if t.last_used_at.is_some() || t.last_used_ip.is_some() {
@@ -427,23 +424,37 @@ impl TokenStore {
                 );
             }
         }
-        if let Ok(json) = serde_json::to_vec(&map) {
+        serde_json::to_vec(&map).ok()
+    }
+
+    fn persist_tmp_usage(&self, tokens: &[TokenRecord]) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Some(json) = Self::build_tmp_usage_json(tokens) {
             let tmp_p = crate::paths::p(TOKEN_USAGE_TMP_PATH);
-            let _ = crate::state::atomic_write(Path::new(&tmp_p), &json, 0o600);
+            let _ = crate::state::atomic_write_tmpfs(Path::new(&tmp_p), &json, 0o600);
         }
     }
 
     /// Flush in-memory `last_used_at` / `last_used_ip` metadata to `/etc/cellcore/api_tokens.json`
     /// on clean shutdown (`SIGTERM` / reboot).
     pub fn flush_tokens_usage(&self) {
-        let mut g = lock(&self.inner);
-        if !g.usage_dirty || self.path.is_none() {
+        if self.path.is_none() {
             return;
         }
-        if self.persist(&g.tokens).is_ok() {
+        let snapshot = {
+            let g = lock(&self.inner);
+            if !g.usage_dirty {
+                return;
+            }
+            g.tokens.clone()
+        };
+        if self.persist(&snapshot).is_ok() {
+            let mut g = lock(&self.inner);
             g.usage_dirty = false;
         }
-        self.persist_tmp_usage(&g.tokens);
+        self.persist_tmp_usage(&snapshot);
     }
 
     pub fn list(&self) -> Vec<TokenInfo> {
@@ -496,33 +507,47 @@ impl TokenStore {
     }
 
     pub fn revoke(&self, id: &str) -> Result<Option<String>, String> {
-        let mut g = lock(&self.inner);
-        let Some(pos) = g.tokens.iter().position(|t| t.id == id) else { return Ok(None) };
-        let removed = g.tokens.remove(pos);
-        if let Err(e) = self.persist(&g.tokens) {
-            g.tokens.insert(pos, removed);
-            return Err(e);
+        let (removed_name, tmp_json) = {
+            let mut g = lock(&self.inner);
+            let Some(pos) = g.tokens.iter().position(|t| t.id == id) else { return Ok(None) };
+            let removed = g.tokens.remove(pos);
+            if let Err(e) = self.persist(&g.tokens) {
+                g.tokens.insert(pos, removed);
+                return Err(e);
+            }
+            g.usage_dirty = false;
+            let tmp_json = self.path.is_some().then(|| Self::build_tmp_usage_json(&g.tokens)).flatten();
+            (removed.name, tmp_json)
+        };
+        if let Some(json) = tmp_json {
+            let tmp_p = crate::paths::p(TOKEN_USAGE_TMP_PATH);
+            let _ = crate::state::atomic_write_tmpfs(Path::new(&tmp_p), &json, 0o600);
         }
-        g.usage_dirty = false;
-        self.persist_tmp_usage(&g.tokens);
-        Ok(Some(removed.name))
+        Ok(Some(removed_name))
     }
 
     /// Revoke every stored API token (e.g. on root password reset).
     /// Returns the number of tokens revoked.
     pub fn revoke_all(&self) -> Result<usize, String> {
-        let mut g = lock(&self.inner);
-        let count = g.tokens.len();
-        if count == 0 {
-            return Ok(0);
+        let (count, tmp_json) = {
+            let mut g = lock(&self.inner);
+            let count = g.tokens.len();
+            if count == 0 {
+                return Ok(0);
+            }
+            let prev = std::mem::take(&mut g.tokens);
+            if let Err(e) = self.persist(&g.tokens) {
+                g.tokens = prev;
+                return Err(e);
+            }
+            g.usage_dirty = false;
+            let tmp_json = self.path.is_some().then(|| Self::build_tmp_usage_json(&g.tokens)).flatten();
+            (count, tmp_json)
+        };
+        if let Some(json) = tmp_json {
+            let tmp_p = crate::paths::p(TOKEN_USAGE_TMP_PATH);
+            let _ = crate::state::atomic_write_tmpfs(Path::new(&tmp_p), &json, 0o600);
         }
-        let prev = std::mem::take(&mut g.tokens);
-        if let Err(e) = self.persist(&g.tokens) {
-            g.tokens = prev;
-            return Err(e);
-        }
-        g.usage_dirty = false;
-        self.persist_tmp_usage(&g.tokens);
         Ok(count)
     }
 
@@ -577,11 +602,18 @@ impl TokenStore {
             kind: t.kind,
         };
         g.usage_dirty = true;
-        if g.last_tmp_flush
+        let tmp_json = if g.last_tmp_flush
             .is_none_or(|l| now_mono.saturating_duration_since(l) >= Duration::from_secs(LAST_USED_TMP_PERSIST_SECS))
         {
             g.last_tmp_flush = Some(now_mono);
-            self.persist_tmp_usage(&g.tokens);
+            self.path.is_some().then(|| Self::build_tmp_usage_json(&g.tokens)).flatten()
+        } else {
+            None
+        };
+        drop(g);
+        if let Some(json) = tmp_json {
+            let tmp_p = crate::paths::p(TOKEN_USAGE_TMP_PATH);
+            let _ = crate::state::atomic_write_tmpfs(Path::new(&tmp_p), &json, 0o600);
         }
         Ok(auth)
     }

@@ -118,12 +118,12 @@ pub fn start_job(package: &str, action: &str) -> Result<Job, String> {
     let mut job = Job { state: "running".into(), package: package.into(), action: action.into(), started_at: started, ..Default::default() };
     let _ = std::fs::create_dir_all(paths().run);
     let _ = std::fs::write(log_file(), b"");
-    crate::state::atomic_write(&job_file(), &serde_json::to_vec(&job).unwrap_or_default(), 0o644)?;
+    crate::state::atomic_write_tmpfs(&job_file(), &serde_json::to_vec(&job).unwrap_or_default(), 0o644)?;
     let jf = job_file().display().to_string();
     let pid = crate::ota::spawn_detached(SCRIPT, &[&jf, &opkg_path(), action, package, &started.to_string()], Path::new(&log_file()))?;
     job.pid = Some(pid);
     if read_job().is_some_and(|j| j.state == "running") {
-        let _ = crate::state::atomic_write(&job_file(), &serde_json::to_vec(&job).unwrap_or_default(), 0o644);
+        let _ = crate::state::atomic_write_tmpfs(&job_file(), &serde_json::to_vec(&job).unwrap_or_default(), 0o644);
     }
     if package.starts_with("tailscale") {
         super::tailscale::forget_flags();

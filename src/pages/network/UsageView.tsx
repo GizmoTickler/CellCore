@@ -69,14 +69,27 @@ function CycleMeter({ cycle }: { cycle: UsageCycle }) {
   );
 }
 
-export function UsageView({ usage, loading }: { usage: DataUsageState | null; loading: boolean }) {
+export function UsageView({ usage: queryUsage, loading }: { usage: DataUsageState | null; loading: boolean }) {
   const qc = useQueryClient();
   const push = useToastStore((s) => s.push);
+  const wsDataUsage = useWsStore((s) => s.dataUsage);
+  const wsUsageSummary = useWsStore((s) => s.usageSummary);
   const setDataUsage = useWsStore((s) => s.setDataUsage);
   const [busy, setBusy] = useState<string | null>(null);
   const [range, setRange] = useState<Range>("14");
   const [picked, setPicked] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+
+  // Merge fresh REST daily/monthly/policy data with live 1 Hz WebSocket summary counters.
+  const usage = useMemo<DataUsageState | null>(() => {
+    const base = queryUsage ?? wsDataUsage;
+    if (!base) return null;
+    const liveSummary = wsUsageSummary ?? base.usageSummary;
+    if (liveSummary && liveSummary !== base.usageSummary) {
+      return { ...base, usageSummary: liveSummary };
+    }
+    return base;
+  }, [queryUsage, wsDataUsage, wsUsageSummary]);
 
   // Billing-cycle accounting is computed by the daemon (local dates, short months, projection).
   const cycleQuery = useQuery({

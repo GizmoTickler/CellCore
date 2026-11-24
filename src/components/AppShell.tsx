@@ -178,10 +178,15 @@ function AppearanceButton({ onClick, compact = false }: { onClick: () => void; c
 }
 
 function AppearanceDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  if (!open) return null;
+  return <AppearanceDialogInner onClose={onClose} />;
+}
+
+function AppearanceDialogInner({ onClose }: { onClose: () => void }) {
   const { skin, setSkin, theme, setTheme, layoutPref, setLayoutPref } = useThemeStore();
   const meta = skinMeta(skin);
   return (
-    <Modal open={open} onClose={onClose} title="Appearance">
+    <Modal open onClose={onClose} title="Appearance">
       <div className="space-y-5">
         <div>
           <div className="qm-eyebrow mb-2">Theme ({SKINS.length})</div>
@@ -359,7 +364,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
 
   useEffect(() => {
     if (!mobileMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
+    const onPointerDown = (e: PointerEvent) => {
       if (mobileMenuRef.current && !mobileMenuRef.current.contains(e.target as Node)) {
         setMobileMenuOpen(false);
       }
@@ -367,10 +372,10 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setMobileMenuOpen(false);
     };
-    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("pointerdown", onPointerDown);
     window.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKey);
     };
   }, [mobileMenuOpen]);

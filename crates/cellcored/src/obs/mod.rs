@@ -54,8 +54,13 @@ pub const OBS_CONFIG_PATH: &str = "/etc/cellcore/observability.json";
 pub const EVENTS_PATH: &str = "/etc/cellcore/events.json";
 /// Periodic flush check interval (monotonic).
 pub const FLUSH_INTERVAL_SECS: u64 = 3600;
-/// Gate hourly `obs_state.json` flash writes on >= 10 MiB delta or >= 24h (eliminating standby NAND wear).
-pub const OBS_FLUSH_MIN_BYTES: u64 = 10 * 1024 * 1024;
+/// Coalesce routine `obs_state.json` & `Info`-only `events.json` flash writes to 6 hours
+/// (cutting UBIFS NAND wear ~10x while keeping immediate/hourly flushes for `state_dirty`
+/// and `Warning`/`Critical` events, plus clean shutdown).
+pub const OBS_PERIODIC_FLUSH_SECS: u64 = 6 * 3600;
+pub const EVENTS_INFO_FLUSH_SECS: u64 = 6 * 3600;
+/// Gate periodic `obs_state.json` flash writes on >= 512 MiB delta or >= 24h (eliminating standby NAND wear).
+pub const OBS_FLUSH_MIN_BYTES: u64 = 512 * 1024 * 1024;
 pub const OBS_FLUSH_MAX_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Poison-tolerant lock: a panic is an abort in release builds, so a
@@ -92,6 +97,7 @@ pub struct Obs {
     pub state_dirty: AtomicBool,
     last_flushed: Mutex<Option<PersistedObs>>,
     last_state_flush_mono_ms: AtomicU64,
+    last_events_flush_mono_ms: AtomicU64,
     pub config: Mutex<config::ObsConfig>,
     pub events: Mutex<events::EventStore>,
     pub detector: Mutex<events::SnapshotDetector>,
@@ -106,6 +112,7 @@ static OBS: LazyLock<Obs> = LazyLock::new(|| Obs {
     state_dirty: AtomicBool::new(false),
     last_flushed: Mutex::new(None),
     last_state_flush_mono_ms: AtomicU64::new(0),
+    last_events_flush_mono_ms: AtomicU64::new(0),
     config: Mutex::new(config::ObsConfig::default()),
     events: Mutex::new(events::EventStore::default()),
     detector: Mutex::new(events::SnapshotDetector::default()),
@@ -189,8 +196,9 @@ pub fn start(state: &AppState) {
     *lock(&OBS.last_flushed) = disk_baseline;
     *lock(&OBS.persisted) = prev;
     OBS.state_dirty.store(dirty_at_start, Ordering::Relaxed);
-    OBS.last_state_flush_mono_ms
-        .store(mono_ms(), Ordering::Release);
+    let now_m = mono_ms();
+    OBS.last_state_flush_mono_ms.store(now_m, Ordering::Release);
+    OBS.last_events_flush_mono_ms.store(now_m, Ordering::Release);
 
     emit(
         EventKind::DaemonStart,
@@ -217,21 +225,33 @@ pub fn flush_now(clean_shutdown: bool) {
     flush_impl(true, clean_shutdown, mono_ms());
 }
 
-/// Hourly periodic flush: gates `obs_state.json` flash writes on `state_dirty`
-/// (episode/OTA/boot_reason), `>= 10 MiB` traffic delta, or `>= 24h` elapsed,
-/// eliminating 8,760 standby writes/year on UBIFS flash.
+/// Periodic flush:
+/// - `events.json`: flushes hourly when any `Warning`/`Critical` event arrived, or every 6 h
+///   for routine `Info` events (`CaChange`/`Handover`), plus always on clean shutdown.
+/// - `obs_state.json`: flushes immediately/hourly when `state_dirty` (failover episode, OTA,
+///   cycle rollover, boot_reason, shutdown), otherwise coalesced to every 6 h when `>= 512 MiB`
+///   delta (or `>= 24 h` elapsed), eliminating routine UBIFS NAND wear.
 pub fn flush_periodic() {
     flush_impl(false, false, mono_ms());
 }
 
 fn flush_impl(force: bool, clean_shutdown: bool, now_mono_ms: u64) {
+    let last_ev_ms = OBS.last_events_flush_mono_ms.load(Ordering::Acquire);
+    let ev_elapsed_secs = if last_ev_ms == 0 {
+        EVENTS_INFO_FLUSH_SECS
+    } else {
+        now_mono_ms.saturating_sub(last_ev_ms) / 1000
+    };
+    let allow_info_flush = ev_elapsed_secs >= EVENTS_INFO_FLUSH_SECS;
     let snapshot = {
         let mut ev = lock(&OBS.events);
-        let dirty = ev.take_dirty();
-        dirty.then(|| ev.to_stored())
+        ev.take_flush_snapshot(force || clean_shutdown, allow_info_flush)
     };
-    if let Some(stored) = snapshot {
-        let _ = save_json_compact_atomic(EVENTS_PATH, &stored, 0o600);
+    if let Some(stored) = snapshot
+        && save_json_compact_atomic(EVENTS_PATH, &stored, 0o600).is_ok()
+    {
+        OBS.last_events_flush_mono_ms
+            .store(now_mono_ms, Ordering::Release);
     }
     let maybe_state = {
         let mut p = lock(&OBS.persisted);
@@ -266,7 +286,7 @@ fn flush_impl(force: bool, clean_shutdown: bool, now_mono_ms: u64) {
             let should_write = force
                 || clean_shutdown
                 || flagged
-                || byte_delta >= OBS_FLUSH_MIN_BYTES
+                || (elapsed_secs >= OBS_PERIODIC_FLUSH_SECS && byte_delta >= OBS_FLUSH_MIN_BYTES)
                 || elapsed_secs >= OBS_FLUSH_MAX_INTERVAL_SECS;
             if should_write {
                 OBS.take_state_dirty();
@@ -333,21 +353,41 @@ async fn run_obs_loop(state: AppState) {
             failover::broadcast_status();
         }
         if tick.is_multiple_of(30) {
-            let usage = state.data_usage.read().await.clone();
-            usage_cycle::check_alerts(&usage, now);
+            let (today, secs) = usage_cycle::local_now();
+            let (cycle, used, quota_bytes, monthly_seed) = {
+                let u = state.data_usage.read().await;
+                let cycle = usage_cycle::cycle_bounds(today, u.billing_cycle_day);
+                let (rx, tx) = usage_cycle::sum_days(&u.daily, cycle.start, today);
+                let need_seed = !lock(&OBS.persisted).lifetime_seeded;
+                let seed = need_seed.then(|| {
+                    (
+                        u.monthly.iter().map(|m| m.rx_bytes).sum(),
+                        u.monthly.iter().map(|m| m.tx_bytes).sum(),
+                    )
+                });
+                (cycle, rx.saturating_add(tx), u.quota_bytes, seed)
+            };
+            usage_cycle::check_alerts_scalars(today, secs, cycle, used, quota_bytes, monthly_seed, now);
+
+            let sms_interval_secs = {
+                let cfg = lock(&OBS.config);
+                cfg.notify
+                    .sms_forward
+                    .enabled
+                    .then_some(cfg.notify.sms_forward.interval_secs)
+            };
+            if let Some(interval_secs) = sms_interval_secs
+                && (last_sms_ms == 0
+                    || now_m.saturating_sub(last_sms_ms)
+                        >= interval_secs.max(notify::SMS_MIN_INTERVAL_SECS) * 1000)
+            {
+                last_sms_ms = now_m;
+                notify::sms_forward_tick(&state).await;
+            }
         }
         if tick.is_multiple_of(60) {
             failover::check_deferred_reboot(&state, now).await;
             events::check_ota_status();
-        }
-        let sms = lock(&OBS.config).notify.sms_forward.clone();
-        if sms.enabled
-            && (last_sms_ms == 0
-                || now_m.saturating_sub(last_sms_ms)
-                    >= sms.interval_secs.max(notify::SMS_MIN_INTERVAL_SECS) * 1000)
-        {
-            last_sms_ms = now_m;
-            notify::sms_forward_tick(&state).await;
         }
         if now_m.saturating_sub(last_flush_ms) >= FLUSH_INTERVAL_SECS * 1000 {
             last_flush_ms = now_m;
@@ -406,5 +446,32 @@ mod tests {
         set_boot_reason("manual reboot");
         flush_now(false);
         assert!(state_file.exists(), "dirty state must write obs_state.json");
+    }
+
+    #[test]
+    fn events_info_waits_6h_while_warning_flushes_on_periodic_tick() {
+        let mut store = events::EventStore::default();
+        store.push(
+            EventKind::CaChange,
+            Severity::Info,
+            "CA changed".into(),
+            serde_json::json!({}),
+            100,
+        );
+        // Routine Info event does NOT flush before 6h window.
+        assert!(store.take_flush_snapshot(false, false).is_none());
+        // After 6h window (`allow_info_flush = true`), it flushes.
+        assert!(store.take_flush_snapshot(false, true).is_some());
+        assert!(store.take_flush_snapshot(false, true).is_none());
+
+        // Warning/Critical event flushes immediately on periodic tick even before 6h.
+        store.push(
+            EventKind::ThermalThrottle,
+            Severity::Warning,
+            "Thermal throttle".into(),
+            serde_json::json!({}),
+            200,
+        );
+        assert!(store.take_flush_snapshot(false, false).is_some());
     }
 }

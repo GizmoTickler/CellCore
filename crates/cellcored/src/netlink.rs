@@ -5,6 +5,7 @@ use std::{
     io, mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::Mutex,
 };
 
 use serde::Serialize;
@@ -349,13 +350,28 @@ fn send_recv_netlink(req: &[u8]) -> Result<NlFrames, String> {
     send_recv_netlink_errno(req).map_err(|(_, msg)| msg)
 }
 
-fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
-    let fd = open_netlink_route().map_err(|e| (None, e))?;
+struct NetlinkSocketPool {
+    fd: Option<OwnedFd>,
+    buf: Vec<u8>,
+}
+
+static NL_POOL: Mutex<NetlinkSocketPool> = Mutex::new(NetlinkSocketPool {
+    fd: None,
+    buf: Vec::new(),
+});
+
+const NL_RECV_BUF_LEN: usize = 32768;
+
+fn send_recv_netlink_once(
+    raw_fd: libc::c_int,
+    buf: &mut [u8],
+    req: &[u8],
+) -> Result<NlFrames, (bool /* transport_broken */, NlErrno)> {
     let mut sa: libc::sockaddr_nl = unsafe { mem::zeroed() };
     sa.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     let sent = unsafe {
         libc::sendto(
-            fd.as_raw_fd(),
+            raw_fd,
             req.as_ptr() as *const libc::c_void,
             req.len(),
             0,
@@ -364,16 +380,16 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
         )
     };
     if sent < 0 {
-        return Err((None, format!("sendto(AF_NETLINK): {}", io::Error::last_os_error())));
+        let e = io::Error::last_os_error();
+        return Err((true, (e.raw_os_error(), format!("sendto(AF_NETLINK): {e}"))));
     }
 
     let hdr_len = mem::size_of::<NlMsgHdr>();
     let mut frames = Vec::new();
-    let mut buf = vec![0u8; 32768];
     loop {
         let n = unsafe {
             libc::recv(
-                fd.as_raw_fd(),
+                raw_fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
                 0,
@@ -384,7 +400,7 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err((e.raw_os_error(), format!("recv(AF_NETLINK): {e}")));
+            return Err((true, (e.raw_os_error(), format!("recv(AF_NETLINK): {e}"))));
         }
         if n == 0 {
             break;
@@ -397,7 +413,7 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
             let nlmsg_type = u16::from_ne_bytes([slice[4], slice[5]]);
             let nlmsg_flags = u16::from_ne_bytes([slice[6], slice[7]]);
             if nlmsg_len < hdr_len || nlmsg_len > slice.len() {
-                return Err((None, "malformed netlink message length".into()));
+                return Err((true, (None, "malformed netlink message length".into())));
             }
             if (nlmsg_flags & NLM_F_MULTI_BIT) != 0 {
                 saw_multi = true;
@@ -410,7 +426,7 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
                 }
                 NLMSG_ERR_TYPE => {
                     if payload.len() < 4 {
-                        return Err((None, "truncated NLMSG_ERROR".into()));
+                        return Err((true, (None, "truncated NLMSG_ERROR".into())));
                     }
                     let err_code = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     if err_code == 0 {
@@ -418,7 +434,7 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
                         break;
                     }
                     let raw = -err_code;
-                    return Err((Some(raw), io::Error::from_raw_os_error(raw).to_string()));
+                    return Err((false, (Some(raw), io::Error::from_raw_os_error(raw).to_string())));
                 }
                 other => {
                     frames.push((other, payload.to_vec()));
@@ -435,6 +451,35 @@ fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
         }
     }
     Ok(frames)
+}
+
+fn send_recv_netlink_errno(req: &[u8]) -> Result<NlFrames, NlErrno> {
+    let mut pool = NL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.buf.len() < NL_RECV_BUF_LEN {
+        pool.buf.resize(NL_RECV_BUF_LEN, 0);
+    }
+    for attempt in 0..2 {
+        let reopened = pool.fd.is_none();
+        if reopened {
+            let fd = open_netlink_route().map_err(|e| (None, e))?;
+            pool.fd = Some(fd);
+        }
+        let raw_fd = pool.fd.as_ref().expect("netlink fd initialized").as_raw_fd();
+        match send_recv_netlink_once(raw_fd, &mut pool.buf, req) {
+            Ok(frames) => return Ok(frames),
+            Err((true, err)) => {
+                // Socket may be stale/broken (EBADF, ENOBUFS, partial stream); drop and
+                // transparently recreate once if this came from a reused socket.
+                pool.fd = None;
+                if attempt == 0 && !reopened {
+                    continue;
+                }
+                return Err(err);
+            }
+            Err((false, err)) => return Err(err),
+        }
+    }
+    unreachable!()
 }
 
 pub(crate) fn parse_link_payload(payload: &[u8]) -> Option<NetlinkLink> {

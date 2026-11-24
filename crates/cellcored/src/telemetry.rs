@@ -48,6 +48,11 @@ static ALIGN_KEEP_AWAKE_MS: AtomicU64 = AtomicU64::new(0);
 static ALIGN_KEEP_AWAKE_SEQ: AtomicU64 = AtomicU64::new(1);
 static ALIGN_KEEP_AWAKE_INFLIGHT: AtomicBool = AtomicBool::new(false);
 static ALIGN_BEAM_ID_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+static COMPOUND_RF_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+pub fn reset_compound_rf_cache() {
+    COMPOUND_RF_UNSUPPORTED.store(false, Ordering::Relaxed);
+}
 
 const ALIGN_KEEP_AWAKE_INTERVAL_MS: u64 = 1000;
 const ALIGN_KEEP_AWAKE_HOST: &str = "speed.cloudflare.com";
@@ -60,8 +65,8 @@ pub const DATA_USAGE_PATH: &str = "/etc/cellcore/data_usage.json";
 pub const DATA_USAGE_TMP_PATH: &str = "/tmp/cellcore/data_usage.json";
 pub const DATA_USAGE_SNAPSHOT_FLUSH_SECS: u64 = 300;
 pub const DATA_USAGE_ETC_FLUSH_SECS: u64 = 6 * 3600;
-pub const DATA_USAGE_ETC_FLUSH_BYTES: u64 = 50 * 1024 * 1024;
-pub const DATA_USAGE_ETC_MIN_DEBOUNCE_SECS: u64 = 300;
+pub const DATA_USAGE_ETC_FLUSH_BYTES: u64 = 512 * 1024 * 1024;
+pub const DATA_USAGE_ETC_MIN_DEBOUNCE_SECS: u64 = 3600;
 pub const CELL_LOCK_BYPASS_TMP_PATH: &str = "/tmp/cellcore/cell_lock_bypassed.json";
 
 pub const LIVENESS_WATCHDOG_CHECK_SECS: u64 = 30;
@@ -967,13 +972,17 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         }
     });
 
-    // 3. 1s /proc/net/dev + persistent data usage + 2s/10s memory/uptime/internals poller + eth0 auto-heal
+    // 3. 1s /proc/net/dev + persistent data usage + 2s/10s fast vitals + 30s slow vitals + eth0 auto-heal
     let st_net = state.clone();
     tokio::spawn(async move {
         let mut prev_samples: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+        let mut operstate_cache: HashMap<String, String> = HashMap::new();
+        let mut last_operstate_refresh: Option<Instant> = None;
         let mut prev_inst = Instant::now();
         let mut usage_tracker = UsageFlushTracker::new_at_boot(prev_inst);
         let mut last_vitals: Option<Instant> = None;
+        let mut last_slow_vitals: Option<Instant> = None;
+        let mut slow_vitals_cache = SlowVitalsCache::default();
         let mut last_wan_check: Option<Instant> = None;
         let mut cached_slot = String::from("_a");
         let mut boot_slot_loaded = false;
@@ -988,7 +997,21 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
             let elapsed_secs = now_inst.duration_since(prev_inst).as_secs_f64().max(0.2);
             prev_inst = now_inst;
 
-            poll_network_and_usage(&st_net, &mut prev_samples, elapsed_secs, &mut usage_tracker, now_inst).await;
+            let refresh_operstate = last_operstate_refresh
+                .is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(5));
+            if refresh_operstate {
+                last_operstate_refresh = Some(now_inst);
+            }
+            poll_network_and_usage(
+                &st_net,
+                &mut prev_samples,
+                &mut operstate_cache,
+                refresh_operstate,
+                elapsed_secs,
+                &mut usage_tracker,
+                now_inst,
+            )
+            .await;
 
             let vitals_period = if st_net.ws_tx.receiver_count() > 0 {
                 Duration::from_secs(2)
@@ -997,6 +1020,11 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
             };
             if last_vitals.is_none_or(|t| now_inst.saturating_duration_since(t) >= vitals_period) {
                 last_vitals = Some(now_inst);
+                let refresh_slow = last_slow_vitals
+                    .is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(30));
+                if refresh_slow {
+                    last_slow_vitals = Some(now_inst);
+                }
                 if !boot_slot_loaded {
                     boot_slot_loaded = true;
                     if let Ok(slot) = run_cmd("abctl", &["--boot_slot"], Duration::from_secs(2)).await {
@@ -1020,6 +1048,8 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                     &st_net,
                     &cached_slot,
                     cached_wan_up.clone(),
+                    refresh_slow,
+                    &mut slow_vitals_cache,
                     &mut eth_degraded_since,
                     &mut last_eth_reneg,
                 )
@@ -1049,19 +1079,44 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
 
         loop {
             st_icmp.hb_linkwatch_ms.store(mono_ms(), Ordering::Release);
-            let cfg = st_icmp.settings.read().await.clone();
             let now_inst = Instant::now();
-            let ping_period = if cfg.keep_alive_enabled {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_secs(cfg.ping_interval_sec.clamp(2, 60))
+            let (
+                ping_enabled,
+                ping_period,
+                preferred_sim_slot,
+                sim_failback_mins,
+                qw_enabled,
+                qw_interval_sec,
+                qw_high_latency,
+                qw_latency_ceiling,
+                qw_max_retries,
+                qw_failures,
+            ) = {
+                let s = st_icmp.settings.read().await;
+                let period = if s.keep_alive_enabled {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(s.ping_interval_sec.clamp(2, 60))
+                };
+                (
+                    s.ping_enabled,
+                    period,
+                    s.preferred_sim_slot,
+                    s.sim_failback_mins,
+                    s.quecwatch_enabled,
+                    s.quecwatch_interval_sec,
+                    s.quecwatch_high_latency,
+                    s.quecwatch_latency_ceiling,
+                    s.quecwatch_max_retries,
+                    s.quecwatch_failures,
+                )
             };
-            if cfg.ping_enabled
+            if ping_enabled
                 && last_ping.is_none_or(|t| now_inst.saturating_duration_since(t) >= ping_period)
             {
                 last_ping = Some(now_inst);
                 seq = seq.wrapping_add(1).max(1);
-                let host = cfg.ping_host.clone();
+                let host = st_icmp.settings.read().await.ping_host.clone();
                 let res = icmp_ping_once(&host, seq).await;
                 let ts_ms = now_secs() * 1000;
                 let pt = match res {
@@ -1119,12 +1174,19 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
             }
 
             // Preferred SIM failback (monotonic timer, skipped during active failover)
-            tick_preferred_sim_failback(&st_icmp, &cfg, &mut non_preferred_sim_since, Instant::now()).await;
+            tick_preferred_sim_failback(
+                &st_icmp,
+                preferred_sim_slot,
+                sim_failback_mins,
+                &mut non_preferred_sim_since,
+                Instant::now(),
+            )
+            .await;
 
             // LinkWatch monitoring cycle (monotonic Instant timers + 45s SIM settle + 900s cooldown)
             let now_wall = now_secs();
             let now_inst = Instant::now();
-            if !cfg.quecwatch_enabled {
+            if !qw_enabled {
                 was_qw_enabled = false;
                 qw_fail_streak = 0;
                 qw_high_lat_streak = 0;
@@ -1143,13 +1205,14 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                 let sim_sw_ms = st_icmp.sim_switched_at_ms.load(Ordering::Acquire);
                 let in_sim_settle =
                     sim_sw_ms > 0 && mono_ms().saturating_sub(sim_sw_ms) < SIM_ATTACH_SETTLE_MS;
-                let probe_interval = Duration::from_secs(cfg.quecwatch_interval_sec.max(15));
+                let probe_interval = Duration::from_secs(qw_interval_sec.max(15));
                 if !in_sim_settle
                     && last_qw_probe.is_none_or(|t| now_inst.saturating_duration_since(t) >= probe_interval)
                 {
                     last_qw_probe = Some(now_inst);
+                    let qw_target = st_icmp.settings.read().await.quecwatch_target.clone();
                     let ipv6_only = is_bearer_ipv6_only(&st_icmp).await;
-                    let targets = linkwatch_probe_targets(&cfg.quecwatch_target, ipv6_only);
+                    let targets = linkwatch_probe_targets(&qw_target, ipv6_only);
                     let mut res: Result<(String, f64), String> = Err("No LinkWatch targets".into());
                     for tgt in &targets {
                         seq = seq.wrapping_add(1).max(1);
@@ -1169,7 +1232,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                             qw_retries = 0;
                             last_qw_cooldown_try = None;
                             let rtt_u64 = rtt.round() as u64;
-                            if cfg.quecwatch_high_latency && rtt_u64 > cfg.quecwatch_latency_ceiling {
+                            if qw_high_latency && rtt_u64 > qw_latency_ceiling {
                                 qw_high_lat_streak += 1;
                             } else {
                                 qw_high_lat_streak = 0;
@@ -1186,7 +1249,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                             let mut qw = st_icmp.quecwatch.write().await;
                             qw.current_latency = 0;
                             qw.timestamp = now_wall;
-                            if qw_retries >= cfg.quecwatch_max_retries {
+                            if qw_retries >= qw_max_retries {
                                 qw.status = "cooldown".into();
                                 let anchor = *last_qw_cooldown_try.get_or_insert(now_inst);
                                 if now_inst.saturating_duration_since(anchor)
@@ -1196,10 +1259,11 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                                     let cd_attempt = qw_retries.saturating_add(1);
                                     qw.message = format!(
                                         "Cooldown recovery retry (every 15m after {} retries): {err}",
-                                        cfg.quecwatch_max_retries
+                                        qw_max_retries
                                     );
                                     drop(qw);
-                                    let _ = trigger_quecwatch_recovery(&st_icmp, &cfg, cd_attempt).await;
+                                    let rec_cfg = st_icmp.settings.read().await.clone();
+                                    let _ = trigger_quecwatch_recovery(&st_icmp, &rec_cfg, cd_attempt).await;
                                     qw_fail_streak = 0;
                                 } else {
                                     let rem = LINKWATCH_COOLDOWN_SECS.saturating_sub(
@@ -1209,14 +1273,15 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                                 }
                             } else {
                                 qw.status = "failing".into();
-                                qw.message = format!("Probe failed ({qw_fail_streak}/{}): {err}", cfg.quecwatch_failures);
-                                if qw_fail_streak >= cfg.quecwatch_failures {
+                                qw.message = format!("Probe failed ({qw_fail_streak}/{}): {err}", qw_failures);
+                                if qw_fail_streak >= qw_failures {
                                     qw_retries += 1;
                                     qw.retry = qw_retries;
                                     qw.status = "recovering".into();
-                                    qw.message = format!("Triggering recovery attempt {qw_retries}/{}", cfg.quecwatch_max_retries);
+                                    qw.message = format!("Triggering recovery attempt {qw_retries}/{}", qw_max_retries);
                                     drop(qw);
-                                    if !trigger_quecwatch_recovery(&st_icmp, &cfg, qw_retries).await {
+                                    let rec_cfg = st_icmp.settings.read().await.clone();
+                                    if !trigger_quecwatch_recovery(&st_icmp, &rec_cfg, qw_retries).await {
                                         // Deferred while carrying failover traffic: Route10's
                                         // own watchdog owns recovery; do not burn a retry.
                                         qw_retries -= 1;
@@ -1224,7 +1289,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                                         qw.retry = qw_retries;
                                         qw.status = "failing".into();
                                         qw.message = "Recovery deferred: carrying failover traffic (Route10 handles recovery)".into();
-                                    } else if qw_retries >= cfg.quecwatch_max_retries {
+                                    } else if qw_retries >= qw_max_retries {
                                         last_qw_cooldown_try = Some(Instant::now());
                                     }
                                     qw_fail_streak = 0;
@@ -1470,27 +1535,28 @@ async fn try_verified_sim_switch(state: &AppState, target_slot: u8, reason: &str
 
 async fn tick_preferred_sim_failback(
     state: &AppState,
-    cfg: &crate::state::DaemonSettings,
+    preferred_sim_slot: u8,
+    sim_failback_mins: u64,
     non_preferred_since: &mut Option<Instant>,
     now: Instant,
 ) {
-    if !(1..=2).contains(&cfg.preferred_sim_slot) || crate::obs::failover::is_active() {
+    if !(1..=2).contains(&preferred_sim_slot) || crate::obs::failover::is_active() {
         *non_preferred_since = None;
         return;
     }
     let cur_slot = state.modem.read().await.identity.sim_slot;
-    if !(1..=2).contains(&cur_slot) || cur_slot == i32::from(cfg.preferred_sim_slot) {
+    if !(1..=2).contains(&cur_slot) || cur_slot == i32::from(preferred_sim_slot) {
         *non_preferred_since = None;
         return;
     }
     let since = *non_preferred_since.get_or_insert(now);
-    if now.saturating_duration_since(since) < Duration::from_secs(cfg.sim_failback_mins.max(1) * 60)
+    if now.saturating_duration_since(since) < Duration::from_secs(sim_failback_mins.max(1) * 60)
     {
         return;
     }
     *non_preferred_since = Some(now);
     let _guard = crate::radio::lock_bounded(state, Duration::from_secs(8)).await;
-    if try_verified_sim_switch(state, cfg.preferred_sim_slot, "Preferred SIM failback").await {
+    if try_verified_sim_switch(state, preferred_sim_slot, "Preferred SIM failback").await {
         crate::handlers::forget_radio_mode(state);
         *non_preferred_since = None;
     }
@@ -1741,14 +1807,20 @@ pub(crate) fn build_telemetry_commands_full(
 ) -> Vec<(String, Duration)> {
     // Keep at_fwd commands (QMAP WWAN, QTEMP) in their mid-batch positions so trailing
     // baseband queries always follow them; moving them to the end caused a post-CFUN resync miss.
-    // Combine AT+QRSRP;+QRSRQ;+QSINR into one compound query and omit unused AT+C5GREG?.
+    // Combine AT+QRSRP;+QRSRQ;+QSINR into one compound query unless cached as unsupported on this firmware.
     let mut cmds: Vec<(String, Duration)> = vec![
         ("AT+CFUN?".into(), Duration::from_secs(3)),
         ("AT+QENG=\"servingcell\"".into(), Duration::from_secs(4)),
         (qcainfo_cmd.into(), Duration::from_secs(4)),
-        ("AT+QRSRP;+QRSRQ;+QSINR".into(), Duration::from_secs(3)),
-        ("AT+QNWCFG=\"nr5g_mimo_info\"".into(), Duration::from_secs(3)),
     ];
+    if COMPOUND_RF_UNSUPPORTED.load(Ordering::Relaxed) {
+        cmds.push(("AT+QRSRP".into(), Duration::from_secs(2)));
+        cmds.push(("AT+QRSRQ".into(), Duration::from_secs(2)));
+        cmds.push(("AT+QSINR".into(), Duration::from_secs(2)));
+    } else {
+        cmds.push(("AT+QRSRP;+QRSRQ;+QSINR".into(), Duration::from_secs(3)));
+    }
+    cmds.push(("AT+QNWCFG=\"nr5g_mimo_info\"".into(), Duration::from_secs(3)));
     if include_qmap {
         cmds.push(("AT+QMAP=\"WWAN\"".into(), Duration::from_secs(4)));
     }
@@ -1884,31 +1956,42 @@ pub async fn refresh_modem_snapshot(state: &AppState, priority: Priority, init_u
         }
     }
 
-    // Fallback to individual QRSRP/QRSRQ/QSINR if compound command returned empty/error on non-standard firmware
-    let compound_sig = raw_map
-        .get("AT+QRSRP;+QRSRQ;+QSINR")
-        .cloned()
-        .unwrap_or_default();
-    let mut mimo = parse_mimo_signal(&compound_sig, &compound_sig, &compound_sig);
-    if mimo.rsrp.iter().all(|v| v.is_none())
-        && !compound_sig.contains("+QRSRP:")
-        && let Ok(fb) = state
-            .smd
-            .exec_batch(
-                vec![
-                    ("AT+QRSRP".into(), Duration::from_secs(2)),
-                    ("AT+QRSRQ".into(), Duration::from_secs(2)),
-                    ("AT+QSINR".into(), Duration::from_secs(2)),
-                ],
-                priority,
-            )
-            .await
-    {
-        let r0 = fb.first().and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
-        let r1 = fb.get(1).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
-        let r2 = fb.get(2).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
-        mimo = parse_mimo_signal(r0, r1, r2);
-    }
+    // Fallback to individual QRSRP/QRSRQ/QSINR if compound command returned empty/error on non-standard firmware,
+    // and cache compound failure until SMD reconnect so subsequent ticks avoid the wasted round-trip.
+    let mut mimo = if let Some(compound_sig) = raw_map.get("AT+QRSRP;+QRSRQ;+QSINR") {
+        let parsed = parse_mimo_signal(compound_sig, compound_sig, compound_sig);
+        if parsed.rsrp.iter().all(|v| v.is_none())
+            && !compound_sig.contains("+QRSRP:")
+            && let Ok(fb) = state
+                .smd
+                .exec_batch(
+                    vec![
+                        ("AT+QRSRP".into(), Duration::from_secs(2)),
+                        ("AT+QRSRQ".into(), Duration::from_secs(2)),
+                        ("AT+QSINR".into(), Duration::from_secs(2)),
+                    ],
+                    priority,
+                )
+                .await
+        {
+            let r0 = fb.first().and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let r1 = fb.get(1).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let r2 = fb.get(2).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
+            let fb_mimo = parse_mimo_signal(r0, r1, r2);
+            if fb_mimo.rsrp.iter().any(|v| v.is_some()) || r0.contains("+QRSRP:") {
+                COMPOUND_RF_UNSUPPORTED.store(true, Ordering::Relaxed);
+            }
+            fb_mimo
+        } else {
+            parsed
+        }
+    } else {
+        let r0 = raw_map.get("AT+QRSRP").map(String::as_str).unwrap_or("");
+        let r1 = raw_map.get("AT+QRSRQ").map(String::as_str).unwrap_or("");
+        let r2 = raw_map.get("AT+QSINR").map(String::as_str).unwrap_or("");
+        parse_mimo_signal(r0, r1, r2)
+    };
+    let _ = &mut mimo;
 
     let get_resp = |needle: &str| -> String {
         raw_map
@@ -2232,19 +2315,25 @@ async fn record_signal_history_point(state: &AppState) {
 }
 
 async fn poll_antenna_alignment(state: &AppState) {
-    // Try compound signal query first to cut SMD round-trips during 400 ms alignment.
-    let compound_cmds = vec![("AT+QRSRP;+QRSRQ;+QSINR".into(), Duration::from_secs(2))];
-    let mut mimo = match state.smd.exec_batch(compound_cmds, Priority::Telemetry).await {
-        Ok(res)
-            if res
-                .first()
-                .and_then(|r| r.as_ref().ok())
-                .is_some_and(|r| r.ok) =>
-        {
-            let body = res[0].as_ref().map(|r| r.body.as_str()).unwrap_or("");
-            parse_mimo_signal(body, body, body)
+    // Try compound signal query first to cut SMD round-trips during 400 ms alignment,
+    // skipping straight to individual commands if compound RF is cached as unsupported.
+    let tried_compound = !COMPOUND_RF_UNSUPPORTED.load(Ordering::Relaxed);
+    let mut mimo = if tried_compound {
+        let compound_cmds = vec![("AT+QRSRP;+QRSRQ;+QSINR".into(), Duration::from_secs(2))];
+        match state.smd.exec_batch(compound_cmds, Priority::Telemetry).await {
+            Ok(res)
+                if res
+                    .first()
+                    .and_then(|r| r.as_ref().ok())
+                    .is_some_and(|r| r.ok) =>
+            {
+                let body = res[0].as_ref().map(|r| r.body.as_str()).unwrap_or("");
+                parse_mimo_signal(body, body, body)
+            }
+            _ => crate::parsers::MimoSignalData::default(),
         }
-        _ => crate::parsers::MimoSignalData::default(),
+    } else {
+        crate::parsers::MimoSignalData::default()
     };
     if mimo.rsrp.iter().all(|v| v.is_none()) {
         let cmds = vec![
@@ -2259,6 +2348,9 @@ async fn poll_antenna_alignment(state: &AppState) {
         let rsrq_raw = res.get(1).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
         let sinr_raw = res.get(2).and_then(|r| r.as_ref().ok()).map(|r| r.body.as_str()).unwrap_or("");
         mimo = parse_mimo_signal(rsrp_raw, rsrq_raw, sinr_raw);
+        if tried_compound && (mimo.rsrp.iter().any(|v| v.is_some()) || rsrp_raw.contains("+QRSRP:")) {
+            COMPOUND_RF_UNSUPPORTED.store(true, Ordering::Relaxed);
+        }
     }
 
     let prev_samples = state.antenna_align.read().await.samples;
@@ -2488,10 +2580,10 @@ struct NetDevRow {
     tx_pkts: u64,
     tx_errors: u64,
     tx_drops: u64,
-    oper: String,
+    oper: Option<String>,
 }
 
-fn read_net_dev_samples() -> Option<Vec<NetDevRow>> {
+fn read_net_dev_samples(read_operstate: bool) -> Option<Vec<NetDevRow>> {
     let proc_dev = fs::read_to_string(crate::paths::p("/proc/net/dev")).ok()?;
     let mut rows = Vec::new();
     for line in proc_dev.lines().skip(2) {
@@ -2509,10 +2601,16 @@ fn read_net_dev_samples() -> Option<Vec<NetDevRow>> {
         if cols.len() < 12 {
             continue;
         }
-        let oper = fs::read_to_string(crate::paths::p(&format!("/sys/class/net/{name}/operstate")))
-            .unwrap_or_else(|_| "unknown".into())
-            .trim()
-            .to_string();
+        let oper = if read_operstate {
+            Some(
+                fs::read_to_string(crate::paths::p(&format!("/sys/class/net/{name}/operstate")))
+                    .unwrap_or_else(|_| "unknown".into())
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
         rows.push(NetDevRow {
             name: name.to_string(),
             rx_bytes: cols[0],
@@ -2532,11 +2630,14 @@ fn read_net_dev_samples() -> Option<Vec<NetDevRow>> {
 async fn poll_network_and_usage(
     state: &AppState,
     prev: &mut HashMap<String, (u64, u64, u64, u64)>,
+    operstate_cache: &mut HashMap<String, String>,
+    refresh_operstate: bool,
     elapsed_secs: f64,
     tracker: &mut UsageFlushTracker,
     mono_now: Instant,
 ) {
-    let Ok(Some(rows)) = tokio::task::spawn_blocking(read_net_dev_samples).await else {
+    let read_oper = refresh_operstate || operstate_cache.is_empty();
+    let Ok(Some(rows)) = crate::paths::spawn_blocking(move || read_net_dev_samples(read_oper)).await else {
         return;
     };
     let mut ifaces = Vec::with_capacity(rows.len());
@@ -2553,6 +2654,16 @@ async fn poll_network_and_usage(
             tx_drops,
             oper,
         } = row;
+        let oper_state = match oper {
+            Some(s) => {
+                operstate_cache.insert(name.clone(), s.clone());
+                s
+            }
+            None => operstate_cache
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| "unknown".into()),
+        };
         let (rx_bps, tx_bps, rx_pps, tx_pps) =
             if let Some(&(pr_b, pr_p, pt_b, pt_p)) = prev.get(&name) {
                 let drx_b = rx_bytes.saturating_sub(pr_b);
@@ -2572,7 +2683,7 @@ async fn poll_network_and_usage(
 
         ifaces.push(TrafficInterfaceStats {
             name,
-            state: oper,
+            state: oper_state,
             rx: TrafficDirectionStats {
                 bytes_total: rx_bytes,
                 bps: rx_bps,
@@ -2596,6 +2707,8 @@ async fn poll_network_and_usage(
         .find(|i| i.name == "eth0")
         .or_else(|| ifaces.iter().find(|i| i.name.starts_with("eth")));
 
+    let primary_name = primary.map(|p| p.name.clone());
+    let lan_name = lan.map(|l| l.name.clone());
     let rx_bps = primary.map(|p| p.rx.bps).unwrap_or(0);
     let tx_bps = primary.map(|p| p.tx.bps).unwrap_or(0);
     let now_ms_val = now_secs() * 1000;
@@ -2614,15 +2727,16 @@ async fn poll_network_and_usage(
         .await;
     }
 
+    let ws_ifaces = (state.ws_tx.receiver_count() > 0).then(|| ifaces.clone());
     {
         let mut tr = state.traffic.write().await;
-        if let Some(p) = primary {
-            tr.primary_iface = p.name.clone();
+        if let Some(p_name) = primary_name {
+            tr.primary_iface = p_name;
         }
-        if let Some(l) = lan {
-            tr.lan_iface = l.name.clone();
+        if let Some(l_name) = lan_name {
+            tr.lan_iface = l_name;
         }
-        tr.interfaces = ifaces.clone();
+        tr.interfaces = ifaces;
         if tr.history.len() >= 90 {
             tr.history.pop_front();
         }
@@ -2633,7 +2747,7 @@ async fn poll_network_and_usage(
         });
     }
 
-    if state.ws_tx.receiver_count() > 0 {
+    if let Some(ws_ifaces) = ws_ifaces {
         let usage_today = {
             let u = state.data_usage.read().await;
             let (today, month, _) = format_today_ymd();
@@ -2649,7 +2763,7 @@ async fn poll_network_and_usage(
 
         state.broadcast_with(|| serde_json::json!({
             "channel": "network-monitor",
-            "interfaces": ifaces,
+            "interfaces": ws_ifaces,
             "usageSummary": usage_today,
         }));
     }
@@ -2919,11 +3033,8 @@ async fn query_wan_uptime_ubus() -> Option<UptimeTelemetry> {
     None
 }
 
-struct SystemVitalsRaw {
-    mem: MemoryTelemetry,
-    dev_up: UptimeTelemetry,
-    conntrack_count: u64,
-    conntrack_max: u64,
+#[derive(Default, Clone)]
+struct SlowVitalsCache {
     conntrack_hashsize: u64,
     pcie_aspm: String,
     autosleep: String,
@@ -2934,11 +3045,19 @@ struct SystemVitalsRaw {
     usrdata_used_bytes: u64,
     usrdata_avail_bytes: u64,
     mwan3_running: bool,
-    eth_speed: String,
-    eth_duplex: String,
 }
 
-fn read_system_vitals_blocking() -> SystemVitalsRaw {
+struct FastVitalsRaw {
+    mem: MemoryTelemetry,
+    dev_up: UptimeTelemetry,
+    conntrack_count: u64,
+    conntrack_max: u64,
+    eth_speed: String,
+    eth_duplex: String,
+    slow: Option<SlowVitalsCache>,
+}
+
+fn read_system_vitals_blocking(refresh_slow: bool, native_mode: bool) -> FastVitalsRaw {
     let ts = format_now_hms();
     let mut mem = MemoryTelemetry::default();
     if let Ok(meminfo) = fs::read_to_string(crate::paths::p("/proc/meminfo")) {
@@ -2984,41 +3103,53 @@ fn read_system_vitals_blocking() -> SystemVitalsRaw {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let conntrack_hashsize = fs::read_to_string(crate::paths::p("/sys/module/nf_conntrack/parameters/hashsize"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let pcie_aspm = fs::read_to_string(crate::paths::p("/sys/module/pcie_aspm/parameters/policy"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let autosleep = fs::read_to_string(crate::paths::p("/sys/power/autosleep"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let (usb_udc, usb_controller, usb_adb_present) = current_usb_gadget_udc();
-    let (usrdata_total_bytes, usrdata_used_bytes, usrdata_avail_bytes) =
-        statvfs_bytes(&crate::paths::p("/usrdata"));
-    let mwan3_running = is_mwan3track_running();
     let (eth_speed, eth_duplex) = read_eth0_speed_and_duplex();
 
-    SystemVitalsRaw {
+    let slow = if refresh_slow {
+        let conntrack_hashsize = fs::read_to_string(crate::paths::p("/sys/module/nf_conntrack/parameters/hashsize"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let pcie_aspm = fs::read_to_string(crate::paths::p("/sys/module/pcie_aspm/parameters/policy"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let autosleep = fs::read_to_string(crate::paths::p("/sys/power/autosleep"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let (usb_udc, usb_controller, usb_adb_present) = current_usb_gadget_udc();
+        let (usrdata_total_bytes, usrdata_used_bytes, usrdata_avail_bytes) =
+            statvfs_bytes(&crate::paths::p("/usrdata"));
+        let mwan3_running = if native_mode {
+            false
+        } else {
+            is_mwan3track_running()
+        };
+        Some(SlowVitalsCache {
+            conntrack_hashsize,
+            pcie_aspm,
+            autosleep,
+            usb_udc,
+            usb_controller,
+            usb_adb_present,
+            usrdata_total_bytes,
+            usrdata_used_bytes,
+            usrdata_avail_bytes,
+            mwan3_running,
+        })
+    } else {
+        None
+    };
+
+    FastVitalsRaw {
         mem,
         dev_up,
         conntrack_count,
         conntrack_max,
-        conntrack_hashsize,
-        pcie_aspm,
-        autosleep,
-        usb_udc,
-        usb_controller,
-        usb_adb_present,
-        usrdata_total_bytes,
-        usrdata_used_bytes,
-        usrdata_avail_bytes,
-        mwan3_running,
         eth_speed,
         eth_duplex,
+        slow,
     }
 }
 
@@ -3026,13 +3157,19 @@ async fn poll_system_vitals(
     state: &AppState,
     boot_slot: &str,
     wan_up: Option<UptimeTelemetry>,
+    refresh_slow: bool,
+    slow_cache: &mut SlowVitalsCache,
     eth_degraded_since: &mut Option<Instant>,
     last_eth_reneg: &mut Option<Instant>,
 ) {
-    let raw = match tokio::task::spawn_blocking(read_system_vitals_blocking).await {
+    let native_mode = crate::dataplane::is_native_mode();
+    let raw = match crate::paths::spawn_blocking(move || read_system_vitals_blocking(refresh_slow, native_mode)).await {
         Ok(r) => r,
         Err(_) => return,
     };
+    if let Some(slow) = raw.slow {
+        *slow_cache = slow;
+    }
 
     let mem = raw.mem;
     *state.memory.write().await = mem.clone();
@@ -3109,17 +3246,17 @@ async fn poll_system_vitals(
     let mut internals = state.internals.write().await;
     internals.conntrack_count = raw.conntrack_count;
     internals.conntrack_max = raw.conntrack_max;
-    internals.conntrack_hashsize = raw.conntrack_hashsize;
-    internals.pcie_aspm = raw.pcie_aspm;
-    internals.autosleep = raw.autosleep;
+    internals.conntrack_hashsize = slow_cache.conntrack_hashsize;
+    internals.pcie_aspm = slow_cache.pcie_aspm.clone();
+    internals.autosleep = slow_cache.autosleep.clone();
     internals.boot_slot = boot_slot.to_string();
-    internals.usrdata_total_bytes = raw.usrdata_total_bytes;
-    internals.usrdata_used_bytes = raw.usrdata_used_bytes;
-    internals.usrdata_avail_bytes = raw.usrdata_avail_bytes;
-    internals.usb_udc = raw.usb_udc;
-    internals.usb_controller = raw.usb_controller;
-    internals.usb_adb_present = raw.usb_adb_present;
-    internals.mwan3_running = raw.mwan3_running;
+    internals.usrdata_total_bytes = slow_cache.usrdata_total_bytes;
+    internals.usrdata_used_bytes = slow_cache.usrdata_used_bytes;
+    internals.usrdata_avail_bytes = slow_cache.usrdata_avail_bytes;
+    internals.usb_udc = slow_cache.usb_udc.clone();
+    internals.usb_controller = slow_cache.usb_controller.clone();
+    internals.usb_adb_present = slow_cache.usb_adb_present;
+    internals.mwan3_running = slow_cache.mwan3_running;
     internals.keep_alive_enabled = keep_alive_enabled;
     internals.eth_speed = raw.eth_speed;
 }
@@ -3249,11 +3386,11 @@ async fn scrape_local_cloudflared_metrics(addr: &str) -> Option<u64> {
 }
 
 async fn poll_cloudflared_metrics(state: &AppState) {
-    let (present, running) = tokio::task::spawn_blocking(|| {
-        let bin_present = std::path::Path::new(&crate::paths::p("/usr/bin/cloudflared")).exists()
+    let (present, running) = crate::paths::spawn_blocking(|| {
+        let present = std::path::Path::new(&crate::paths::p("/usr/bin/cloudflared")).exists()
             || std::path::Path::new(&crate::paths::p("/usr/sbin/cloudflared")).exists();
-        let running = is_proc_running("cloudflared");
-        (bin_present || running, running)
+        let running = present && is_proc_running("cloudflared");
+        (present, running)
     })
     .await
     .unwrap_or((false, false));
@@ -4217,13 +4354,14 @@ mod tests {
                     disconnect_count: Some(1),
                     timestamp: "2026-11-18 00:00:00".into(),
                 };
+                let mut slow_cache = SlowVitalsCache::default();
                 let mut eth_deg = None;
                 let mut eth_ren = None;
-                poll_system_vitals(&state, "_a", Some(up), &mut eth_deg, &mut eth_ren).await;
+                poll_system_vitals(&state, "_a", Some(up), true, &mut slow_cache, &mut eth_deg, &mut eth_ren).await;
                 assert_eq!(state.session_uptime.read().await.is_connected, Some(true));
                 assert_eq!(state.session_uptime.read().await.uptime_seconds, 120);
 
-                poll_system_vitals(&state, "_a", None, &mut eth_deg, &mut eth_ren).await;
+                poll_system_vitals(&state, "_a", None, false, &mut slow_cache, &mut eth_deg, &mut eth_ren).await;
                 let dropped = state.session_uptime.read().await.clone();
                 assert_eq!(dropped.is_connected, Some(false));
                 assert_eq!(dropped.uptime_seconds, 0);
@@ -4510,22 +4648,22 @@ mod tests {
                 let loaded = load_initial_data_usage();
                 assert_eq!(loaded.daily[0].rx_bytes, 5096 + 1024 * 1024);
 
-                // 5. >= 50 MiB accumulated delta triggers immediate /etc flush even before 6h.
-                let big_rx = 5096 + 52 * 1024 * 1024;
+                // 5. >= 512 MiB accumulated delta triggers /etc flush once past the 3600s debounce even before 6h.
+                let big_rx = 5096 + 520 * 1024 * 1024;
                 update_persistent_usage_with_clock(
                     &app,
                     "rmnet_data0",
                     big_rx,
                     1024,
                     &mut tracker,
-                    valid_wall + 900,
+                    valid_wall + 3605,
                     ymd.clone(),
-                    t0 + Duration::from_secs(900),
+                    t0 + Duration::from_secs(3605),
                 )
                 .await;
-                let etc_after_50m: serde_json::Value =
+                let etc_after_512m: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&etc_file).unwrap()).unwrap();
-                assert_eq!(etc_after_50m["daily"][0]["rxBytes"], big_rx);
+                assert_eq!(etc_after_512m["daily"][0]["rxBytes"], big_rx);
 
                 // 6. Small delta after 6 hours also flushes /etc.
                 update_persistent_usage_with_clock(
@@ -4534,9 +4672,9 @@ mod tests {
                     big_rx + 2048,
                     1024,
                     &mut tracker,
-                    valid_wall + 900 + DATA_USAGE_ETC_FLUSH_SECS + 10,
+                    valid_wall + 3605 + DATA_USAGE_ETC_FLUSH_SECS + 10,
                     ymd,
-                    t0 + Duration::from_secs(900 + DATA_USAGE_ETC_FLUSH_SECS + 10),
+                    t0 + Duration::from_secs(3605 + DATA_USAGE_ETC_FLUSH_SECS + 10),
                 )
                 .await;
                 let etc_after_6h: serde_json::Value =
@@ -4953,8 +5091,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_usage_etc_50mib_flush_obeys_300s_debounce_and_flushes_on_zero_delta() {
-        let sbx = crate::paths::TestSandbox::new("usage-debounce-300s");
+    async fn data_usage_etc_512mib_flush_obeys_3600s_debounce_and_flushes_on_zero_delta() {
+        let sbx = crate::paths::TestSandbox::new("usage-debounce-3600s");
         std::fs::create_dir_all(sbx.root.join("etc/cellcore")).unwrap();
         std::fs::create_dir_all(sbx.root.join("tmp/cellcore")).unwrap();
 
@@ -4983,36 +5121,36 @@ mod tests {
                     save_json_compact_atomic(DATA_USAGE_PATH, &*u, 0o600).unwrap();
                 }
 
-                // +60 MiB at t0 + 60s (< 300s debounce): must NOT rewrite /etc yet!
-                let sixty_mib = 60 * 1024 * 1024;
+                // +520 MiB at t0 + 600s (< 3600s debounce): must NOT rewrite /etc yet!
+                let over_threshold = 520 * 1024 * 1024;
                 update_persistent_usage_with_clock(
                     &app,
                     "rmnet_data0",
-                    sixty_mib,
+                    over_threshold,
                     0,
                     &mut tracker,
-                    valid_wall + 60,
+                    valid_wall + 600,
                     ymd.clone(),
-                    t0 + Duration::from_secs(60),
+                    t0 + Duration::from_secs(600),
                 )
                 .await;
                 let etc_early: DataUsageState = load_json_or_default(DATA_USAGE_PATH);
-                assert_eq!(etc_early.daily[0].rx_bytes, 1000, "/etc flush must debounce for 300s");
+                assert_eq!(etc_early.daily[0].rx_bytes, 1000, "/etc flush must debounce for 3600s");
 
-                // Zero-delta tick at t0 + 305s (>= 300s debounce): buffered 60 MiB flushes to /etc!
+                // Zero-delta tick at t0 + 3605s (>= 3600s debounce): buffered 520 MiB flushes to /etc!
                 update_persistent_usage_with_clock(
                     &app,
                     "rmnet_data0",
-                    sixty_mib,
+                    over_threshold,
                     0,
                     &mut tracker,
-                    valid_wall + 305,
+                    valid_wall + 3605,
                     ymd,
-                    t0 + Duration::from_secs(305),
+                    t0 + Duration::from_secs(3605),
                 )
                 .await;
                 let etc_after: DataUsageState = load_json_or_default(DATA_USAGE_PATH);
-                assert_eq!(etc_after.daily[0].rx_bytes, 1000 + sixty_mib);
+                assert_eq!(etc_after.daily[0].rx_bytes, 1000 + over_threshold);
             })
             .await;
     }

@@ -9,6 +9,7 @@ import { useSubRoute } from "../stores/route-store";
 import { useToastStore } from "../stores/toast-store";
 import type {
   AntennaAlignState,
+  CarrierComponent,
   DaemonSettings,
   MbnProfile,
   NeighborCellInfo,
@@ -55,6 +56,251 @@ function bandUniverse(base: string[], ...extra: string[][]) {
   return [...set].sort((a, b) => Number(a) - Number(b));
 }
 
+const EMPTY_CARRIERS: CarrierComponent[] = [];
+
+const ServingChip = React.memo(function ServingChip() {
+  const serving = useWsStore((s) => s.modem?.serving ?? null);
+  if (!serving) return null;
+  const quality = signalQuality(serving.rsrp ?? null, serving.sinr ?? null);
+  return (
+    <div className="flex items-center gap-3 rounded-full border border-line bg-surface py-1.5 pl-3 pr-4 shadow-[var(--qm-shadow)]">
+      <LiveDot tone={quality.tone} />
+      <div className="leading-tight">
+        <div className="text-[11px] font-semibold text-muted">
+          {serving.rat} · cell <span className="font-mono">{serving.pci ?? "—"}</span>
+        </div>
+        <div className="flex items-baseline gap-2">
+          <span className="qm-display text-[1.05rem] font-semibold text-ink">{serving.band}</span>
+          <span className={cn("text-[12.5px] font-bold qm-tabular", TONE_TEXT[rsrpTone(serving.rsrp)])}>
+            {serving.rsrp ?? "—"} dBm
+          </span>
+          <span className="text-[11.5px] text-muted">{quality.label}</span>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const BandsTab = React.memo(function BandsTab(
+  props: Omit<React.ComponentProps<typeof BandsView>, "serving" | "carriers">
+) {
+  // Only re-render when RAT, serving band, or carrier aggregation composition actually changes.
+  useWsStore((s) => {
+    const sv = s.modem?.serving;
+    const cs = s.modem?.carriers;
+    return sv ? `${sv.rat}|${sv.band}|${(cs ?? []).map((c) => `${c.role}:${c.band}:${c.arfcn}`).join(",")}` : "";
+  });
+  const modem = useWsStore.getState().modem;
+  return <BandsView {...props} serving={modem?.serving ?? null} carriers={modem?.carriers ?? EMPTY_CARRIERS} />;
+});
+
+const LockTab = React.memo(function LockTab(
+  props: Omit<React.ComponentProps<typeof LockView>, "serving">
+) {
+  useWsStore((s) => {
+    const sv = s.modem?.serving;
+    return sv ? `${sv.rat}|${sv.band}|${sv.pci ?? ""}|${sv.arfcn ?? ""}|${sv.scsKhz ?? ""}|${sv.rsrp ?? ""}` : "";
+  });
+  const serving = useWsStore.getState().modem?.serving ?? null;
+  return <LockView {...props} serving={serving} />;
+});
+
+const ScanTab = React.memo(function ScanTab(
+  props: Omit<React.ComponentProps<typeof ScanView>, "serving">
+) {
+  useWsStore((s) => {
+    const sv = s.modem?.serving;
+    return sv ? `${sv.band}|${sv.pci ?? ""}|${sv.arfcn ?? ""}|${sv.rsrp ?? ""}|${sv.mcc}|${sv.mnc}` : "";
+  });
+  const serving = useWsStore.getState().modem?.serving ?? null;
+  return <ScanView {...props} serving={serving} />;
+});
+
+const AlignTab = React.memo(function AlignTab({
+  busy,
+  setBusy,
+  notify,
+}: {
+  busy: string | null;
+  setBusy: React.Dispatch<React.SetStateAction<string | null>>;
+  notify: (kind: "ok" | "err", msg: string) => void;
+}) {
+  const antennaAlign = useWsStore((s) => s.antennaAlign);
+  const mimo = useWsStore((s) => s.modem?.mimo ?? null);
+  const antennaLabels = useWsStore((s) => s.settings?.antennaLabels);
+  const setAntennaAlign = useWsStore((s) => s.setAntennaAlign);
+  const setSettings = useWsStore((s) => s.setSettings);
+  const sendWsCommand = useWsStore((s) => s.sendWsCommand);
+
+  const [resetSeq, setResetSeq] = useState(0);
+  const keepAwake = Boolean(antennaAlign?.keepAwake);
+  const userKeepAwakeRef = useRef<boolean | null>(null);
+  const keepAwakeRef = useRef(keepAwake);
+  keepAwakeRef.current = keepAwake;
+
+  // Activate 400 ms high-rate Antenna Alignment polling while mounted (auto-enabling 4x4 RX keep-awake
+  // unless explicitly turned off), renew 300s lease every 120s, and clean up on exit/unmount.
+  useEffect(() => {
+    let active = true;
+    sendWsCommand({ action: "set_fast_rf", enabled: true });
+    const renew = () => {
+      const wantAwake = userKeepAwakeRef.current ?? true;
+      void apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
+        method: "POST",
+        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: wantAwake }),
+      })
+        .then((res) => {
+          if (active && res.align) setAntennaAlign(res.align);
+        })
+        .catch(() => {
+          // ignore if unmounted early
+        });
+    };
+    renew();
+    const leaseId = window.setInterval(renew, 120_000);
+    return () => {
+      active = false;
+      window.clearInterval(leaseId);
+      sendWsCommand({ action: "set_fast_rf", enabled: false });
+      void apiFetch("/api/v1/cellular/align", {
+        method: "POST",
+        skipAuthRedirect: true,
+        body: JSON.stringify({ active: false, resetPeaks: false, keepAwake: false }),
+      }).catch(() => {});
+    };
+  }, [sendWsCommand, setAntennaAlign]);
+
+  async function resetAlignPeaks() {
+    setBusy("align-reset");
+    try {
+      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
+        method: "POST",
+        body: JSON.stringify({ active: true, resetPeaks: true, keepAwake: keepAwakeRef.current }),
+      });
+      if (res.align) setAntennaAlign(res.align);
+      setResetSeq((n) => n + 1);
+      notify("ok", "All peaks reset");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Reset failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resetAlignChainPeak(chainIdx: number) {
+    setBusy("align-reset");
+    try {
+      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
+        method: "POST",
+        body: JSON.stringify({
+          active: true,
+          resetPeaks: false,
+          resetChain: chainIdx,
+          keepAwake: keepAwakeRef.current,
+        }),
+      });
+      if (res.align) setAntennaAlign(res.align);
+      notify("ok", `RX${chainIdx} peak reset`);
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Reset failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function toggleAlignKeepAwake(next: boolean) {
+    userKeepAwakeRef.current = next;
+    setBusy("align-awake");
+    try {
+      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
+        method: "POST",
+        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: next }),
+      });
+      if (res.align) setAntennaAlign(res.align);
+      notify("ok", next ? "4×4 RX Awake enabled" : "4×4 RX Awake paused");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Failed toggling keep-awake");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveAntennaLabels(labels: [string, string, string, string]) {
+    setBusy("align-labels");
+    try {
+      const res = await apiFetch<{ status: string; settings?: DaemonSettings }>("/api/v1/system/settings", {
+        method: "POST",
+        body: JSON.stringify({ antennaLabels: labels }),
+      });
+      if (res.settings) setSettings(res.settings);
+      notify("ok", "Saved antenna jack labels");
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Failed saving labels");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const alignData = antennaAlign;
+  const liveAlignRsrp = alignData?.rsrp ?? mimo?.rsrp ?? [null, null, null, null];
+  const liveAlignSinr = alignData?.sinr ?? mimo?.sinr ?? [null, null, null, null];
+  const liveAlignRsrq = alignData?.rsrq ?? mimo?.rsrq ?? [null, null, null, null];
+  const peakRsrp = alignData?.peakRsrp ?? [null, null, null, null];
+  const peakSinr = alignData?.peakSinr ?? [null, null, null, null];
+
+  const alignSummary = useMemo(() => {
+    const activeCur = liveAlignRsrp.filter((v): v is number => v != null);
+    const activePeak = peakRsrp.filter((v): v is number => v != null);
+    const activeSinr = liveAlignSinr.filter((v): v is number => v != null);
+    const meanCur =
+      activeCur.length > 0 ? Math.round((activeCur.reduce((a, b) => a + b, 0) / activeCur.length) * 10) / 10 : null;
+    const computedPeak =
+      activePeak.length > 0
+        ? Math.round((activePeak.reduce((a, b) => a + b, 0) / activePeak.length) * 10) / 10
+        : null;
+    const meanPeak = alignData?.peakMeanRsrp ?? computedPeak;
+    const meanSinr =
+      activeSinr.length > 0
+        ? Math.round((activeSinr.reduce((a, b) => a + b, 0) / activeSinr.length) * 10) / 10
+        : null;
+    const score =
+      meanCur != null
+        ? Math.max(0, Math.min(100, Math.round(((meanCur + 125) / 55) * 70 + ((meanSinr ?? 5) + 5) * 1.2)))
+        : 0;
+    return {
+      meanCur,
+      meanPeak,
+      meanSinr,
+      peakMeanSinr: alignData?.peakMeanSinr ?? null,
+      score,
+    };
+  }, [liveAlignRsrp, peakRsrp, liveAlignSinr, alignData?.peakMeanRsrp, alignData?.peakMeanSinr]);
+
+  return (
+    <Suspense fallback={<Skeleton className="h-64" />}>
+      <AlignView
+        active={Boolean(alignData?.active)}
+        samples={alignData?.samples ?? 0}
+        rsrp={liveAlignRsrp}
+        sinr={liveAlignSinr}
+        rsrq={liveAlignRsrq}
+        peakRsrp={peakRsrp}
+        peakSinr={peakSinr}
+        summary={alignSummary}
+        align={alignData}
+        resetSeq={resetSeq}
+        keepAwake={keepAwake}
+        onToggleKeepAwake={(next) => void toggleAlignKeepAwake(next)}
+        busy={busy}
+        onResetPeaks={() => void resetAlignPeaks()}
+        onResetChainPeak={(idx) => void resetAlignChainPeak(idx)}
+        antennaLabels={antennaLabels}
+        onSaveAntennaLabels={(labels) => void saveAntennaLabels(labels)}
+      />
+    </Suspense>
+  );
+});
+
 export function CellularPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useSubRoute<CellTab>("/cellular", CELL_TABS, "profiles");
@@ -70,15 +316,7 @@ export function CellularPage() {
   const setLockForm = lockForm.set;
   const [confirmLink, setConfirmLink] = useState<null | "bands" | "nr" | "lte">(null);
 
-  const modem = useWsStore((s) => s.modem);
-  const settings = useWsStore((s) => s.settings);
-  const setSettings = useWsStore((s) => s.setSettings);
-  const antennaAlign = useWsStore((s) => s.antennaAlign);
-  const setAntennaAlign = useWsStore((s) => s.setAntennaAlign);
-  const sendWsCommand = useWsStore((s) => s.sendWsCommand);
   const hydrateBootstrap = useWsStore((s) => s.hydrateBootstrap);
-
-  const serving = modem?.serving ?? null;
 
   function notify(kind: "ok" | "err", msg: string) {
     pushToast(msg, kind === "ok" ? "success" : "error");
@@ -192,44 +430,6 @@ export function CellularPage() {
   const schedDirty =
     (sched0?.startTime != null && schedStart !== sched0.startTime) ||
     (sched0?.endTime != null && schedEnd !== sched0.endTime);
-
-  const [resetSeq, setResetSeq] = useState(0);
-  const keepAwake = Boolean(antennaAlign?.keepAwake);
-  const userKeepAwakeRef = useRef<boolean | null>(null);
-  const keepAwakeRef = useRef(keepAwake);
-  keepAwakeRef.current = keepAwake;
-
-  // Activate 400 ms high-rate Antenna Alignment polling when on "align" tab (auto-enabling 4x4 RX keep-awake unless explicitly turned off), renew 300s lease every 120s, and clean up on exit/unmount
-  useEffect(() => {
-    if (tab !== "align") return;
-    let active = true;
-    sendWsCommand({ action: "set_fast_rf", enabled: true });
-    const renew = () => {
-      const wantAwake = userKeepAwakeRef.current ?? true;
-      void apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
-        method: "POST",
-        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: wantAwake }),
-      })
-        .then((res) => {
-          if (active && res.align) setAntennaAlign(res.align);
-        })
-        .catch(() => {
-          // ignore if unmounted early
-        });
-    };
-    renew();
-    const leaseId = window.setInterval(renew, 120_000);
-    return () => {
-      active = false;
-      window.clearInterval(leaseId);
-      sendWsCommand({ action: "set_fast_rf", enabled: false });
-      void apiFetch("/api/v1/cellular/align", {
-        method: "POST",
-        skipAuthRedirect: true,
-        body: JSON.stringify({ active: false, resetPeaks: false, keepAwake: false }),
-      }).catch(() => {});
-    };
-  }, [tab, sendWsCommand, setAntennaAlign]);
 
   const mbnState = useMemo(() => {
     const list = profilesQuery.data?.mbnProfiles ?? [];
@@ -449,6 +649,7 @@ export function CellularPage() {
   }
 
   function prefillFromServingCell() {
+    const serving = useWsStore.getState().modem?.serving ?? null;
     if (!serving) {
       notify("err", "No serving cell detected yet");
       return;
@@ -656,77 +857,6 @@ export function CellularPage() {
     void saveSchedule(enabled);
   }
 
-  async function resetAlignPeaks() {
-    setBusy("align-reset");
-    try {
-      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
-        method: "POST",
-        body: JSON.stringify({ active: true, resetPeaks: true, keepAwake: keepAwakeRef.current }),
-      });
-      if (res.align) setAntennaAlign(res.align);
-      setResetSeq((n) => n + 1);
-      notify("ok", "All peaks reset");
-    } catch (e) {
-      notify("err", e instanceof Error ? e.message : "Reset failed");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function resetAlignChainPeak(chainIdx: number) {
-    setBusy("align-reset");
-    try {
-      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
-        method: "POST",
-        body: JSON.stringify({
-          active: true,
-          resetPeaks: false,
-          resetChain: chainIdx,
-          keepAwake: keepAwakeRef.current,
-        }),
-      });
-      if (res.align) setAntennaAlign(res.align);
-      notify("ok", `RX${chainIdx} peak reset`);
-    } catch (e) {
-      notify("err", e instanceof Error ? e.message : "Reset failed");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function toggleAlignKeepAwake(next: boolean) {
-    userKeepAwakeRef.current = next;
-    setBusy("align-awake");
-    try {
-      const res = await apiFetch<{ align?: AntennaAlignState }>("/api/v1/cellular/align", {
-        method: "POST",
-        body: JSON.stringify({ active: true, resetPeaks: false, keepAwake: next }),
-      });
-      if (res.align) setAntennaAlign(res.align);
-      notify("ok", next ? "4×4 RX Awake enabled" : "4×4 RX Awake paused");
-    } catch (e) {
-      notify("err", e instanceof Error ? e.message : "Failed toggling keep-awake");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function saveAntennaLabels(labels: [string, string, string, string]) {
-    setBusy("align-labels");
-    try {
-      const res = await apiFetch<{ status: string; settings?: DaemonSettings }>("/api/v1/system/settings", {
-        method: "POST",
-        body: JSON.stringify({ antennaLabels: labels }),
-      });
-      if (res.settings) setSettings(res.settings);
-      notify("ok", "Saved antenna jack labels");
-    } catch (e) {
-      notify("err", e instanceof Error ? e.message : "Failed saving labels");
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function startFullQscan() {
     setBusy("qscan");
     try {
@@ -753,41 +883,6 @@ export function CellularPage() {
       setBusy(null);
     }
   }
-
-  const alignData = antennaAlign;
-  const liveAlignRsrp = alignData?.rsrp ?? modem?.mimo?.rsrp ?? [null, null, null, null];
-  const liveAlignSinr = alignData?.sinr ?? modem?.mimo?.sinr ?? [null, null, null, null];
-  const liveAlignRsrq = alignData?.rsrq ?? modem?.mimo?.rsrq ?? [null, null, null, null];
-  const peakRsrp = alignData?.peakRsrp ?? [null, null, null, null];
-  const peakSinr = alignData?.peakSinr ?? [null, null, null, null];
-
-  const alignSummary = useMemo(() => {
-    const activeCur = liveAlignRsrp.filter((v): v is number => v != null);
-    const activePeak = peakRsrp.filter((v): v is number => v != null);
-    const activeSinr = liveAlignSinr.filter((v): v is number => v != null);
-    const meanCur =
-      activeCur.length > 0 ? Math.round((activeCur.reduce((a, b) => a + b, 0) / activeCur.length) * 10) / 10 : null;
-    const computedPeak =
-      activePeak.length > 0
-        ? Math.round((activePeak.reduce((a, b) => a + b, 0) / activePeak.length) * 10) / 10
-        : null;
-    const meanPeak = alignData?.peakMeanRsrp ?? computedPeak;
-    const meanSinr =
-      activeSinr.length > 0
-        ? Math.round((activeSinr.reduce((a, b) => a + b, 0) / activeSinr.length) * 10) / 10
-        : null;
-    const score =
-      meanCur != null
-        ? Math.max(0, Math.min(100, Math.round(((meanCur + 125) / 55) * 70 + ((meanSinr ?? 5) + 5) * 1.2)))
-        : 0;
-    return {
-      meanCur,
-      meanPeak,
-      meanSinr,
-      peakMeanSinr: alignData?.peakMeanSinr ?? null,
-      score,
-    };
-  }, [liveAlignRsrp, peakRsrp, liveAlignSinr, alignData?.peakMeanRsrp, alignData?.peakMeanSinr]);
 
   const neighbors = scanQuery.data?.neighbors ?? [];
 
@@ -824,26 +919,6 @@ export function CellularPage() {
     ];
   }, [bandsQuery.data, selSa, selNsa, selLte]);
 
-  const quality = signalQuality(serving?.rsrp ?? null, serving?.sinr ?? null);
-
-  const servingChip = serving ? (
-    <div className="flex items-center gap-3 rounded-full border border-line bg-surface py-1.5 pl-3 pr-4 shadow-[var(--qm-shadow)]">
-      <LiveDot tone={quality.tone} />
-      <div className="leading-tight">
-        <div className="text-[11px] font-semibold text-muted">
-          {serving.rat} · cell <span className="font-mono">{serving.pci ?? "—"}</span>
-        </div>
-        <div className="flex items-baseline gap-2">
-          <span className="qm-display text-[1.05rem] font-semibold text-ink">{serving.band}</span>
-          <span className={cn("text-[12.5px] font-bold qm-tabular", TONE_TEXT[rsrpTone(serving.rsrp)])}>
-            {serving.rsrp ?? "—"} dBm
-          </span>
-          <span className="text-[11.5px] text-muted">{quality.label}</span>
-        </div>
-      </div>
-    </div>
-  ) : null;
-
   function goLockNr(pci: number | null | undefined, arfcn: number | null | undefined, extra?: { band?: string; scs?: string }) {
     setLockForm({ nrPci: String(pci ?? ""), nrArfcn: String(arfcn ?? ""), ...(extra?.band != null ? { nrBand: extra.band } : {}), ...(extra?.scs != null ? { nrScs: extra.scs } : {}) });
     setTab("lock");
@@ -856,7 +931,7 @@ export function CellularPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader section="/cellular" sub={tab} onSubChange={(id) => setTab(id as CellTab)} actions={servingChip} />
+      <PageHeader section="/cellular" sub={tab} onSubChange={(id) => setTab(id as CellTab)} actions={<ServingChip />} />
 
       {tab === "profiles" && (
         <ProfilesView
@@ -886,7 +961,7 @@ export function CellularPage() {
       )}
 
       {tab === "bands" && (
-        <BandsView
+        <BandsTab
           loading={bandsQuery.isLoading}
           groups={bandGroups}
           modePref={modePref}
@@ -896,8 +971,6 @@ export function CellularPage() {
           savedModePref={modeQuery.data?.modePref}
           savedNrDisable={modeQuery.data?.nr5gDisableMode != null ? String(modeQuery.data.nr5gDisableMode) : undefined}
           busy={busy}
-          serving={serving}
-          carriers={modem?.carriers ?? []}
           onToggle={(g, b) => toggleBand(groupSetter[g], b)}
           onSetGroup={setBandGroup}
           onReload={reloadBands}
@@ -912,7 +985,7 @@ export function CellularPage() {
       )}
 
       {tab === "lock" && (
-        <LockView
+        <LockTab
           loading={cellLockQuery.isLoading}
           status={activeLocks}
           lteRaw={cellLockQuery.data?.lteRaw}
@@ -937,7 +1010,6 @@ export function CellularPage() {
           setSchedStart={setSchedStart}
           setSchedEnd={setSchedEnd}
           onSaveSchedule={() => void saveSchedule(Boolean(cellLockQuery.data?.schedule?.enabled), "Lock schedule times saved")}
-          serving={serving}
           busy={busy}
           onPrefill={prefillFromServingCell}
           onLockNr={askNrCellLock}
@@ -947,36 +1019,13 @@ export function CellularPage() {
         />
       )}
 
-      {tab === "align" && (
-        <Suspense fallback={<Skeleton className="h-64" />}>
-          <AlignView
-            active={Boolean(alignData?.active)}
-            samples={alignData?.samples ?? 0}
-            rsrp={liveAlignRsrp}
-            sinr={liveAlignSinr}
-            rsrq={liveAlignRsrq}
-            peakRsrp={peakRsrp}
-            peakSinr={peakSinr}
-            summary={alignSummary}
-            align={alignData}
-            resetSeq={resetSeq}
-            keepAwake={keepAwake}
-            onToggleKeepAwake={(next) => void toggleAlignKeepAwake(next)}
-            busy={busy}
-            onResetPeaks={() => void resetAlignPeaks()}
-            onResetChainPeak={(idx) => void resetAlignChainPeak(idx)}
-            antennaLabels={settings?.antennaLabels}
-            onSaveAntennaLabels={(labels) => void saveAntennaLabels(labels)}
-          />
-        </Suspense>
-      )}
+      {tab === "align" && <AlignTab busy={busy} setBusy={setBusy} notify={notify} />}
 
       {tab === "scan" && (
-        <ScanView
+        <ScanTab
           loading={scanQuery.isLoading}
           fetching={scanQuery.isFetching}
           neighbors={neighbors}
-          serving={serving}
           scanRunning={Boolean(scanQuery.data?.scanRunning)}
           scanResult={scanQuery.data?.scanResult}
           busy={busy}

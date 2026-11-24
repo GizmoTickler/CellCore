@@ -168,6 +168,86 @@ pub async fn get_public_preview(State(ctx): State<HttpCtx>) -> Response {
     .into_response()
 }
 
+pub async fn get_overview_pulse(State(ctx): State<HttpCtx>) -> Response {
+    let (lw_enabled, cl_active, cl_pci, cl_earfcn) = {
+        let s = ctx.app.settings.read().await;
+        let active = !s.cell_lock_nr5g.is_empty() || !s.cell_lock_lte.is_empty();
+        let (nr, lte) = crate::telemetry::target_cell_lock_params(&s);
+        let chosen = nr.or(lte);
+        let pci = chosen.and_then(|(p, _)| u32::try_from(p).ok());
+        let earfcn = chosen.and_then(|(_, a)| a.and_then(|v| u32::try_from(v).ok()));
+        (s.quecwatch_enabled, active, pci, earfcn)
+    };
+    let (lw_state, lw_retry) = {
+        let qw = ctx.app.quecwatch.read().await;
+        let st = if !lw_enabled && qw.status.is_empty() {
+            "disabled".to_string()
+        } else {
+            qw.status.clone()
+        };
+        (st, qw.retry)
+    };
+    let cl_bypassed = ctx
+        .app
+        .cell_lock_bypassed
+        .load(std::sync::atomic::Ordering::Acquire);
+    let cl_bypass_reason = crate::state::CellLockBypassReason::from_u8(
+        ctx.app
+            .cell_lock_bypass_reason
+            .load(std::sync::atomic::Ordering::Acquire),
+    )
+    .as_str();
+    let (dsp_throttling, dsp_sar_state) = {
+        let d = ctx.app.dsp_telemetry.read().await;
+        (d.any_throttling, d.sar_rf_state.unwrap_or(0))
+    };
+    let warp_mode = crate::vpn::current_mode().as_str();
+    let warp_usable = crate::vpn::runtime().usable;
+    let ts = crate::vpn::cached_tailscale_pulse();
+    let (cf_enabled, cf_running, cf_ha_connections) = {
+        let i = ctx.app.internals.read().await;
+        (
+            i.cloudflared_present,
+            i.cloudflared_running,
+            u32::try_from(i.cloudflared_ha_connections).unwrap_or(u32::MAX),
+        )
+    };
+
+    Json(serde_json::json!({
+        "linkWatch": {
+            "enabled": lw_enabled,
+            "state": lw_state,
+            "retry": lw_retry,
+        },
+        "cellLock": {
+            "active": cl_active,
+            "bypassed": cl_bypassed,
+            "bypassReason": cl_bypass_reason,
+            "pci": cl_pci,
+            "earfcn": cl_earfcn,
+        },
+        "dsp": {
+            "tmdThrottling": dsp_throttling,
+            "sarState": dsp_sar_state,
+        },
+        "warp": {
+            "mode": warp_mode,
+            "usable": warp_usable,
+        },
+        "tailscale": {
+            "enabled": ts.enabled,
+            "running": ts.running,
+            "loggedIn": ts.logged_in,
+        },
+        "cloudflared": {
+            "enabled": cf_enabled,
+            "running": cf_running,
+            "haConnections": cf_ha_connections,
+        },
+    }))
+    .into_response()
+}
+
 pub async fn get_bootstrap(State(ctx): State<HttpCtx>) -> Response {
     let modem = ctx.app.modem.read().await.clone();
     let rsrp_hist: Vec<_> = ctx.app.rsrp_hist.read().await.iter().cloned().collect();

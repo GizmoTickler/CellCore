@@ -36,7 +36,20 @@ pub const RING_CAP: usize = SEGMENT_CAP * 2;
 pub const MAX_CAPTURE: usize = 64 * 1024;
 const SUMMARY_CAP: usize = 600;
 const VALUE_CAP: usize = 80;
-const FLUSH_DEBOUNCE: Duration = Duration::from_secs(20);
+const FLUSH_DEBOUNCE: Duration = Duration::from_secs(120);
+
+/// Best-effort non-blocking RFC 3164 datagram write to `/dev/log`, avoiding
+/// per-event `/usr/bin/logger` subprocess forks. Falls back silently when
+/// `/dev/log` is absent (e.g. unit tests or minimal containers).
+fn send_syslog_dgram(msg: &str) {
+    use std::os::unix::net::UnixDatagram;
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+    let _ = sock.set_nonblocking(true);
+    let payload = format!("<134>cellcored: {msg}");
+    let _ = sock.send_to(payload.as_bytes(), "/dev/log");
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -224,11 +237,7 @@ impl AuditLog {
         self.wake.notify_one();
         if self.syslog {
             let line = syslog_line(&entry);
-            if let Ok(h) = tokio::runtime::Handle::try_current() {
-                h.spawn(async move {
-                    let _ = crate::uci::run_cmd("logger", &["-t", "cellcored-audit", "-p", "authpriv.notice", &line], Duration::from_secs(3)).await;
-                });
-            }
+            send_syslog_dgram(&line);
         }
         entry
     }
@@ -262,11 +271,7 @@ impl AuditLog {
         };
         if first_in_window && self.syslog {
             let line = format!("API token authentication failed from {} on {}", clip(peer, 64), clip(&scrub_value(route), 120));
-            if let Ok(h) = tokio::runtime::Handle::try_current() {
-                h.spawn(async move {
-                    let _ = crate::uci::run_cmd("logger", &["-t", "cellcored-audit", "-p", "authpriv.warning", &line], Duration::from_secs(3)).await;
-                });
-            }
+            send_syslog_dgram(&line);
         }
     }
 

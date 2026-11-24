@@ -756,7 +756,9 @@ fn spawn_reader(
     ind_tx: mpsc::Sender<QmiIndication>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        // QMI control SDUs on QRTR are well under 4 KiB; keep idle buffer at 8 KiB
+        // (instead of 64 KiB per service client) to reduce steady-state RSS on embedded RAM.
+        let mut buf = vec![0u8; 8192];
         loop {
             tokio::select! {
                 ev = bus_rx.recv() => {

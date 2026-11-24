@@ -82,6 +82,14 @@ impl CellLockBypassReason {
             _ => Self::None,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Deadman => "deadman",
+            Self::LinkWatch => "link_watch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,17 +1,18 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import { RefreshCw } from "lucide-react";
 import { cn } from "../lib/utils";
 import { useSubRoute } from "../stores/route-store";
 import { useLiveness } from "../stores/ws-store";
-import { Button, LiveDot, PageHeader } from "../components/ui";
+import { Button, LiveDot, PageHeader, Skeleton } from "../components/ui";
 import { SYS_TABS, type SysTab, useSystemController } from "./system/useSystemController";
-import { HardwareView } from "./system/HardwareView";
 import { InternalsView } from "./system/InternalsView";
 import { LogsView } from "./system/LogsView";
 import { MaintenanceView } from "./system/MaintenanceView";
-import { OtaView } from "./system/OtaView";
 import { ConfigBackupView } from "./system/ConfigBackupView";
-import { SecurityView } from "./system/SecurityView";
+
+const HardwareView = lazy(() => import("./system/HardwareView").then((m) => ({ default: m.HardwareView })));
+const OtaView = lazy(() => import("./system/OtaView").then((m) => ({ default: m.OtaView })));
+const SecurityView = lazy(() => import("./system/SecurityView").then((m) => ({ default: m.SecurityView })));
 
 export { validateImeiLuhn } from "./system/useSystemController";
 
@@ -41,13 +42,25 @@ export function SystemPage() {
     <div className="space-y-6">
       <PageHeader section="/system" sub={tab} onSubChange={(id) => setTab(id as SysTab)} actions={actions} />
       <div key={tab} className="qm-rise">
-        {tab === "hardware" && <HardwareView ctl={ctl} />}
+        {tab === "hardware" && (
+          <Suspense fallback={<Skeleton className="h-64" />}>
+            <HardwareView ctl={ctl} />
+          </Suspense>
+        )}
         {tab === "internals" && <InternalsView ctl={ctl} />}
         {tab === "logs" && <LogsView ctl={ctl} />}
         {tab === "alerts" && <MaintenanceView ctl={ctl} />}
-        {tab === "ota" && <OtaView ctl={ctl} />}
+        {tab === "ota" && (
+          <Suspense fallback={<Skeleton className="h-64" />}>
+            <OtaView ctl={ctl} />
+          </Suspense>
+        )}
         {tab === "backup" && <ConfigBackupView />}
-        {tab === "security" && <SecurityView ctl={ctl} />}
+        {tab === "security" && (
+          <Suspense fallback={<Skeleton className="h-64" />}>
+            <SecurityView ctl={ctl} />
+          </Suspense>
+        )}
       </div>
     </div>
   );

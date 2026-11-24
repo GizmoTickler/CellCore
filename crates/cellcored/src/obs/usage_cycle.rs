@@ -230,21 +230,28 @@ pub fn on_bytes(drx: u64, dtx: u64, failover_active: bool) {
 }
 
 /// Every 30 s: seed lifetime once, roll the standby day, fire thresholds and
-/// standby-leak alerts.
-pub fn check_alerts(usage: &DataUsageState, _now: u64) {
-    let (today, secs) = local_now();
+/// standby-leak alerts using pre-summed scalars without cloning `DataUsageState`.
+pub(crate) fn check_alerts_scalars(
+    today: Civil,
+    secs: u32,
+    cycle: Cycle,
+    used: u64,
+    quota_bytes: Option<u64>,
+    monthly_seed: Option<(u64, u64)>,
+    _now: u64,
+) {
     let cfg = lock(&obs().config).usage.clone();
-    let cycle = cycle_bounds(today, usage.billing_cycle_day);
-    let (rx, tx) = sum_days(&usage.daily, cycle.start, today);
-    let used = rx.saturating_add(tx);
     let mut fire_pct = None;
     let mut leak = None;
     {
         let mut p = lock(&obs().persisted);
-        if !p.lifetime_seeded {
-            p.lifetime_rx = usage.monthly.iter().map(|m| m.rx_bytes).sum();
-            p.lifetime_tx = usage.monthly.iter().map(|m| m.tx_bytes).sum();
+        if !p.lifetime_seeded
+            && let Some((m_rx, m_tx)) = monthly_seed
+        {
+            p.lifetime_rx = m_rx;
+            p.lifetime_tx = m_tx;
             p.lifetime_seeded = true;
+            obs().mark_state_dirty();
         }
         let day = today.ymd();
         if p.usage.standby_day != day {
@@ -252,16 +259,22 @@ pub fn check_alerts(usage: &DataUsageState, _now: u64) {
             p.usage.standby_bytes = 0;
         }
         if cfg.thresholds_enabled
-            && let Some(q) = usage.quota_bytes
+            && let Some(q) = quota_bytes
         {
+            let prev_cycle = p.usage.thresholds.cycle_start.clone();
+            let prev_len = p.usage.thresholds.fired.len();
             fire_pct = threshold_to_fire(&mut p.usage.thresholds, &cycle.start.ymd(), q, used);
+            if p.usage.thresholds.cycle_start != prev_cycle || p.usage.thresholds.fired.len() != prev_len {
+                obs().mark_state_dirty();
+            }
         }
         if cfg.standby_floor_bytes > 0 && p.usage.standby_bytes > cfg.standby_floor_bytes && p.usage.leak_alerted_day != day {
             p.usage.leak_alerted_day = day;
             leak = Some(p.usage.standby_bytes);
+            obs().mark_state_dirty();
         }
     }
-    if let (Some(pct), Some(q)) = (fire_pct, usage.quota_bytes) {
+    if let (Some(pct), Some(q)) = (fire_pct, quota_bytes) {
         let projected = project(used, elapsed_days(&cycle, today, secs), cycle.days());
         emit(
             EventKind::UsageThreshold,

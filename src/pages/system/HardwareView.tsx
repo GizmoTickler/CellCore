@@ -1,9 +1,16 @@
 import { useMemo } from "react";
 import { Cpu, Edit3, Eye, EyeOff, ShieldCheck, Thermometer, TriangleAlert } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { useWsStore } from "../../stores/ws-store";
+import type { TempSensor } from "../../types/cellcore";
 import { Badge, Button, Card, CardHeader, CopyButton, Input, Modal, Switch } from "../../components/ui";
 import { FailoverWarning } from "../../components/obs";
-import { validateImeiLuhn, type SystemController } from "./useSystemController";
+import {
+  classifyThermalSubsystem,
+  validateImeiLuhn,
+  type SystemController,
+  type ThermalSubsystem,
+} from "./useSystemController";
 import {
   Field,
   HEAT_GRADIENT,
@@ -16,6 +23,8 @@ import {
   heatPct,
   heatVerdict,
 } from "./parts";
+
+const EMPTY_THERMALS: TempSensor[] = [];
 
 export function HardwareView({ ctl }: { ctl: SystemController }) {
   return (
@@ -38,7 +47,7 @@ function mrzLine(parts: string[], width = 44): string {
 }
 
 function PassportCard({ ctl }: { ctl: SystemController }) {
-  const id = ctl.modem?.identity;
+  const id = useWsStore((s) => s.modem?.identity);
   const { revealSecrets, secretsData } = ctl;
   const model = id?.model || "RM551E-GL";
   const rel = id?.rel || "Release 17";
@@ -165,8 +174,21 @@ function PassportRow({
 /* ───────────────────────── Thermals ───────────────────────── */
 
 function ThermalsCard({ ctl }: { ctl: SystemController }) {
-  const { fmtTemp, thermalGroups } = ctl;
-  const all = ctl.modem?.thermals ?? [];
+  const { fmtTemp } = ctl;
+  const all = useWsStore((s) => s.modem?.thermals) ?? EMPTY_THERMALS;
+
+  const thermalGroups = useMemo(() => {
+    const groups: Record<ThermalSubsystem, Array<{ sensor: string; celsius: number }>> = {
+      "CPU Cluster": [],
+      "Baseband & DSP": [],
+      "RF Transceiver": [],
+      "PHY & Chassis": [],
+    };
+    for (const t of all) {
+      groups[classifyThermalSubsystem(t.sensor)].push(t);
+    }
+    return groups;
+  }, [all]);
 
   const stats = useMemo(() => {
     if (all.length === 0) return null;

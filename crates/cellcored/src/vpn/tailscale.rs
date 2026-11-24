@@ -46,6 +46,34 @@ traffic stops until the exit node is cleared. On a backup WAN that can take upst
 
 static FLAGS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TailscalePulse {
+    pub enabled: bool,
+    pub running: bool,
+    pub logged_in: bool,
+}
+
+static PULSE_CACHE: Mutex<TailscalePulse> = Mutex::new(TailscalePulse {
+    enabled: false,
+    running: false,
+    logged_in: false,
+});
+
+pub fn cached_pulse() -> TailscalePulse {
+    *crate::obs::lock(&PULSE_CACHE)
+}
+
+fn update_pulse_cache(enabled: bool, running: bool, logged_in: Option<bool>) {
+    let mut g = crate::obs::lock(&PULSE_CACHE);
+    g.enabled = enabled;
+    g.running = running;
+    if let Some(li) = logged_in {
+        g.logged_in = li;
+    } else if !running {
+        g.logged_in = false;
+    }
+}
+
 /// Flags `tailscale set` accepts on this build (cached for the daemon's life;
 /// a package upgrade restarts nothing here, so the cache is dropped on install).
 pub async fn set_flags() -> Vec<String> {
@@ -134,6 +162,10 @@ pub async fn get_tailscale(auth: Option<Extension<AuthCtx>>) -> Response {
     let pkg = installed_package().await;
     let (running, enabled) = service_state().await;
     let mut status = if running { ts_status().await.ok() } else { None };
+    let logged_in = status
+        .as_ref()
+        .is_some_and(|s| s.backend_state == "Running");
+    update_pulse_cache(enabled, running, Some(logged_in));
     if is_read_token(&auth)
         && let Some(s) = status.as_mut()
     {
@@ -217,6 +249,7 @@ pub async fn post_service(State(ctx): State<HttpCtx>, Json(req): Json<ServiceReq
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     audit(&ctx, format!("vpn: tailscale service {} (running={running}, enabled={enabled})", req.action));
+    update_pulse_cache(enabled, running, None);
     if !ok_now {
         return server(format!("tailscale {} did not take effect: {}", req.action, out.err_summary(INIT)));
     }
@@ -334,6 +367,11 @@ pub async fn post_login(
     if !out.ok() && st.backend_state != "Running" && st.auth_url.is_none() {
         return fail(StatusCode::BAD_GATEWAY, super::redact(&out.err_summary("tailscale up"), &secrets));
     }
+    {
+        let mut g = crate::obs::lock(&PULSE_CACHE);
+        g.running = true;
+        g.logged_in = st.backend_state == "Running";
+    }
     ok(serde_json::json!({
         "status": "ok",
         "backendState": st.backend_state,
@@ -369,6 +407,7 @@ pub async fn post_logout(
     let _g = mutate_lock().await;
     match run_ok("tailscale", &["logout"], 30, 16 * KIB).await {
         Ok(_) => {
+            crate::obs::lock(&PULSE_CACHE).logged_in = false;
             audit(&ctx, "vpn: tailscale logged out");
             ok(serde_json::json!({ "status": "ok" }))
         }

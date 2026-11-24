@@ -8,7 +8,7 @@ import type {
   AntennaAlignState,
   AuthStateResponse,
   BootstrapPayload,
-  DataUsageState,
+  DataUsageSummary,
   ModemSnapshot,
   PingPoint,
   SignalHistoryPoint,
@@ -37,9 +37,12 @@ const INITIAL_SPEEDTEST: SpeedtestLiveState = {
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let hydrating = false;
+let lastHydrateAt = 0;
 let watchdog: number | null = null;
 let everOpened = false;
 let consecutiveFailures = 0;
+let wakeVisibilityHandler: (() => void) | null = null;
+let wakeOnlineHandler: (() => void) | null = null;
 
 const SIGNAL_BUCKET_MS = 60_000;
 const SIGNAL_HISTORY_CAP = 180;
@@ -179,6 +182,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
     history: [],
   },
   dataUsage: null,
+  usageSummary: null,
   ping: null,
   pingHistory: [],
   memory: null,
@@ -195,7 +199,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
   resetSpeedtest: () => set({ speedtest: { ...INITIAL_SPEEDTEST } }),
   setAntennaAlign: (antennaAlign) => set({ antennaAlign }),
   setInternals: (internals) => set({ internals }),
-  setDataUsage: (dataUsage) => set({ dataUsage }),
+  setDataUsage: (dataUsage) => set({ dataUsage, usageSummary: dataUsage.usageSummary ?? null }),
   setSettings: (settings) => set({ settings }),
   dismissAlert: (index) => set((s) => ({ alerts: s.alerts.filter((_, i) => i !== index) })),
   clearAlerts: () => set({ alerts: [] }),
@@ -225,6 +229,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
     hydrating = true;
     try {
       const boot = await apiFetch<BootstrapPayload>("/api/v1/bootstrap");
+      lastHydrateAt = Date.now();
       set((state) => {
         const pings = Array.isArray(boot.pingHistory)
           ? boot.pingHistory.map((p) => normalizePing(p)).slice(-180)
@@ -245,6 +250,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
             boot.traffic?.lanIface
           ),
           dataUsage: boot.dataUsage ?? state.dataUsage,
+          usageSummary: boot.dataUsage?.usageSummary ?? state.usageSummary,
           pingHistory: pings,
           ping: pings[pings.length - 1] ?? state.ping,
           memory: boot.memory ?? state.memory,
@@ -282,6 +288,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
     const url = `${proto}//${host}/api/v1/ws`;
     set({ status: "connecting" });
     startWatchdog(get, set);
+    attachWakeListeners(get, set);
 
     try {
       const ws = new WebSocket(url);
@@ -295,7 +302,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
         set({ status: "connected", lastFrameAt: Date.now(), stale: false });
         // Catch up on events / failover state and full telemetry missed while disconnected.
         void useObsStore.getState().load();
-        if (isReconnect) {
+        if (isReconnect && Date.now() - lastHydrateAt > 1_500) {
           void get().hydrateBootstrap();
         }
       };
@@ -341,7 +348,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
         if (ch === "network-monitor" && Array.isArray(msg.interfaces)) {
           const ifaces = msg.interfaces as TrafficInterfaceStats[];
-          const usageSum = msg.usageSummary as DataUsageState["usageSummary"] | undefined;
+          const usageSum = msg.usageSummary as DataUsageSummary | undefined;
           set((s) => {
             const nextTraffic = buildTrafficState(ifaces, s.traffic.history, s.traffic);
             const history = [
@@ -352,7 +359,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
               lastFrameAt: now,
               stale: false,
               traffic: { ...nextTraffic, history },
-              dataUsage: s.dataUsage && usageSum ? { ...s.dataUsage, usageSummary: usageSum } : s.dataUsage,
+              ...(usageSum ? { usageSummary: usageSum } : {}),
             };
           });
           return;
@@ -455,7 +462,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
         set({ status: "error" });
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         if (socket !== ws) return;
         socket = null;
         consecutiveFailures += 1;
@@ -473,8 +480,10 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
 
         if (!useAuthStore.getState().authenticated) return;
 
-        // After 3 consecutive failures, verify the session is still valid so expired cookies don't spin forever.
-        if (consecutiveFailures >= 3) {
+        // Immediately verify auth on policy/unauth close (1008/4401) or by the 2nd consecutive failure
+        // so expired sessions don't spin through backoff retries and rotated CSRF tokens resync cleanly.
+        const isAuthClose = ev.code === 1008 || ev.code === 4401;
+        if (isAuthClose || consecutiveFailures >= 2) {
           void apiFetch<AuthStateResponse>("/api/v1/auth/status", { skipAuthRedirect: true })
             .then((res) => {
               const ok = Boolean(res?.authenticated || res?.state === "valid");
@@ -485,6 +494,9 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
                   window.location.hash = "#/login";
                 }
               } else {
+                if (res?.csrfToken || res?.token) {
+                  useAuthStore.getState().setAuthenticated(true, res.token ?? null, res.csrfToken ?? null);
+                }
                 scheduleReconnect();
               }
             })
@@ -504,6 +516,7 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
   disconnect: () => {
     everOpened = false;
     consecutiveFailures = 0;
+    detachWakeListeners();
     if (watchdog != null) {
       window.clearInterval(watchdog);
       watchdog = null;
@@ -520,6 +533,62 @@ export const useWsStore = create<WsStoreState>((set, get) => ({
     set({ status: "disconnected", stale: false });
   },
 }));
+
+function handleWake(get: () => WsStoreState, set: (p: Partial<WsStoreState>) => void) {
+  if (!useAuthStore.getState().authenticated) return;
+  if (reconnectTimer != null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  const s = get();
+  const frameAge = s.lastFrameAt != null ? Date.now() - s.lastFrameAt : Infinity;
+
+  if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+    consecutiveFailures = 0;
+    s.connect();
+  } else if (socket.readyState === WebSocket.OPEN && (s.stale || frameAge > STALE_AFTER_MS)) {
+    const dead = socket;
+    socket = null;
+    try {
+      dead.close();
+    } catch {
+      /* ignore */
+    }
+    consecutiveFailures = 0;
+    set({ status: "disconnected" });
+    s.connect();
+  }
+
+  // Pull fresh telemetry + observability immediately so mobile Safari wakes in <1 s.
+  void s.hydrateBootstrap();
+  void useObsStore.getState().load();
+}
+
+function attachWakeListeners(get: () => WsStoreState, set: (p: Partial<WsStoreState>) => void) {
+  if (wakeVisibilityHandler || wakeOnlineHandler) return;
+  wakeVisibilityHandler = () => {
+    if (document.visibilityState === "visible") {
+      handleWake(get, set);
+    }
+  };
+  wakeOnlineHandler = () => {
+    handleWake(get, set);
+  };
+  document.addEventListener("visibilitychange", wakeVisibilityHandler);
+  window.addEventListener("online", wakeOnlineHandler);
+}
+
+function detachWakeListeners() {
+  if (wakeVisibilityHandler) {
+    document.removeEventListener("visibilitychange", wakeVisibilityHandler);
+    wakeVisibilityHandler = null;
+  }
+  if (wakeOnlineHandler) {
+    window.removeEventListener("online", wakeOnlineHandler);
+    wakeOnlineHandler = null;
+  }
+}
 
 function startWatchdog(get: () => WsStoreState, set: (p: Partial<WsStoreState>) => void) {
   if (watchdog != null) return;

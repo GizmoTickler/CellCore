@@ -377,7 +377,7 @@ export function AtConsoleView({ header }: { header: HeaderFn }) {
                 spellCheck={false}
                 autoCapitalize="characters"
                 autoComplete="off"
-                className="min-w-0 flex-1 h-10 bg-transparent font-mono text-[13.5px] text-ink placeholder:text-muted/70 focus:outline-none"
+                className="min-w-0 flex-1 h-10 bg-transparent font-mono text-[16px] sm:text-[13.5px] text-ink placeholder:text-muted/70 focus:outline-none"
               />
               <Button type="submit" variant="primary" size="sm" disabled={Boolean(running) || !atInput.trim()} className="h-9">
                 {running ? "Running…" : "Run"}

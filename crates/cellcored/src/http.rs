@@ -78,41 +78,41 @@ pub async fn serve_http_and_https(
             tokio::time::sleep(Duration::from_secs(60)).await;
             hb_http_watch.store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
             let lan_clone = lan_ip_watch.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                check_and_heal_self_signed_cert(
+            let prev = last.clone();
+            let reloaded = crate::paths::spawn_blocking(move || {
+                let _ = check_and_heal_self_signed_cert(
                     &TLS_SOURCES,
                     crate::auth::now_secs(),
                     lan_clone.as_deref(),
-                )
-            })
-            .await;
-            let (cp, kp) = resolve_tls_pair(&TLS_SOURCES);
-            let cur = tls_fingerprint(&cp, &kp);
-            if cur != last {
+                );
+                let (cp, kp) = resolve_tls_pair(&TLS_SOURCES);
+                let cur = tls_fingerprint(&cp, &kp);
+                if cur == prev {
+                    return None;
+                }
                 match load_tls_config(&cp, &kp) {
-                    Ok(new_cfg) => {
-                        *tls_watch.write().await = Arc::new(new_cfg);
-                        last = cur;
-                    }
+                    Ok(new_cfg) => Some((new_cfg, cur)),
                     Err(e) => {
                         eprintln!(
                             "cellcored: TLS pair ({}, {}) invalid/mismatched ({e}); falling back to self-signed",
                             cp.display(),
                             kp.display()
                         );
-                        let lan_fb = lan_ip_watch.clone();
-                        let fb_res = tokio::task::spawn_blocking(move || {
-                            ensure_self_signed_fallback(&TLS_SOURCES, lan_fb.as_deref())
-                        })
-                        .await;
-                        if let Ok(Ok((fb_c, fb_k))) = fb_res
+                        if let Ok((fb_c, fb_k)) =
+                            ensure_self_signed_fallback(&TLS_SOURCES, lan_clone.as_deref())
                             && let Ok(fb_cfg) = load_tls_config(&fb_c, &fb_k)
                         {
-                            *tls_watch.write().await = Arc::new(fb_cfg);
-                            last = cur;
+                            Some((fb_cfg, cur))
+                        } else {
+                            None
                         }
                     }
                 }
+            })
+            .await;
+            if let Ok(Some((new_cfg, cur))) = reloaded {
+                *tls_watch.write().await = Arc::new(new_cfg);
+                last = cur;
             }
         }
     });
@@ -503,6 +503,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
 
     let protected = Router::new()
         .route("/api/v1/bootstrap", get(handlers::get_bootstrap))
+        .route("/api/v1/overview/pulse", get(handlers::get_overview_pulse))
         .route("/api/v1/ws", get(ws_upgrade_handler))
         .route("/api/v1/modem/refresh", post(handlers::post_modem_refresh))
         .route("/api/v1/modem/at", post(handlers::post_modem_at))
@@ -607,17 +608,65 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .merge(protected)
         .merge(proxy_routes)
         .fallback_service(static_svc)
-        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .compress_when(ApiCompressionPredicate::default()),
+        )
         .layer(middleware::from_fn(body_deadline_middleware))
         .layer(middleware::from_fn_with_state(ctx.clone(), security_headers_middleware))
         .with_state(ctx)
+}
+
+#[derive(Clone, Default)]
+struct ApiCompressionPredicate {
+    inner: tower_http::compression::predicate::DefaultPredicate,
+}
+
+impl tower_http::compression::predicate::Predicate for ApiCompressionPredicate {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        if !self.inner.should_compress(response) {
+            return false;
+        }
+        // Avoid paying gzip/brotli CPU cost on Cortex-A53 for tiny payloads (< 1 KiB).
+        if !tower_http::compression::predicate::SizeAbove::new(1024).should_compress(response) {
+            return false;
+        }
+        if let Some(ct) = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            let mime = ct.split(';').next().unwrap_or("").trim();
+            if mime.eq_ignore_ascii_case("application/gzip")
+                || mime.eq_ignore_ascii_case("application/x-gzip")
+                || mime.eq_ignore_ascii_case("application/zip")
+                || mime.eq_ignore_ascii_case("application/zstd")
+                || mime.eq_ignore_ascii_case("application/octet-stream")
+                || mime.eq_ignore_ascii_case("font/woff2")
+                || mime.eq_ignore_ascii_case("text/event-stream")
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, next: Next) -> Response {
     ctx.app
         .hb_http_ms
         .store(crate::state::mono_ms(), std::sync::atomic::Ordering::Release);
-    let path = req.uri().path().to_string();
+    let (is_luci, is_assets, is_luci_static) = {
+        let p = req.uri().path();
+        (
+            p.starts_with("/cgi-bin/luci") || p.starts_with("/luci-static/"),
+            p.starts_with("/assets/"),
+            p.starts_with("/luci-static/"),
+        )
+    };
     let hsts = ctx
         .app
         .https_redirect_cached
@@ -644,7 +693,7 @@ async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, n
         HeaderName::from_static("cross-origin-opener-policy"),
         HeaderValue::from_static("same-origin"),
     );
-    if path.starts_with("/cgi-bin/luci") || path.starts_with("/luci-static/") {
+    if is_luci {
         headers.insert(
             HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("DENY"),
@@ -673,12 +722,12 @@ async fn security_headers_middleware(State(ctx): State<HttpCtx>, req: Request, n
             HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         );
     }
-    if path.starts_with("/assets/") {
+    if is_assets {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
         );
-    } else if !path.starts_with("/luci-static/") {
+    } else if !is_luci_static {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -2603,6 +2652,106 @@ mod tests {
             resp_inj.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
             Some("https://192.168.228.1/login")
         );
+    }
+
+    #[test]
+    fn compression_predicate_skips_small_and_binary_responses() {
+        use tower_http::compression::predicate::Predicate;
+        let pred = ApiCompressionPredicate::default();
+
+        let small_json = axum::http::Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, "256")
+            .body(Body::from(vec![b'a'; 256]))
+            .unwrap();
+        assert!(!pred.should_compress(&small_json), "responses < 1024 B must not be compressed");
+
+        let large_json = axum::http::Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, "2048")
+            .body(Body::from(vec![b'a'; 2048]))
+            .unwrap();
+        assert!(pred.should_compress(&large_json), "JSON >= 1024 B should be compressed");
+
+        let binary_gz = axum::http::Response::builder()
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(header::CONTENT_LENGTH, "4096")
+            .body(Body::from(vec![0u8; 4096]))
+            .unwrap();
+        assert!(!pred.should_compress(&binary_gz), "already-compressed binary must not be re-compressed");
+    }
+
+    #[tokio::test]
+    async fn overview_pulse_returns_cached_schema_with_read_token() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt;
+
+        let dir = std::env::temp_dir().join(format!("qm-pulse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ctx = HttpCtx::for_tests(&dir);
+        {
+            let mut s = ctx.app.settings.write().await;
+            s.quecwatch_enabled = true;
+            s.cell_lock_nr5g = "123,632000,30,77".into();
+        }
+        {
+            let mut qw = ctx.app.quecwatch.write().await;
+            qw.status = "healthy".into();
+            qw.retry = 2;
+        }
+        ctx.app
+            .cell_lock_bypassed
+            .store(true, std::sync::atomic::Ordering::Release);
+        ctx.app.cell_lock_bypass_reason.store(
+            crate::state::CellLockBypassReason::Deadman.to_u8(),
+            std::sync::atomic::Ordering::Release,
+        );
+        {
+            let mut dsp = ctx.app.dsp_telemetry.write().await;
+            dsp.any_throttling = true;
+            dsp.sar_rf_state = Some(3);
+        }
+        {
+            let mut i = ctx.app.internals.write().await;
+            i.cloudflared_present = true;
+            i.cloudflared_running = true;
+            i.cloudflared_ha_connections = 4;
+        }
+        let (_info, tok) = ctx
+            .app
+            .tokens
+            .create("pulse-reader", crate::tokens::TokenKind::Read, Some(7))
+            .unwrap();
+        let app = build_router(ctx);
+        let req = Request::builder()
+            .uri("/api/v1/overview/pulse")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["linkWatch"]["enabled"], true);
+        assert_eq!(v["linkWatch"]["state"], "healthy");
+        assert_eq!(v["linkWatch"]["retry"], 2);
+        assert_eq!(v["cellLock"]["active"], true);
+        assert_eq!(v["cellLock"]["bypassed"], true);
+        assert_eq!(v["cellLock"]["bypassReason"], "deadman");
+        assert_eq!(v["cellLock"]["pci"], 123);
+        assert_eq!(v["cellLock"]["earfcn"], 632000);
+        assert_eq!(v["dsp"]["tmdThrottling"], true);
+        assert_eq!(v["dsp"]["sarState"], 3);
+        assert!(v["warp"]["mode"].is_string());
+        assert!(v["warp"]["usable"].is_boolean());
+        assert!(v["tailscale"]["enabled"].is_boolean());
+        assert!(v["tailscale"]["running"].is_boolean());
+        assert!(v["tailscale"]["loggedIn"].is_boolean());
+        assert_eq!(v["cloudflared"]["enabled"], true);
+        assert_eq!(v["cloudflared"]["running"], true);
+        assert_eq!(v["cloudflared"]["haConnections"], 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     impl super::HttpCtx {

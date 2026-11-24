@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     admin::exec::{ExecOpts, KIB, run as exec_run},
     auth::now_secs,
-    state::atomic_write,
+    state::atomic_write_tmpfs,
     uci::run_cmd,
 };
 
@@ -252,7 +252,7 @@ fn load_feed_conf() -> Result<FeedConf, String> {
     let base = fs::read_to_string(crate::paths::p(OPKG_CONF)).map_err(|e| format!("read {OPKG_CONF}: {e}"))?;
     let custom = fs::read_to_string(crate::paths::p(CUSTOM_FEEDS)).unwrap_or_default();
     let fc = build_feed_conf(&base, &custom, FEED_NAME)?;
-    atomic_write(Path::new(&crate::paths::p(FEED_CONF_TMP)), fc.conf.as_bytes(), 0o600)?;
+    atomic_write_tmpfs(Path::new(&crate::paths::p(FEED_CONF_TMP)), fc.conf.as_bytes(), 0o600)?;
     Ok(fc)
 }
 
@@ -621,7 +621,7 @@ pub async fn check_feed() -> CheckRecord {
         },
     }
     if let Ok(json) = serde_json::to_vec(&rec) {
-        let _ = atomic_write(Path::new(&crate::paths::p(CHECK_STATE_PATH)), &json, 0o644);
+        let _ = atomic_write_tmpfs(Path::new(&crate::paths::p(CHECK_STATE_PATH)), &json, 0o644);
     }
     rec
 }
@@ -842,7 +842,7 @@ pub async fn start_upgrade(pkg: &str, requested: Option<&str>) -> Result<Upgrade
     let status_path = crate::paths::p(UPGRADE_STATUS_PATH);
     let feed_conf_path = crate::paths::p(FEED_CONF_TMP);
     // Record "running" before launching so a fast installer's final write wins.
-    let _ = atomic_write(Path::new(&status_path), &serde_json::to_vec(&st).unwrap_or_default(), 0o644);
+    let _ = atomic_write_tmpfs(Path::new(&status_path), &serde_json::to_vec(&st).unwrap_or_default(), 0o644);
     let started_s = started.to_string();
     let pid = spawn_detached(
         INSTALL_SCRIPT,
@@ -866,13 +866,13 @@ pub async fn start_upgrade(pkg: &str, requested: Option<&str>) -> Result<Upgrade
             finished_at: Some(now_secs()),
             ..st.clone()
         };
-        let _ = atomic_write(Path::new(&status_path), &serde_json::to_vec(&failed).unwrap_or_default(), 0o644);
+        let _ = atomic_write_tmpfs(Path::new(&status_path), &serde_json::to_vec(&failed).unwrap_or_default(), 0o644);
     })?;
     st.pid = Some(pid);
     // Only add the pid if the installer has not already finished and
     // written its own result.
     if read_upgrade_status().is_some_and(|s| s.state == "running") {
-        let _ = atomic_write(Path::new(&status_path), &serde_json::to_vec(&st).unwrap_or_default(), 0o644);
+        let _ = atomic_write_tmpfs(Path::new(&status_path), &serde_json::to_vec(&st).unwrap_or_default(), 0o644);
     }
     Ok(st)
 }
@@ -1018,7 +1018,7 @@ pub fn run_verified_cli_upgrade(check_only: bool, yes: bool) -> i32 {
         pid: Some(std::process::id()),
         ..Default::default()
     };
-    let _ = atomic_write(
+    let _ = atomic_write_tmpfs(
         Path::new(&status_path),
         &serde_json::to_vec(&init_st).unwrap_or_default(),
         0o644,

@@ -1367,6 +1367,7 @@ impl Actor {
                 // A fresh start: a pending echo restore is tried again.
                 self.sync_gen += 1;
                 self.healthy.store(true, AtomicOrdering::Relaxed);
+                crate::telemetry::reset_compound_rf_cache();
                 Ok(())
             }
             Err(e) => {

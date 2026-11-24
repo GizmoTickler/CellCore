@@ -137,11 +137,16 @@ pub(crate) fn tick_needs_route_poll(
 /// One monitor step: measure tunnel health and install / withdraw the
 /// table's default route. Returns the action taken.
 pub async fn tick(now: u64) -> RouteAction {
-    let st = load_state();
     let (was, route_installed) = {
         let rt = crate::obs::lock(&RUNTIME);
         (rt.usable, rt.route_installed)
     };
+    // Fast-path when WARP is Off and no residual route is installed: avoid
+    // disk reads, sysfs walks, and subprocess forks every 5 s.
+    if crate::vpn::current_mode() == Mode::Off && !route_installed {
+        return RouteAction::Keep;
+    }
+    let st = load_state();
     // Disabled or unconfigured with no residual route: pure sysfs check, ZERO subprocess forks.
     if st.policy == Mode::Off && !route_installed {
         let present = device_present();

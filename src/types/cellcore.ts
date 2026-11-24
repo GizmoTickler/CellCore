@@ -177,6 +177,13 @@ export interface MonthlyUsageEntry {
   txBytes: number;
 }
 
+export interface DataUsageSummary {
+  todayRx: number;
+  todayTx: number;
+  monthRx: number;
+  monthTx: number;
+}
+
 export interface DataUsageState {
   billingCycleDay: number;
   quotaBytes: number | null;
@@ -185,12 +192,16 @@ export interface DataUsageState {
   lastRawTx: number;
   daily: DailyUsageEntry[];
   monthly: MonthlyUsageEntry[];
-  usageSummary?: {
-    todayRx: number;
-    todayTx: number;
-    monthRx: number;
-    monthTx: number;
-  };
+  usageSummary?: DataUsageSummary;
+}
+
+export interface OverviewPulse {
+  linkWatch: { enabled: boolean; state: string; retry: number };
+  cellLock: { active: boolean; bypassed: boolean; bypassReason: string; pci?: number | null; earfcn?: number | null };
+  dsp: { tmdThrottling: boolean; sarState: number };
+  warp: { mode: string; usable: boolean };
+  tailscale: { enabled: boolean; running: boolean; loggedIn: boolean };
+  cloudflared: { enabled: boolean; running: boolean; haConnections: number };
 }
 
 export interface PingPoint {
@@ -518,6 +529,7 @@ export interface WsStoreState {
     history: TrafficHistoryPoint[];
   };
   dataUsage: DataUsageState | null;
+  usageSummary: DataUsageSummary | null;
   ping: PingPoint | null;
   pingHistory: PingPoint[];
   memory: MemoryTelemetry | null;

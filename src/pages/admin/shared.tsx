@@ -239,7 +239,7 @@ export function TextArea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
   return (
     <textarea
       className={cn(
-        "w-full rounded-xl border border-line bg-raised px-3.5 py-2.5 text-[13px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition",
+        "w-full rounded-xl border border-line bg-raised px-3.5 py-2.5 text-[16px] sm:text-[13px] text-ink placeholder:text-muted/80 focus:outline-none focus:ring-4 focus:ring-ember/15 focus:border-ember transition",
         className
       )}
       {...rest}

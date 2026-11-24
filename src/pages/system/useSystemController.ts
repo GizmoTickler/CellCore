@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch, confirmFirmwareAbSlot, getFirmwareAbStatus, inspectFirmwareAb } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
@@ -132,7 +132,6 @@ export function useSystemController(tab: SysTab) {
   const [abInspect, setAbInspect] = useState<FirmwareAbInspectReport | null>(null);
   const [abPolling, setAbPolling] = useState(false);
 
-  const modem = useWsStore((s) => s.modem);
   const settings = useWsStore((s) => s.settings);
   const internalsStore = useWsStore((s) => s.internals);
   const setInternals = useWsStore((s) => s.setInternals);
@@ -587,25 +586,11 @@ export function useSystemController(tab: SysTab) {
   const useFahrenheit = settings?.temperatureUnit === "fahrenheit";
   const fmtTemp = (c: number) => (useFahrenheit ? `${Math.round(((c * 9) / 5 + 32) * 10) / 10} °F` : `${c} °C`);
 
-  const thermalGroups = useMemo(() => {
-    const groups: Record<ThermalSubsystem, Array<{ sensor: string; celsius: number }>> = {
-      "CPU Cluster": [],
-      "Baseband & DSP": [],
-      "RF Transceiver": [],
-      "PHY & Chassis": [],
-    };
-    for (const t of modem?.thermals ?? []) {
-      groups[classifyThermalSubsystem(t.sensor)].push(t);
-    }
-    return groups;
-  }, [modem?.thermals]);
-
   const internals = internalsQuery.data ?? internalsStore;
   const activeReport = reconcileOutput ?? internals?.lastReconcile ?? null;
 
   return {
     tab,
-    modem,
     settings,
     busy,
     // identity
@@ -625,7 +610,6 @@ export function useSystemController(tab: SysTab) {
     // thermals
     useFahrenheit,
     fmtTemp,
-    thermalGroups,
     // internals
     internals,
     internalsQuery,

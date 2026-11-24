@@ -595,6 +595,36 @@ async fn post_jws(
 // Active certificate inspection
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, PartialEq, Eq)]
+struct CertFileKey {
+    path: String,
+    mtime: i64,
+    mtime_nsec: i64,
+    len: u64,
+    ino: u64,
+}
+
+#[derive(Clone)]
+struct CachedCertInspect {
+    key: CertFileKey,
+    info: ActiveCertInfo,
+    not_after_epoch: Option<i64>,
+}
+
+static CERT_INSPECT_CACHE: OnceLock<std::sync::Mutex<Option<CachedCertInspect>>> = OnceLock::new();
+
+fn cert_file_key(path: &str) -> Option<CertFileKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some(CertFileKey {
+        path: path.to_string(),
+        mtime: m.mtime(),
+        mtime_nsec: m.mtime_nsec(),
+        len: m.len(),
+        ino: m.ino(),
+    })
+}
+
 pub async fn inspect_active_cert() -> ActiveCertInfo {
     let acme_c = crate::paths::p(ACME_CERT_PATH);
     let self_c = crate::paths::p("/etc/cellcore/tls/cert.pem");
@@ -612,6 +642,22 @@ pub async fn inspect_active_cert() -> ActiveCertInfo {
             ..Default::default()
         };
     };
+
+    let file_key = cert_file_key(&path);
+    if let Some(ref key) = file_key {
+        let cache = CERT_INSPECT_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(g) = cache.lock()
+            && let Some(cached) = g.as_ref()
+            && cached.key == *key
+            && cached.info.source == source
+        {
+            let mut info = cached.info.clone();
+            info.days_remaining = cached
+                .not_after_epoch
+                .map(|end_epoch| (end_epoch - crate::auth::now_secs() as i64) / 86_400);
+            return info;
+        }
+    }
 
     let out = match run(
         "openssl",
@@ -667,10 +713,22 @@ pub async fn inspect_active_cert() -> ActiveCertInfo {
         }
     }
 
-    // Compute days remaining via openssl -checkend or date parse
-    if let Ok(end_epoch) = parse_openssl_not_after_epoch(&info.not_after) {
+    // Compute days remaining via parsed notAfter epoch and cache by file stat key
+    // so the 5-minute telemetry loop avoids forking `openssl x509` 288x/day.
+    let not_after_epoch = parse_openssl_not_after_epoch(&info.not_after).ok();
+    if let Some(end_epoch) = not_after_epoch {
         let now = crate::auth::now_secs() as i64;
         info.days_remaining = Some((end_epoch - now) / 86_400);
+    }
+    if let Some(key) = file_key {
+        let cache = CERT_INSPECT_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut g) = cache.lock() {
+            *g = Some(CachedCertInspect {
+                key,
+                info: info.clone(),
+                not_after_epoch,
+            });
+        }
     }
     info
 }

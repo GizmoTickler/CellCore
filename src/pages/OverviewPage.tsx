@@ -31,6 +31,7 @@ import { Badge, Button, CopyButton, LiveDot, Meter, SignalDial, Skeleton, Sparkl
 import { InteractiveAreaChart } from "../components/Charts";
 import { EventRow, FailoverBadge } from "../components/obs";
 import { useObsStore } from "../stores/obs-store";
+import type { OverviewPulse } from "../types/cellcore";
 import { heatInk, heatVerdict } from "./system/parts";
 
 function splitRate(bps: number): { value: string; unit: string } {
@@ -322,82 +323,62 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
   const mimoRsrp = useWsStore((s) => s.modem?.mimo?.rsrp);
   const liveness = useLiveness();
 
-  const qwQ = useQuery({
-    queryKey: ["overview-quecwatch"],
-    queryFn: () =>
-      apiFetch<{ enabled?: boolean; runtime?: { status?: string; retry?: number } }>("/api/v1/diagnostics/quecwatch"),
-    staleTime: 30_000,
+  // Single lightweight snapshot endpoint (zero AT commands on the modem).
+  const pulseQ = useQuery({
+    queryKey: ["overview-pulse"],
+    queryFn: () => apiFetch<OverviewPulse>("/api/v1/overview/pulse"),
+    staleTime: 25_000,
     refetchInterval: 30_000,
     retry: false,
   });
-
-  const lockQ = useQuery({
-    queryKey: ["overview-cell-lock"],
-    queryFn: () =>
-      apiFetch<{
-        lteRaw?: string;
-        nr5gRaw?: string;
-        bypassed?: boolean;
-        schedule?: { lteLock?: string; nr5gLock?: string; bypassed?: boolean };
-      }>("/api/v1/cellular/cell-lock"),
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-    retry: false,
-  });
-
-  const dspQ = useQuery({
-    queryKey: ["overview-dsp"],
-    queryFn: () => apiFetch<{ dsp?: { anyThrottling?: boolean } }>("/api/v1/cellular/dsp"),
-    staleTime: 30_000,
-    refetchInterval: 60_000,
-    retry: false,
-  });
-
-  const warpQ = useQuery({
-    queryKey: ["overview-warp"],
-    queryFn: () =>
-      apiFetch<{ policy?: { mode?: string; usable?: boolean }; interface?: { up?: boolean } }>("/api/v1/vpn/warp"),
-    staleTime: 30_000,
-    refetchInterval: 60_000,
-    retry: false,
-  });
-
-  const tsQ = useQuery({
-    queryKey: ["overview-tailscale"],
-    queryFn: () =>
-      apiFetch<{ service?: { running?: boolean }; status?: { backendState?: string } }>("/api/v1/vpn/tailscale"),
-    staleTime: 30_000,
-    refetchInterval: 60_000,
-    retry: false,
-  });
+  const pulse = pulseQ.data;
 
   // 1. LinkWatch
-  const qwEnabled = qwQ.data?.enabled ?? Boolean(settings?.quecwatchEnabled);
-  const qwStatus = qwQ.data?.runtime?.status ?? (qwEnabled ? "monitoring" : "off");
-  const qwRecovering = qwEnabled && (qwQ.data?.runtime?.retry ?? 0) > 0;
+  const qwEnabled = pulse?.linkWatch.enabled ?? Boolean(settings?.quecwatchEnabled);
+  const qwStatus = pulse?.linkWatch.state || (qwEnabled ? "monitoring" : "off");
+  const qwRecovering = qwEnabled && (pulse?.linkWatch.retry ?? 0) > 0;
 
   // 2. Cell Lock / Dead-Man Bypass
-  const lockBypassed = Boolean(lockQ.data?.bypassed ?? lockQ.data?.schedule?.bypassed);
-  const lteLocked =
-    /"common\/4g"\s*,\s*[1-9]/.test(lockQ.data?.lteRaw ?? "") ||
-    Boolean(lockQ.data?.schedule?.lteLock || settings?.cellLockLte);
-  const nrLocked =
-    /"common\/5g"\s*,\s*[1-9]/.test(lockQ.data?.nr5gRaw ?? "") ||
-    Boolean(lockQ.data?.schedule?.nr5gLock || settings?.cellLockNr5g);
-  const anyLocked = lteLocked || nrLocked;
+  const lockBypassed = Boolean(pulse?.cellLock.bypassed);
+  const anyLocked =
+    pulse != null
+      ? Boolean(pulse.cellLock.active)
+      : Boolean(settings?.cellLockLte || settings?.cellLockNr5g);
+  const lockSubtext = lockBypassed
+    ? pulse?.cellLock.bypassReason
+      ? `Dead-Man: ${pulse.cellLock.bypassReason}`
+      : "Dead-Man active"
+    : anyLocked
+      ? pulse?.cellLock.pci != null
+        ? `PCI ${pulse.cellLock.pci}${pulse.cellLock.earfcn != null ? ` · ${pulse.cellLock.earfcn}` : ""}`
+        : settings?.cellLockNr5g && settings?.cellLockLte
+          ? "5G + LTE pinned"
+          : settings?.cellLockNr5g
+            ? "5G NR pinned"
+            : settings?.cellLockLte
+              ? "LTE pinned"
+              : "Cell lock active"
+      : "Roaming freely";
 
-  // 3. VPN / WARP / Tailscale / Cloudflare Tunnel
-  const warpMode = warpQ.data?.policy?.mode;
-  const warpOn = Boolean(warpMode && warpMode !== "off" && warpQ.data?.interface?.up);
-  const tsOn = Boolean(tsQ.data?.service?.running && tsQ.data?.status?.backendState === "Running");
-  const cfHa = internals?.cloudflaredHaConnections;
-  const tunnelBadges: string[] = [];
-  if (warpOn) tunnelBadges.push(`WARP (${warpMode})`);
-  if (tsOn) tunnelBadges.push("Tailscale");
-  if (cfHa != null && cfHa > 0) tunnelBadges.push(`CF ${cfHa} HA`);
-  else if (internals?.cloudflaredRunning) tunnelBadges.push("Cloudflared");
+  // 3. VPN / WARP / Tailscale / Cloudflared Tunnel
+  const warpMode = pulse?.warp.mode;
+  const warpOn = Boolean(warpMode && warpMode !== "off" && pulse?.warp.usable);
+  const tsOn = Boolean(pulse?.tailscale.running && pulse?.tailscale.loggedIn);
+  const tsNeedsLogin = Boolean(pulse?.tailscale.enabled && pulse?.tailscale.running && !pulse?.tailscale.loggedIn);
+  const cfEnabled = pulse?.cloudflared.enabled ?? Boolean(internals?.cloudflaredPresent);
+  const cfRunning = pulse?.cloudflared.running ?? Boolean(internals?.cloudflaredRunning);
+  const cfHa = pulse?.cloudflared.haConnections ?? internals?.cloudflaredHaConnections ?? 0;
 
-  // 4. Hottest Die Thermal + TMD
+  const tunnelPills: Array<{ label: string; tone: "success" | "warning" }> = [];
+  if (warpOn) tunnelPills.push({ label: `WARP (${warpMode})`, tone: "success" });
+  if (tsOn) tunnelPills.push({ label: "Tailscale", tone: "success" });
+  else if (tsNeedsLogin) tunnelPills.push({ label: "Tailscale · login", tone: "warning" });
+  if (cfRunning && cfHa > 0) tunnelPills.push({ label: `Cloudflared · ${cfHa} HA`, tone: "success" });
+  else if (cfRunning) tunnelPills.push({ label: "Cloudflared", tone: "warning" });
+  else if (cfEnabled) tunnelPills.push({ label: "Cloudflared · down", tone: "warning" });
+  const activeTunnelCount = tunnelPills.filter((p) => p.tone === "success").length;
+
+  // 4. Hottest Die Thermal + TMD / SAR
   const hottest = useMemo(() => {
     const list = thermals ?? [];
     if (list.length === 0) return null;
@@ -406,7 +387,8 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
   const useF = settings?.temperatureUnit === "fahrenheit";
   const fmtTemp = (c: number) => (useF ? `${Math.round(((c * 9) / 5 + 32) * 10) / 10}°F` : `${c}°C`);
   const heat = heatVerdict(hottest?.celsius ?? null);
-  const tmdThrottle = Boolean(dspQ.data?.dsp?.anyThrottling);
+  const tmdThrottle = Boolean(pulse?.dsp.tmdThrottling);
+  const sarState = pulse?.dsp.sarState ?? 0;
 
   // 5. 4x4 MIMO Balance Verdict
   const mimoVerdict = useMemo(() => {
@@ -454,16 +436,8 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
             {lockBypassed ? "Bypassed" : anyLocked ? "Pinned" : "Free"}
           </Badge>
         </div>
-        <div className={cn("text-[13px] font-semibold truncate", lockBypassed ? "text-crimson-ink" : "text-ink")}>
-          {lockBypassed
-            ? "Dead-Man active"
-            : nrLocked && lteLocked
-              ? "5G + LTE pinned"
-              : nrLocked
-                ? "5G NR pinned"
-                : lteLocked
-                  ? "LTE pinned"
-                  : "Roaming freely"}
+        <div className={cn("text-[13px] font-semibold truncate", lockBypassed ? "text-crimson-ink" : "text-ink")} title={lockSubtext}>
+          {lockSubtext}
         </div>
       </a>
 
@@ -475,13 +449,26 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
           <span className="qm-eyebrow flex items-center gap-1.5">
             <Shield className="h-3.5 w-3.5" /> Tunnels
           </span>
-          <Badge variant={tunnelBadges.length > 0 ? "success" : "neutral"} dot={tunnelBadges.length > 0}>
-            {tunnelBadges.length > 0 ? `${tunnelBadges.length} up` : "Direct"}
+          <Badge
+            variant={activeTunnelCount > 0 ? "success" : tunnelPills.length > 0 ? "warning" : "neutral"}
+            dot={tunnelPills.length > 0}
+          >
+            {activeTunnelCount > 0 ? `${activeTunnelCount} up` : tunnelPills.length > 0 ? "Degraded" : "Direct"}
           </Badge>
         </div>
-        <div className="text-[13px] font-semibold text-ink truncate">
-          {tunnelBadges.length > 0 ? tunnelBadges.join(" · ") : "No VPN / Tunnel"}
-        </div>
+        {tunnelPills.length > 0 ? (
+          <div className="flex flex-wrap gap-1">
+            {tunnelPills.map((p) => (
+              <Badge key={p.label} variant={p.tone}>
+                {p.label}
+              </Badge>
+            ))}
+          </div>
+        ) : (
+          <div className="text-[13px] font-semibold text-ink truncate">
+            {pulseQ.isLoading ? "Checking…" : "No VPN / Tunnel"}
+          </div>
+        )}
       </a>
 
       <a
@@ -494,6 +481,8 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
           </span>
           {tmdThrottle ? (
             <Badge variant="danger" dot>TMD Throttle</Badge>
+          ) : sarState > 0 ? (
+            <Badge variant="warning" dot>SAR L{sarState}</Badge>
           ) : (
             <Badge variant={heat.tone === "jade" ? "success" : heat.tone === "saffron" ? "warning" : heat.tone === "crimson" ? "danger" : "neutral"}>
               {heat.label.replace("Running ", "")}
@@ -714,12 +703,13 @@ const LatencyTile = React.memo(function LatencyTile() {
 
 const DataTodayTile = React.memo(function DataTodayTile() {
   const dataUsage = useWsStore((s) => s.dataUsage);
+  const usageSummary = useWsStore((s) => s.usageSummary);
   const rxTotalBytes = useWsStore((s) => s.traffic.rxTotalBytes);
   const txTotalBytes = useWsStore((s) => s.traffic.txTotalBytes);
 
   const usage = useMemo(() => {
-    if (dataUsage?.usageSummary) {
-      const u = dataUsage.usageSummary;
+    const u = usageSummary ?? dataUsage?.usageSummary;
+    if (u) {
       return { today: u.todayRx + u.todayTx, month: u.monthRx + u.monthTx, todayRx: u.todayRx, todayTx: u.todayTx };
     }
     const d = dataUsage?.daily?.[dataUsage.daily.length - 1];
@@ -730,7 +720,7 @@ const DataTodayTile = React.memo(function DataTodayTile() {
       todayRx: d?.rxBytes ?? rxTotalBytes,
       todayTx: d?.txBytes ?? txTotalBytes,
     };
-  }, [dataUsage, rxTotalBytes, txTotalBytes]);
+  }, [usageSummary, dataUsage, rxTotalBytes, txTotalBytes]);
 
   return (
     <Panel>
