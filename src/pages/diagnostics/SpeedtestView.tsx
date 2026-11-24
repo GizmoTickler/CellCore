@@ -1,13 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ExternalLink, History, Minus, Play, Radio, RefreshCw, Square, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ExternalLink, History, Minus, Play, Radio, Square, Trash2 } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { cn } from "../../lib/utils";
 import { useWsStore } from "../../stores/ws-store";
 import { useToastStore } from "../../stores/toast-store";
-import type { SpeedtestRun, SpeedtestServerOption } from "../../types/cellcore";
-import { Badge, Button, Card, CardHeader, LiveDot, Meter, Modal, Select } from "../../components/ui";
+import type { SpeedtestRun } from "../../types/cellcore";
+import { Badge, Button, Card, CardHeader, LiveDot, Meter, Modal } from "../../components/ui";
 import { DualAreaChart, SmoothAreaChart } from "../../components/Charts";
 import { TONE_INK, TONE_SOFT, errMsg, fmtMbps, gradeMeta, median, type HeaderFn } from "./shared";
 
@@ -73,8 +72,6 @@ function Delta({ latest, base }: { latest: number; base: number | null }) {
 export function SpeedtestView({ header }: { header: HeaderFn }) {
   const push = useToastStore((s) => s.push);
   const [busy, setBusy] = useState<string | null>(null);
-  const [selectedServerId, setSelectedServerId] = useState<string>("");
-  const [engine, setEngine] = useState<"auto" | "native">("auto");
   const [confirmClear, setConfirmClear] = useState(false);
 
   const speedtest = useWsStore((s) => s.speedtest);
@@ -83,13 +80,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
   const refreshSpeedtestHistory = useWsStore((s) => s.refreshSpeedtestHistory);
   const resetSpeedtest = useWsStore((s) => s.resetSpeedtest);
 
-  const serversQuery = useQuery({
-    queryKey: ["speedtest-servers"],
-    queryFn: ({ signal }) => apiFetch<{ servers?: SpeedtestServerOption[] }>("/api/v1/speedtest/servers", { signal }),
-    staleTime: 120000,
-    retry: 1,
-  });
-
   useEffect(() => {
     void refreshSpeedtestHistory();
   }, [refreshSpeedtestHistory]);
@@ -97,12 +87,9 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
   async function startSpeedtestRun() {
     setBusy("speedtest");
     try {
-      const serverId = engine === "auto" && selectedServerId ? Number(selectedServerId) : undefined;
-      const payload: Record<string, unknown> = { engine };
-      if (serverId) payload.serverId = serverId;
       await disruptiveFetch("speedtest", "/api/v1/speedtest/start", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ engine: "native" }),
       });
       resetSpeedtest();
     } catch (e) {
@@ -191,8 +178,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [speedtestHistory]);
 
-  const servers = serversQuery.data?.servers ?? [];
-
   return (
     <>
       {header(
@@ -203,7 +188,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
             rel="noreferrer"
             className="inline-flex h-9 items-center gap-1.5 rounded-full border border-line bg-raised px-4 text-[13px] font-semibold text-ink hover:border-line-strong"
           >
-            Result on Ookla <ExternalLink className="h-3.5 w-3.5" />
+            External result <ExternalLink className="h-3.5 w-3.5" />
           </a>
         ) : undefined
       )}
@@ -320,69 +305,13 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
             )}
 
             {/* Controls */}
-            <div className="space-y-2.5">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11.5px] font-semibold text-muted mr-1">Engine</span>
-                {(
-                  [
-                    { id: "auto", label: "Ookla (Auto)" },
-                    { id: "native", label: "Native Rust · Cloudflare" },
-                  ] as const
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    disabled={speedtest.running}
-                    onClick={() => setEngine(opt.id)}
-                    className={cn(
-                      "rounded-full px-3 py-1 text-[12px] font-semibold transition-colors border",
-                      engine === opt.id
-                        ? "border-ember bg-ember-soft text-ember-ink"
-                        : "border-line bg-surface text-muted hover:text-ink"
-                    )}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
+            <div className="flex flex-col sm:flex-row gap-2.5">
+              <div className="flex min-h-12 flex-1 items-center rounded-2xl border border-line bg-sunk/60 px-4 py-2.5 text-[12.5px] leading-snug font-medium text-ink-2 min-w-0">
+                <span className="min-w-0 break-words">
+                  Native Rust · Cloudflare Anycast · 8-stream HTTP + loaded bufferbloat
+                </span>
               </div>
-              <div className="flex flex-col sm:flex-row gap-2.5">
-                <div className="flex gap-1.5 min-w-0 sm:flex-1">
-                  {engine === "native" ? (
-                    <div className="flex min-h-12 flex-1 items-center rounded-2xl border border-line bg-sunk/60 px-4 py-2.5 text-[12.5px] leading-snug font-medium text-ink-2 min-w-0">
-                      <span className="min-w-0 break-words">
-                        Cloudflare Anycast · 8-stream HTTP + loaded bufferbloat
-                      </span>
-                    </div>
-                  ) : (
-                    <>
-                      <Select
-                        value={selectedServerId}
-                        onChange={(e) => setSelectedServerId(e.target.value)}
-                        disabled={speedtest.running}
-                        aria-label="Speedtest server"
-                        className="h-12 rounded-2xl"
-                      >
-                        <option value="">Auto · nearest server</option>
-                        {servers.map((s) => (
-                          <option key={s.id} value={String(s.id)}>
-                            {s.name} — {s.location} (#{s.id})
-                          </option>
-                        ))}
-                      </Select>
-                      <Button
-                        variant="secondary"
-                        className="h-12 w-12 shrink-0 rounded-2xl px-0"
-                        onClick={() => serversQuery.refetch()}
-                        aria-label="Refresh speedtest servers"
-                        title="Refresh server list"
-                        disabled={serversQuery.isFetching || speedtest.running}
-                      >
-                        <RefreshCw className={cn("h-4 w-4", serversQuery.isFetching && "animate-spin")} />
-                      </Button>
-                    </>
-                  )}
-                </div>
-                {speedtest.running ? (
+              {speedtest.running ? (
                   <Button
                     variant="danger"
                     size="lg"
@@ -405,7 +334,6 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                     Run speedtest
                   </Button>
                 )}
-              </div>
             </div>
             <p className="-mt-3 text-[11.5px] text-muted">Each run saturates the link for several seconds and counts against your data plan.</p>
           </div>
@@ -581,7 +509,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                             target="_blank"
                             rel="noreferrer"
                             className="shrink-0 rounded-full p-1 text-muted hover:text-ember-ink hover:bg-ember-soft"
-                            aria-label="Open result on Ookla"
+                            aria-label="Open external result"
                           >
                             <ExternalLink className="h-3 w-3" />
                           </a>

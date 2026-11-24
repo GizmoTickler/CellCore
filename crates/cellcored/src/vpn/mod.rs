@@ -283,8 +283,8 @@ pub fn bypass_mark() -> Option<u32> {
     (current_mode() != Mode::Off).then_some(BYPASS_MARK)
 }
 
-/// Cellular device to bind tools that cannot set a mark (curl for the public
-/// IP, the Ookla CLI) while WARP steering is on.
+/// Cellular device to bind tools that cannot set a mark (e.g. curl for the
+/// public IP, native speedtest sockets) while WARP steering is on.
 pub fn bypass_iface() -> Option<String> {
     if current_mode() == Mode::Off {
         return None;

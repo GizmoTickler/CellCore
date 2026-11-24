@@ -1,8 +1,6 @@
 use std::{
     net::SocketAddr,
     os::fd::AsRawFd,
-    path::Path,
-    process::Stdio,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -10,26 +8,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
-    process::Command,
     sync::watch,
 };
 
 use crate::{
     auth::now_secs,
     state::{
-        AppState, SpeedtestLiveState, SpeedtestRun, SpeedtestSample, format_now_hms,
+        AppState, SpeedtestLiveState, SpeedtestRun, SpeedtestSample, format_now_hms, mono_ms,
         save_json_atomic_async,
     },
 };
 
 pub const SPEEDTEST_HISTORY_PATH: &str = "/etc/cellcore/speedtest_history.json";
-/// A full run normally takes 30-60 s; anything past this is hung.
-pub const SPEEDTEST_MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(180);
-const STDERR_TAIL_BYTES: usize = 2048;
 
 const NATIVE_DEFAULT_HOST: &str = "speed.cloudflare.com";
 const NATIVE_DEFAULT_PORT: u16 = 80;
@@ -41,43 +34,21 @@ const NATIVE_DL_SECS: u64 = 10;
 const NATIVE_UL_SECS: u64 = 8;
 const NATIVE_WARMUP_SECS: f64 = 2.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SpeedtestEngine {
-    #[default]
-    Auto,
-    Ookla,
-    Native,
-}
+/// Grace period after a local speedtest ends during which rmnet byte deltas
+/// are still draining and must not falsely trip failover or standby-leak alerts.
+const SELF_TRAFFIC_SETTLE_MS: u64 = 10_000;
 
-/// Read a pipe to EOF keeping only the last `max` bytes, so the child can
-/// never block on a full stderr pipe.
-pub async fn drain_tail<R: tokio::io::AsyncRead + Unpin>(mut r: R, max: usize) -> String {
-    let mut tail: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                tail.extend_from_slice(&buf[..n]);
-                if tail.len() > max {
-                    let cut = tail.len() - max;
-                    tail.drain(..cut);
-                }
-            }
-        }
+static LAST_SPEEDTEST_END_MONO_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns true while CellCore's own speedtest is running (or within
+/// `SELF_TRAFFIC_SETTLE_MS` after it finished) so the failover throughput
+/// heuristic and standby-leak detector ignore self-generated test traffic.
+pub async fn is_self_traffic_active(state: &AppState) -> bool {
+    if state.speedtest_live.read().await.running {
+        return true;
     }
-    String::from_utf8_lossy(&tail).trim().to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpeedtestServerOption {
-    pub id: i64,
-    pub host: String,
-    pub port: u16,
-    pub name: String,
-    pub location: String,
-    pub country: String,
+    let ended = LAST_SPEEDTEST_END_MONO_MS.load(Ordering::Relaxed);
+    ended != 0 && mono_ms().saturating_sub(ended) < SELF_TRAFFIC_SETTLE_MS
 }
 
 pub fn compute_bufferbloat_grade(
@@ -107,7 +78,7 @@ pub fn compute_bufferbloat_grade(
 }
 
 /// Interquartile mean (IQM) of positive finite latency samples — robust against
-/// single-packet spikes, matching Ookla/Cloudflare loaded-latency reporting.
+/// single-packet spikes, matching Cloudflare loaded-latency reporting.
 pub fn compute_iqm(samples: &[f64]) -> Option<f64> {
     let mut vals: Vec<f64> = samples
         .iter()
@@ -167,521 +138,27 @@ pub fn parse_cf_meta_headers(headers_text: &str) -> (Option<String>, Option<Stri
     (ext_ip, colo)
 }
 
-pub async fn list_nearby_servers() -> Result<Vec<SpeedtestServerOption>, String> {
-    let child = Command::new(crate::paths::p("/usr/bin/speedtest"))
-        .env("HOME", crate::paths::p("/tmp/cellcore"))
-        .args(["--accept-license", "--accept-gdpr", "-f", "json", "-L"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to launch speedtest: {e}"))?;
-
-    let out = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
-        .await
-        .map_err(|_| "Timed out listing speedtest servers".to_string())?
-        .map_err(|e| format!("Speedtest wait failed: {e}"))?;
-
-    if !out.status.success() {
-        return Err("Speedtest server discovery failed".into());
-    }
-    let val: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("Invalid server list JSON: {e}"))?;
-    let mut servers = Vec::new();
-    if let Some(arr) = val.get("servers").and_then(|v| v.as_array()) {
-        for s in arr.iter().take(15) {
-            servers.push(SpeedtestServerOption {
-                id: s.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                host: s.get("host").and_then(|v| v.as_str()).unwrap_or("").into(),
-                port: s.get("port").and_then(|v| v.as_u64()).unwrap_or(8080) as u16,
-                name: s.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown").into(),
-                location: s.get("location").and_then(|v| v.as_str()).unwrap_or("").into(),
-                country: s.get("country").and_then(|v| v.as_str()).unwrap_or("").into(),
-            });
-        }
-    }
-    Ok(servers)
-}
-
-const SERVER_LIST_TTL: Duration = Duration::from_secs(600);
-const SERVER_LIST_ERR_TTL: Duration = Duration::from_secs(60);
-
-#[derive(Default)]
-struct ServerListCacheState {
-    ok: Option<(Instant, Vec<SpeedtestServerOption>)>,
-    last_err: Option<(Instant, String)>,
-}
-
-type ServerListCache = Mutex<ServerListCacheState>;
-static SERVER_LIST_CACHE: OnceLock<ServerListCache> = OnceLock::new();
-static SERVER_LIST_FLIGHT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-fn server_cache() -> &'static ServerListCache {
-    SERVER_LIST_CACHE.get_or_init(|| Mutex::new(ServerListCacheState::default()))
-}
-
-/// Return cached nearby Ookla servers within `SERVER_LIST_TTL`, collapsing
-/// concurrent cache misses onto one `speedtest -L` subprocess and falling back
-/// to stale data (or an empty list) with a warning string on transient failure.
-pub async fn list_nearby_servers_cached() -> (Vec<SpeedtestServerOption>, Option<String>) {
-    if let Ok(g) = server_cache().lock() {
-        if let Some((ts, list)) = g.ok.as_ref()
-            && ts.elapsed() < SERVER_LIST_TTL
+/// Check whether HTTP response headers request closing the keep-alive connection.
+fn header_requests_close(headers_text: &str) -> bool {
+    for line in headers_text.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("connection")
+            && v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("close"))
         {
-            return (list.clone(), None);
-        }
-        if let Some((ts, msg)) = g.last_err.as_ref()
-            && ts.elapsed() < SERVER_LIST_ERR_TTL
-        {
-            let stale = g.ok.as_ref().map(|(_, list)| list.clone()).unwrap_or_default();
-            return (stale, Some(msg.clone()));
+            return true;
         }
     }
-    let _flight = SERVER_LIST_FLIGHT
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    if let Ok(g) = server_cache().lock() {
-        if let Some((ts, list)) = g.ok.as_ref()
-            && ts.elapsed() < SERVER_LIST_TTL
-        {
-            return (list.clone(), None);
-        }
-        if let Some((ts, msg)) = g.last_err.as_ref()
-            && ts.elapsed() < SERVER_LIST_ERR_TTL
-        {
-            let stale = g.ok.as_ref().map(|(_, list)| list.clone()).unwrap_or_default();
-            return (stale, Some(msg.clone()));
-        }
-    }
-    match list_nearby_servers().await {
-        Ok(servers) => {
-            if let Ok(mut g) = server_cache().lock() {
-                g.ok = Some((Instant::now(), servers.clone()));
-                g.last_err = None;
-            }
-            (servers, None)
-        }
-        Err(e) => {
-            let stale = if let Ok(mut g) = server_cache().lock() {
-                g.last_err = Some((Instant::now(), e.clone()));
-                g.ok.as_ref().map(|(_, list)| list.clone()).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            (stale, Some(e))
-        }
-    }
-}
-
-fn build_speedtest_args(server_id: Option<i64>) -> Vec<String> {
-    let mut args = vec![
-        "--accept-license".to_string(),
-        "--accept-gdpr".to_string(),
-        "-f".to_string(),
-        "json".to_string(),
-        "-p".to_string(),
-        "yes".to_string(),
-        "--progress-update-interval=100".to_string(),
-    ];
-    if let Some(id) = server_id.filter(|&x| x > 0) {
-        args.push("--server-id".into());
-        args.push(id.to_string());
-    }
-    // Measure the cellular link, not the WARP tunnel, while WARP steers
-    // modem traffic (no-op otherwise).
-    if let Some(dev) = crate::vpn::bypass_iface() {
-        args.push(format!("--interface={dev}"));
-    }
-    args
-}
-
-fn pick_retry_server_id() -> Option<i64> {
-    let g = server_cache().lock().ok()?;
-    let (_, list) = g.ok.as_ref()?;
-    list.get(1)
-        .or_else(|| list.first())
-        .map(|s| s.id)
-        .filter(|&id| id > 0)
-}
-
-fn spawn_speedtest_child(bin: &str, home: &str, args: &[String]) -> Result<tokio::process::Child, String> {
-    Command::new(bin)
-        .env("HOME", home)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("Failed to start speedtest binary: {e}"))
+    false
 }
 
 async fn finish_speedtest_slot(state: &AppState) {
+    LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Relaxed);
     *state.speedtest_pid.lock().await = None;
     *state.speedtest_cancel.lock().await = None;
 }
 
-#[cfg(test)]
-pub async fn start_speedtest(state: AppState, server_id: Option<i64>) -> Result<(), String> {
-    start_speedtest_with_engine(state, server_id, SpeedtestEngine::Auto).await
-}
-
-pub async fn start_speedtest_with_engine(
-    state: AppState,
-    server_id: Option<i64>,
-    engine: SpeedtestEngine,
-) -> Result<(), String> {
-    let bin_path = crate::paths::p("/usr/bin/speedtest");
-    let use_native = match engine {
-        SpeedtestEngine::Native => true,
-        SpeedtestEngine::Ookla => false,
-        SpeedtestEngine::Auto => !Path::new(&bin_path).exists(),
-    };
-    if use_native {
-        return start_native_speedtest(state, NATIVE_DEFAULT_HOST.to_string(), NATIVE_DEFAULT_PORT, None).await;
-    }
-
-    let mut pid_guard = state.speedtest_pid.lock().await;
-    if pid_guard.is_some() {
-        return Err("Speedtest is already running".into());
-    }
-
-    let home_path = crate::paths::p("/tmp/cellcore");
-    let hist_path = crate::paths::p(SPEEDTEST_HISTORY_PATH);
-
-    let first_args = build_speedtest_args(server_id);
-    let first_child = spawn_speedtest_child(&bin_path, &home_path, &first_args)?;
-
-    let child_pid = first_child.id().unwrap_or(0);
-    *pid_guard = Some(child_pid);
-    drop(pid_guard);
-
-    {
-        let mut live = state.speedtest_live.write().await;
-        *live = SpeedtestLiveState {
-            running: true,
-            phase: "starting".into(),
-            progress: 4,
-            engine: Some("ookla".into()),
-            ..Default::default()
-        };
-        broadcast_speedtest(&state, &live);
-    }
-
-    let max_attempts: usize = if server_id.is_none() { 2 } else { 1 };
-    let attempt_timeout = if max_attempts > 1 {
-        Duration::from_secs(90)
-    } else {
-        SPEEDTEST_MAX_RUNTIME
-    };
-
-    tokio::spawn(async move {
-        let mut child_opt = Some(first_child);
-        for attempt in 1..=max_attempts {
-            let mut child = match child_opt.take() {
-                Some(c) => c,
-                None => {
-                    let retry_args = build_speedtest_args(pick_retry_server_id());
-                    match spawn_speedtest_child(&bin_path, &home_path, &retry_args) {
-                        Ok(c) => {
-                            let new_pid = c.id().unwrap_or(0);
-                            let mut pid_guard = state.speedtest_pid.lock().await;
-                            if pid_guard.is_none() {
-                                return;
-                            }
-                            *pid_guard = Some(new_pid);
-                            drop(pid_guard);
-                            let mut live = state.speedtest_live.write().await;
-                            if !live.running || live.phase == "stopped" {
-                                finish_speedtest_slot(&state).await;
-                                return;
-                            }
-                            live.phase = "starting".into();
-                            live.progress = 4;
-                            broadcast_speedtest(&state, &live);
-                            c
-                        }
-                        Err(msg) => {
-                            finish_speedtest_slot(&state).await;
-                            let mut live = state.speedtest_live.write().await;
-                            if live.running {
-                                live.running = false;
-                                if live.phase != "stopped" {
-                                    live.phase = "error".into();
-                                    live.error = Some(msg);
-                                }
-                                broadcast_speedtest(&state, &live);
-                            }
-                            return;
-                        }
-                    }
-                }
-            };
-
-            let stdout = child.stdout.take();
-            let stderr_task = child.stderr.take().map(|e| tokio::spawn(drain_tail(e, STDERR_TAIL_BYTES)));
-            let mut last_dl_iqm: Option<f64> = None;
-            let mut last_ul_iqm: Option<f64> = None;
-
-            let reading = async {
-                if let Some(out) = stdout {
-                    let mut reader = BufReader::new(out).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        let trimmed = line.trim();
-                        if !trimmed.starts_with('{') {
-                            continue;
-                        }
-                        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                            continue;
-                        };
-                        let ev = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                        let mut live = state.speedtest_live.write().await;
-                        let now_ms = now_secs() * 1000;
-                        match ev {
-                            "testStart" => {
-                                live.phase = "ping".into();
-                                live.progress = 8;
-                                live.isp = v.get("isp").and_then(|x| x.as_str()).map(|s| s.to_string());
-                                if let Some(srv) = v.get("server") {
-                                    live.server_name = srv.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
-                                    live.server_location = srv.get("location").and_then(|x| x.as_str()).map(|s| s.to_string());
-                                }
-                            }
-                            "ping" => {
-                                live.phase = "ping".into();
-                                if let Some(p) = v.get("ping") {
-                                    live.ping_ms = p.get("latency").and_then(|x| x.as_f64()).map(round2);
-                                    live.jitter_ms = p.get("jitter").and_then(|x| x.as_f64()).map(round2);
-                                    let prog = p.get("progress").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    live.progress = (prog * 20.0).round().clamp(5.0, 20.0) as u8;
-                                }
-                            }
-                            "download" => {
-                                live.phase = "download".into();
-                                if let Some(d) = v.get("download") {
-                                    let bw = d.get("bandwidth").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    let mbps = round2((bw * 8.0) / 1_000_000.0);
-                                    live.download_mbps = Some(mbps);
-                                    if let Some(iqm) = d.get("latency").and_then(|l| l.get("iqm")).and_then(|x| x.as_f64()) {
-                                        let rounded = round2(iqm);
-                                        live.dl_latency_iqm = Some(rounded);
-                                        last_dl_iqm = Some(rounded);
-                                    }
-                                    let prog = d.get("progress").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    live.progress = 20 + (prog * 40.0).round().clamp(0.0, 40.0) as u8;
-                                    let dl_iqm_copy = live.dl_latency_iqm;
-                                    live.samples.push(SpeedtestSample {
-                                        ts: now_ms,
-                                        phase: "download".into(),
-                                        mbps,
-                                        latency_iqm: dl_iqm_copy,
-                                    });
-                                    if live.samples.len() > 160 {
-                                        live.samples.remove(0);
-                                    }
-                                }
-                            }
-                            "upload" => {
-                                live.phase = "upload".into();
-                                if let Some(u) = v.get("upload") {
-                                    let bw = u.get("bandwidth").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    let mbps = round2((bw * 8.0) / 1_000_000.0);
-                                    live.upload_mbps = Some(mbps);
-                                    if let Some(iqm) = u.get("latency").and_then(|l| l.get("iqm")).and_then(|x| x.as_f64()) {
-                                        let rounded = round2(iqm);
-                                        live.ul_latency_iqm = Some(rounded);
-                                        last_ul_iqm = Some(rounded);
-                                    }
-                                    let prog = u.get("progress").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    live.progress = 60 + (prog * 40.0).round().clamp(0.0, 40.0) as u8;
-                                    let ul_iqm_copy = live.ul_latency_iqm;
-                                    live.samples.push(SpeedtestSample {
-                                        ts: now_ms,
-                                        phase: "upload".into(),
-                                        mbps,
-                                        latency_iqm: ul_iqm_copy,
-                                    });
-                                    if live.samples.len() > 160 {
-                                        live.samples.remove(0);
-                                    }
-                                }
-                            }
-                            "result" => {
-                                let ping_ms = v.get("ping").and_then(|p| p.get("latency")).and_then(|x| x.as_f64()).map(round2);
-                                let jitter_ms = v.get("ping").and_then(|p| p.get("jitter")).and_then(|x| x.as_f64()).map(round2);
-                                let dl_mbps = v
-                                    .get("download")
-                                    .and_then(|d| d.get("bandwidth"))
-                                    .and_then(|x| x.as_f64())
-                                    .map(|bw| round2((bw * 8.0) / 1_000_000.0));
-                                let ul_mbps = v
-                                    .get("upload")
-                                    .and_then(|u| u.get("bandwidth"))
-                                    .and_then(|x| x.as_f64())
-                                    .map(|bw| round2((bw * 8.0) / 1_000_000.0));
-                                let dl_iqm = v
-                                    .get("download")
-                                    .and_then(|d| d.get("latency"))
-                                    .and_then(|l| l.get("iqm"))
-                                    .and_then(|x| x.as_f64())
-                                    .map(round2)
-                                    .or(last_dl_iqm);
-                                let ul_iqm = v
-                                    .get("upload")
-                                    .and_then(|u| u.get("latency"))
-                                    .and_then(|l| l.get("iqm"))
-                                    .and_then(|x| x.as_f64())
-                                    .map(round2)
-                                    .or(last_ul_iqm);
-                                let grade = compute_bufferbloat_grade(ping_ms, dl_iqm, ul_iqm);
-
-                                live.running = false;
-                                live.phase = "complete".into();
-                                live.progress = 100;
-                                live.ping_ms = ping_ms;
-                                live.jitter_ms = jitter_ms;
-                                live.download_mbps = dl_mbps;
-                                live.upload_mbps = ul_mbps;
-                                live.dl_latency_iqm = dl_iqm;
-                                live.ul_latency_iqm = ul_iqm;
-                                live.bufferbloat_grade = Some(grade.clone());
-                                live.packet_loss = v.get("packetLoss").and_then(|x| x.as_f64()).map(round2);
-                                live.isp = v
-                                    .get("isp")
-                                    .and_then(|x| x.as_str())
-                                    .or_else(|| v.get("server").and_then(|s| s.get("isp")).and_then(|x| x.as_str()))
-                                    .map(|s| s.to_string())
-                                    .or_else(|| live.isp.clone());
-                                live.server_name = v
-                                    .get("server")
-                                    .and_then(|s| s.get("name"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string())
-                                    .or_else(|| live.server_name.clone());
-                                live.server_location = v
-                                    .get("server")
-                                    .and_then(|s| s.get("location"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string())
-                                    .or_else(|| live.server_location.clone());
-                                live.external_ip = v
-                                    .get("interface")
-                                    .and_then(|i| i.get("externalIp"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
-                                live.result_url = v
-                                    .get("result")
-                                    .and_then(|r| r.get("url"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
-
-                                let ts = now_secs();
-                                let run = SpeedtestRun {
-                                    id: format!("st-{ts}"),
-                                    timestamp: format_now_hms(),
-                                    ts,
-                                    download_mbps: dl_mbps.unwrap_or(0.0),
-                                    upload_mbps: ul_mbps.unwrap_or(0.0),
-                                    ping_ms: ping_ms.unwrap_or(0.0),
-                                    jitter_ms: jitter_ms.unwrap_or(0.0),
-                                    packet_loss: live.packet_loss,
-                                    dl_latency_iqm: dl_iqm,
-                                    ul_latency_iqm: ul_iqm,
-                                    bufferbloat_grade: grade,
-                                    isp: live.isp.clone(),
-                                    server_id: v.get("server").and_then(|s| s.get("id")).and_then(|x| x.as_i64()),
-                                    server_name: live.server_name.clone(),
-                                    server_location: live.server_location.clone(),
-                                    external_ip: live.external_ip.clone(),
-                                    result_url: live.result_url.clone(),
-                                    engine: Some("ookla".into()),
-                                };
-                                drop(live);
-                                let hist_snap = {
-                                    let mut hist = state.speedtest_history.write().await;
-                                    hist.insert(0, run);
-                                    hist.truncate(50);
-                                    hist.clone()
-                                };
-                                let _ = save_json_atomic_async(&hist_path, hist_snap, 0o600).await;
-                                let live_after = state.speedtest_live.read().await;
-                                broadcast_speedtest(&state, &live_after);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                        broadcast_speedtest(&state, &live);
-                    }
-                }
-            };
-            let timed_out = tokio::time::timeout(attempt_timeout, reading).await.is_err();
-            if timed_out {
-                let _ = child.start_kill();
-            }
-
-            let status = child.wait().await;
-            let stderr_tail = match stderr_task {
-                Some(t) => tokio::time::timeout(Duration::from_secs(2), t)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default(),
-                None => String::new(),
-            };
-
-            let completed_or_stopped = {
-                let live = state.speedtest_live.read().await;
-                let has_pid = state.speedtest_pid.lock().await.is_some();
-                !live.running || live.phase == "stopped" || !has_pid
-            };
-            if completed_or_stopped {
-                finish_speedtest_slot(&state).await;
-                return;
-            }
-
-            let rate_limited = status.as_ref().ok().and_then(|st| st.code()) == Some(173)
-                || stderr_tail.to_ascii_lowercase().contains("too many requests");
-            if attempt < max_attempts && !rate_limited {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let still_active = {
-                    let has_pid = state.speedtest_pid.lock().await.is_some();
-                    let live = state.speedtest_live.read().await;
-                    has_pid && live.running && live.phase != "stopped"
-                };
-                if still_active {
-                    continue;
-                }
-                finish_speedtest_slot(&state).await;
-                return;
-            }
-
-            finish_speedtest_slot(&state).await;
-            let mut live = state.speedtest_live.write().await;
-            if live.running {
-                live.running = false;
-                if live.phase != "stopped" {
-                    live.phase = "error".into();
-                    let mut msg = if timed_out {
-                        format!("Speedtest timed out after {} s", attempt_timeout.as_secs())
-                    } else {
-                        match status {
-                            Ok(st) => format!("Speedtest exited with code {:?}", st.code()),
-                            Err(e) => format!("Speedtest failed: {e}"),
-                        }
-                    };
-                    if let Some(last) = stderr_tail.lines().last().filter(|l| !l.trim().is_empty()) {
-                        msg.push_str(&format!(": {}", last.trim()));
-                    }
-                    live.error = Some(msg);
-                }
-                broadcast_speedtest(&state, &live);
-            }
-            return;
-        }
-    });
-
-    Ok(())
+pub async fn start_speedtest(state: AppState) -> Result<(), String> {
+    start_native_speedtest(state, NATIVE_DEFAULT_HOST.to_string(), NATIVE_DEFAULT_PORT, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -748,16 +225,41 @@ fn parse_http_status(headers: &str) -> u16 {
         .unwrap_or(0)
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+#[derive(Debug)]
+enum ProbeErr {
+    /// Clean keep-alive socket recycle by the remote edge (EOF / reset on reused socket)
+    /// — NOT network packet loss; caller should transparently reconnect once.
+    KeepAliveClosed,
+    /// Genuine probe timeout or transport error.
+    Transport(String),
+}
+
+async fn read_http_headers_typed(stream: &mut TcpStream) -> Result<(String, Vec<u8>), ProbeErr> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
         let n = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut tmp))
             .await
-            .map_err(|_| "header timeout".to_string())?
-            .map_err(|e| format!("header read: {e}"))?;
+            .map_err(|_| ProbeErr::Transport("header timeout".to_string()))?
+            .map_err(|e| {
+                if buf.is_empty()
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                {
+                    ProbeErr::KeepAliveClosed
+                } else {
+                    ProbeErr::Transport(format!("header read: {e}"))
+                }
+            })?;
         if n == 0 {
-            return Err("unexpected EOF reading HTTP headers".into());
+            if buf.is_empty() {
+                return Err(ProbeErr::KeepAliveClosed);
+            }
+            return Err(ProbeErr::Transport("unexpected EOF reading HTTP headers".into()));
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -766,9 +268,16 @@ async fn read_http_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), 
             return Ok((hdr, rest));
         }
         if buf.len() > 16384 {
-            return Err("HTTP response headers too large".into());
+            return Err(ProbeErr::Transport("HTTP response headers too large".into()));
         }
     }
+}
+
+async fn read_http_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+    read_http_headers_typed(stream).await.map_err(|e| match e {
+        ProbeErr::KeepAliveClosed => "keep-alive closed".into(),
+        ProbeErr::Transport(s) => s,
+    })
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -782,20 +291,29 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-async fn probe_http_rtt(
+async fn probe_http_rtt_typed(
     stream: &mut TcpStream,
     host: &str,
     meas_id: u64,
-) -> Result<(f64, String), String> {
+) -> Result<(f64, String), ProbeErr> {
     let req = format!(
         "GET /__down?measId={meas_id}&bytes=0 HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
     );
     let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(3), stream.write_all(req.as_bytes()))
         .await
-        .map_err(|_| "probe write timeout".to_string())?
-        .map_err(|e| format!("probe write: {e}"))?;
-    let (hdr, rest) = read_http_headers(stream).await?;
+        .map_err(|_| ProbeErr::Transport("probe write timeout".to_string()))?
+        .map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) {
+                ProbeErr::KeepAliveClosed
+            } else {
+                ProbeErr::Transport(format!("probe write: {e}"))
+            }
+        })?;
+    let (hdr, rest) = read_http_headers_typed(stream).await?;
     let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(cl) = parse_content_length(&hdr)
         && cl > rest.len()
@@ -814,6 +332,19 @@ async fn probe_http_rtt(
     Ok((rtt_ms, hdr))
 }
 
+async fn probe_http_rtt(
+    stream: &mut TcpStream,
+    host: &str,
+    meas_id: u64,
+) -> Result<(f64, String), String> {
+    probe_http_rtt_typed(stream, host, meas_id)
+        .await
+        .map_err(|e| match e {
+            ProbeErr::KeepAliveClosed => "keep-alive closed".into(),
+            ProbeErr::Transport(s) => s,
+        })
+}
+
 async fn native_dl_worker(
     addr: SocketAddr,
     host: String,
@@ -827,7 +358,9 @@ async fn native_dl_worker(
     );
     let mut buf = vec![0u8; 256 * 1024];
     while !*stop_rx.borrow() {
-        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), Some(2 * 1024 * 1024), None).await else {
+        // 1 MiB SO_RCVBUF per stream × 8 streams = 8 MiB aggregate window (saturates 1.5+ Gbps
+        // without over-filling carrier RLC queues and spiking loaded latency).
+        let Ok(mut stream) = connect_native_socket(addr, bypass_dev.as_deref(), Some(1024 * 1024), None).await else {
             tokio::time::sleep(Duration::from_millis(120)).await;
             continue;
         };
@@ -868,7 +401,7 @@ async fn native_dl_worker(
                     }
                 }
             }
-            if eof {
+            if eof || header_requests_close(&hdr) {
                 break;
             }
         }
@@ -1002,8 +535,54 @@ async fn native_ul_worker(
                     rem = rem.saturating_sub(n);
                 }
             }
+            if header_requests_close(&hdr) {
+                break;
+            }
         }
     }
+}
+
+/// Probe a single loaded HTTP RTT, transparently reconnecting once when the
+/// remote server closes an idle/max-requests keep-alive socket so normal
+/// keep-alive recycles are never miscounted as packet loss.
+async fn probe_once_with_keepalive_retry(
+    stream_opt: &mut Option<TcpStream>,
+    addr: SocketAddr,
+    host: &str,
+    meas_id: u64,
+    bypass_dev: Option<&str>,
+) -> Result<f64, ()> {
+    let mut reused = stream_opt.is_some();
+    for _attempt in 0..2 {
+        if stream_opt.is_none() {
+            match connect_native_socket(addr, bypass_dev, None, None).await {
+                Ok(s) => {
+                    *stream_opt = Some(s);
+                    reused = false;
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        let s = stream_opt.as_mut().expect("stream populated");
+        match probe_http_rtt_typed(s, host, meas_id).await {
+            Ok((rtt, hdr)) => {
+                if header_requests_close(&hdr) {
+                    *stream_opt = None;
+                }
+                return Ok(rtt);
+            }
+            Err(ProbeErr::KeepAliveClosed) if reused => {
+                *stream_opt = None;
+                reused = false;
+                continue;
+            }
+            Err(_) => {
+                *stream_opt = None;
+                return Err(());
+            }
+        }
+    }
+    Err(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1019,24 +598,29 @@ async fn native_loaded_ping_worker(
 ) {
     let mut stream_opt: Option<TcpStream> = None;
     while !*stop_rx.borrow() {
-        if stream_opt.is_none() {
-            stream_opt = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await.ok();
+        let res = tokio::select! {
+            _ = stop_rx.changed() => break,
+            r = probe_once_with_keepalive_retry(
+                &mut stream_opt,
+                addr,
+                &host,
+                meas_id,
+                bypass_dev.as_deref(),
+            ) => r,
+        };
+        if *stop_rx.borrow() {
+            break;
         }
         probes_sent.fetch_add(1, Ordering::Relaxed);
-        if let Some(s) = stream_opt.as_mut() {
-            match probe_http_rtt(s, &host, meas_id).await {
-                Ok((rtt, _)) => {
-                    if let Ok(mut g) = samples.lock() {
-                        g.push(rtt);
-                    }
-                }
-                Err(_) => {
-                    probes_failed.fetch_add(1, Ordering::Relaxed);
-                    stream_opt = None;
+        match res {
+            Ok(rtt) => {
+                if let Ok(mut g) = samples.lock() {
+                    g.push(rtt);
                 }
             }
-        } else {
-            probes_failed.fetch_add(1, Ordering::Relaxed);
+            Err(()) => {
+                probes_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
         tokio::select! {
             _ = stop_rx.changed() => break,
@@ -1150,7 +734,7 @@ async fn run_native_pipeline(
             }
         }
     }
-    let (addr, bypass_dev, mut ping_stream) = connected.ok_or(last_err)?;
+    let (addr, bypass_dev, ping_stream) = connected.ok_or(last_err)?;
 
     // --- Phase 1: Idle Latency & Edge Discovery ---
     let meas_id = now_secs()
@@ -1162,12 +746,17 @@ async fn run_native_pipeline(
     let probes_sent = Arc::new(AtomicU64::new(0));
     let probes_failed = Arc::new(AtomicU64::new(0));
 
+    let mut ping_opt: Option<TcpStream> = Some(ping_stream);
     for i in 0..10 {
         if *cancel_rx.borrow() {
             return Ok(());
         }
         if i == 0 {
-            let (_rtt, hdr) = probe_http_rtt(&mut ping_stream, host, meas_id).await?;
+            let s = ping_opt.as_mut().expect("initial stream");
+            let (_rtt, hdr) = probe_http_rtt(s, host, meas_id).await?;
+            if header_requests_close(&hdr) {
+                ping_opt = None;
+            }
             let (ip, c) = parse_cf_meta_headers(&hdr);
             ext_ip = ip;
             colo = c;
@@ -1182,15 +771,20 @@ async fn run_native_pipeline(
             continue;
         }
         probes_sent.fetch_add(1, Ordering::Relaxed);
-        match probe_http_rtt(&mut ping_stream, host, meas_id).await {
-            Ok((rtt, _hdr)) => {
+        match probe_once_with_keepalive_retry(
+            &mut ping_opt,
+            addr,
+            host,
+            meas_id,
+            bypass_dev.as_deref(),
+        )
+        .await
+        {
+            Ok(rtt) => {
                 idle_rtts.push(rtt);
             }
-            Err(_) => {
+            Err(()) => {
                 probes_failed.fetch_add(1, Ordering::Relaxed);
-                if let Ok(reconn) = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await {
-                    ping_stream = reconn;
-                }
             }
         }
         let cur_ping = compute_iqm(&idle_rtts);
@@ -1203,7 +797,7 @@ async fn run_native_pipeline(
         broadcast_speedtest(state, &live);
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    drop(ping_stream);
+    drop(ping_opt);
 
     let idle_ping = compute_iqm(&idle_rtts);
     let idle_jitter = compute_jitter(&idle_rtts);
@@ -1456,17 +1050,8 @@ pub async fn stop_speedtest(state: &AppState) -> Result<(), String> {
     if let Some(cancel) = state.speedtest_cancel.lock().await.take() {
         let _ = cancel.send(true);
     }
-    let pid_opt = {
-        let mut guard = state.speedtest_pid.lock().await;
-        guard.take()
-    };
-    if let Some(pid) = pid_opt
-        && pid > 0
-    {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
-        }
-    }
+    *state.speedtest_pid.lock().await = None;
+    LAST_SPEEDTEST_END_MONO_MS.store(mono_ms(), Ordering::Relaxed);
     let mut live = state.speedtest_live.write().await;
     live.running = false;
     live.phase = "stopped".into();
@@ -1497,15 +1082,55 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn computes_iqm_jitter_and_cf_headers() {
+    fn computes_iqm_jitter_cf_headers_and_connection_close() {
         assert_eq!(compute_iqm(&[10.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 500.0]), Some(25.0));
         assert_eq!(compute_iqm(&[]), None);
         assert_eq!(compute_jitter(&[20.0, 24.0, 22.0, 26.0]), Some(3.33));
-        let hdr = "HTTP/1.1 200 OK\r\ncf-meta-ip: 203.0.113.42\r\ncf-ray: 8a1b2c3d4e5f-IAD\r\n";
+        let hdr = "HTTP/1.1 200 OK\r\ncf-meta-ip: 203.0.113.42\r\ncf-ray: 8a1b2c3d4e5f-IAD\r\nConnection: close\r\n";
         assert_eq!(
             parse_cf_meta_headers(hdr),
             (Some("203.0.113.42".into()), Some("IAD".into()))
         );
+        assert!(header_requests_close(hdr));
+        assert!(!header_requests_close("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"));
+    }
+
+    #[tokio::test]
+    async fn keepalive_eof_and_connection_close_do_not_report_false_packet_loss() {
+        // Server closes the TCP connection after every single probe (simulating
+        // Cloudflare edge keep-alive recycle / Connection: close).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut count = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                count += 1;
+                let announce_close = count % 2 == 1;
+                tokio::spawn(async move {
+                    if read_http_headers(&mut sock).await.is_ok() {
+                        let resp = if announce_close {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            // Claim keep-alive then close socket immediately (EOF on next probe)
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                        };
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let mut stream_opt: Option<TcpStream> = None;
+        for _ in 0..6 {
+            let rtt = probe_once_with_keepalive_retry(&mut stream_opt, addr, "127.0.0.1", 42, None)
+                .await
+                .expect("keep-alive close/EOF must reconnect transparently without loss");
+            assert!(rtt >= 0.0);
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -1581,6 +1206,7 @@ mod tests {
                 start_native_speedtest(app.clone(), "127.0.0.1".into(), addr.port(), Some(durs))
                     .await
                     .unwrap();
+                assert!(is_self_traffic_active(&app).await);
                 for _ in 0..160 {
                     if !app.speedtest_live.read().await.running && app.speedtest_pid.lock().await.is_none() {
                         break;
@@ -1593,132 +1219,16 @@ mod tests {
                 assert_eq!(live.engine.as_deref(), Some("native"));
                 assert_eq!(live.server_location.as_deref(), Some("PoP IAD"));
                 assert_eq!(live.external_ip.as_deref(), Some("198.51.100.7"));
+                assert_eq!(live.packet_loss, Some(0.0), "{live:?}");
                 assert!(live.download_mbps.unwrap_or(0.0) > 1.0, "{live:?}");
                 assert!(live.upload_mbps.unwrap_or(0.0) > 1.0, "{live:?}");
                 let hist = app.speedtest_history.read().await;
                 assert_eq!(hist.len(), 1);
                 assert_eq!(hist[0].engine.as_deref(), Some("native"));
+                // Immediately after completion, settle window keeps self-traffic active
+                assert!(is_self_traffic_active(&app).await);
             })
             .await;
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn stderr_is_drained_so_a_chatty_child_cannot_block() {
-        let mut child = Command::new("sh")
-            .args(["-c", "head -c 262144 /dev/zero | tr '\\0' 'e' >&2; echo 'last error line' >&2; echo done"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let err = tokio::spawn(drain_tail(child.stderr.take().unwrap(), 64));
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
-        assert_eq!(first.expect("child blocked on stderr").unwrap().as_deref(), Some("done"));
-        let tail = err.await.unwrap();
-        assert!(tail.ends_with("last error line") && tail.len() <= 64, "{tail:?}");
-        let _ = child.wait().await;
-    }
-
-    #[tokio::test]
-    async fn auto_speedtest_retries_once_on_transient_failure_while_explicit_server_does_not() {
-        let env = crate::paths::TestSandbox::new("speedtest-retry");
-        let counter = env.root.join("calls.cnt");
-        std::fs::write(&counter, "0\n").unwrap();
-        env.write_exec(
-            "/usr/bin/speedtest",
-            &format!(
-                "#!/bin/sh\n\
-                 cnt=$(cat {c})\n\
-                 cnt=$((cnt + 1))\n\
-                 printf '%s\\n' \"$cnt\" > {c}\n\
-                 if [ \"$cnt\" -eq 1 ]; then\n\
-                   echo 'Socket error' >&2\n\
-                   exit 2\n\
-                 fi\n\
-                 printf '%s\\n' '{{\"type\":\"result\",\"ping\":{{\"latency\":12.0,\"jitter\":0.5}},\"download\":{{\"bandwidth\":12500000,\"latency\":{{\"iqm\":20.0}}}},\"upload\":{{\"bandwidth\":12500000,\"latency\":{{\"iqm\":18.0}}}},\"server\":{{\"id\":100,\"name\":\"TestSrv\",\"location\":\"City\"}}}}'\n",
-                c = counter.display(),
-            ),
-        );
-
-        let auth = crate::auth::AuthStore::new(env.root.join("sessions"));
-        let app = AppState::for_tests(env.root.clone(), auth);
-
-        crate::paths::TEST_ENV
-            .scope(env.env(), async {
-                // Explicit serverId must NOT retry on failure.
-                start_speedtest(app.clone(), Some(999999999)).await.unwrap();
-                for _ in 0..80 {
-                    if !app.speedtest_live.read().await.running && app.speedtest_pid.lock().await.is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
-                assert_eq!(app.speedtest_live.read().await.phase, "error");
-                assert!(app.speedtest_pid.lock().await.is_none());
-
-                // Automatic selection (server_id: None) retries once after transient failure.
-                std::fs::write(&counter, "0\n").unwrap();
-                start_speedtest(app.clone(), None).await.unwrap();
-                for _ in 0..160 {
-                    if !app.speedtest_live.read().await.running && app.speedtest_pid.lock().await.is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
-                let live = app.speedtest_live.read().await.clone();
-                assert_eq!(live.phase, "complete");
-                assert!(!live.running);
-                assert!(app.speedtest_pid.lock().await.is_none());
-                let hist = app.speedtest_history.read().await;
-                assert_eq!(hist.len(), 1);
-                assert_eq!(hist[0].download_mbps, 100.0);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn auto_speedtest_does_not_retry_on_rate_limit_exit_173() {
-        let env = crate::paths::TestSandbox::new("speedtest-ratelimit");
-        let counter = env.root.join("calls.cnt");
-        std::fs::write(&counter, "0\n").unwrap();
-        env.write_exec(
-            "/usr/bin/speedtest",
-            &format!(
-                "#!/bin/sh\n\
-                 cnt=$(cat {c})\n\
-                 cnt=$((cnt + 1))\n\
-                 printf '%s\\n' \"$cnt\" > {c}\n\
-                 echo 'Too many requests received.' >&2\n\
-                 exit 173\n",
-                c = counter.display(),
-            ),
-        );
-
-        let auth = crate::auth::AuthStore::new(env.root.join("sessions"));
-        let app = AppState::for_tests(env.root.clone(), auth);
-
-        crate::paths::TEST_ENV
-            .scope(env.env(), async {
-                start_speedtest(app.clone(), None).await.unwrap();
-                for _ in 0..80 {
-                    if !app.speedtest_live.read().await.running && app.speedtest_pid.lock().await.is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
-                let live = app.speedtest_live.read().await.clone();
-                assert_eq!(live.phase, "error");
-                assert!(!live.running);
-                let err = live.error.unwrap_or_default();
-                assert!(err.contains("173"), "{err}");
-                assert!(err.contains("Too many requests"), "{err}");
-                assert!(app.speedtest_pid.lock().await.is_none());
-            })
-            .await;
     }
 }

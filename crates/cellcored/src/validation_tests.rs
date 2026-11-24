@@ -1586,17 +1586,18 @@ async fn speedtest_start_rejects_malformed_unknown_and_wrong_content_type_withou
         send_raw(Some("application/json"), br#"{"serverId":-5}"#.to_vec()).await,
         StatusCode::BAD_REQUEST
     );
+    assert_eq!(
+        send_raw(Some("application/json"), br#"{"engine":"ookla"}"#.to_vec()).await,
+        StatusCode::BAD_REQUEST
+    );
     assert!(!marker.exists(), "invalid POST /api/v1/speedtest/start must never spawn speedtest");
     assert!(t.app.speedtest_pid.lock().await.is_none());
 
-    // Empty body without Content-Type still triggers auto-server speedtest (200).
+    // Empty body without Content-Type starts the pure-Rust native speedtest (200)
+    // and must NEVER execute an external /usr/bin/speedtest binary.
     assert_eq!(send_raw(None, Vec::new()).await, StatusCode::OK);
-    for _ in 0..80 {
-        if !t.app.speedtest_live.read().await.running && t.app.speedtest_pid.lock().await.is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(marker.exists());
+    assert_eq!(t.app.speedtest_live.read().await.engine.as_deref(), Some("native"));
+    let _ = crate::speedtest::stop_speedtest(&t.app).await;
+    assert!(!marker.exists(), "native speedtest must never exec /usr/bin/speedtest");
     assert!(t.app.speedtest_pid.lock().await.is_none());
 }

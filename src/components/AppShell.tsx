@@ -419,8 +419,8 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       {
         id: "speedtest",
         label: "Run a speedtest",
-        hint: "Ookla throughput + loaded latency grade",
-        keywords: "speed test bandwidth",
+        hint: "Native Cloudflare throughput + loaded latency grade",
+        keywords: "speed test bandwidth cloudflare bufferbloat",
         icon: <Gauge className="h-4 w-4" />,
         run: () => {
           window.location.hash = hrefFor("/diagnostics", "speedtest");

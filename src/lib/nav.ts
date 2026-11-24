@@ -65,7 +65,7 @@ export const NAV: NavSection[] = [
     hint: "Speed, latency, AT console, SMS and events",
     icon: "pulse",
     subs: [
-      { id: "speedtest", label: "Speedtest", hint: "Throughput and bufferbloat grade", keywords: "speedtest ookla bufferbloat throughput" },
+      { id: "speedtest", label: "Speedtest", hint: "Throughput and bufferbloat grade", keywords: "speedtest cloudflare bufferbloat throughput" },
       { id: "health", label: "Health Watch", hint: "LinkWatch connection monitor", keywords: "health quecwatch watchdog monitor" },
       { id: "latency", label: "Latency", hint: "Ping history and keep-alive", keywords: "latency ping keepalive rrc" },
       { id: "at", label: "AT Console", hint: "Send AT commands to the modem", keywords: "at terminal command console" },

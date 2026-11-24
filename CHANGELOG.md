@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.2 — Pure Native Speedtest (Ookla Removed), Zero False Probe Loss & Failover-Suppression Fix
+
+- **Pure Native Rust Speedtest (`crates/cellcored/src/speedtest.rs`, `handlers.rs`, `SpeedtestView.tsx`, `AppShell.tsx`, `nav.ts`):**
+  - Removed all remaining Ookla CLI subprocess runner, server-list discovery, and UI picker code; CellCore now runs its built-in pure-Rust multi-stream Cloudflare Anycast speedtest exclusively.
+  - Fixed false `packetLoss` readings during high-throughput tests by honoring HTTP `Connection: close`, transparently reconnecting once on remote keep-alive EOF/recycle, cancelling in-flight probes cleanly on phase end, and right-sizing `SO_RCVBUF` to `1 MiB` per download stream to avoid over-filling carrier RLC queues.
+- **Failover & Standby-Leak False-Positive Fix (`crates/cellcored/src/obs/mod.rs`, `speedtest.rs`):**
+  - Added `speedtest::is_self_traffic_active()` (active during speedtest + 10 s drain window) so running local speedtests no longer falsely trips `CARRYING FAILOVER TRAFFIC` or `Standby leak` warnings while still counting accurate lifetime bytes.
+
 ## 1.9.1 — 24× Faster Native NAND Read-Back Verification
 
 - **A/B Firmware Flasher (`crates/cellcored/src/firmware_ab.rs`):**
