@@ -7,6 +7,8 @@ import type {
   FirmwareAbScope,
   FirmwareAbStatus,
   FirmwareAbSwitchRequest,
+  FirmwareUploadResponse,
+  StagedFirmwareFile,
 } from "@/types/cellcore";
 
 export class ApiError extends Error {
@@ -106,6 +108,96 @@ export async function getFirmwareAbStatus(): Promise<FirmwareAbStatus> {
   return apiFetch<FirmwareAbStatus>("/api/v1/system/firmware-ab");
 }
 
+export async function getFirmwareAbStaged(): Promise<{ files: StagedFirmwareFile[] }> {
+  return apiFetch<{ files: StagedFirmwareFile[] }>("/api/v1/system/firmware-ab/staged");
+}
+
+function normalizeFirmwareUploadFilename(raw: string): string {
+  const trimmed = raw.trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/.test(trimmed) && !trimmed.includes("..") && trimmed.length <= 128) {
+    return trimmed;
+  }
+  const withoutZip = trimmed.replace(/\.zip$/i, "");
+  let cleaned = withoutZip
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[._-]+/, "");
+  if (!cleaned) cleaned = "firmware-upload";
+  if (cleaned.length > 124) cleaned = cleaned.slice(0, 124);
+  return `${cleaned}.zip`;
+}
+
+export function uploadFirmwareAbZip(
+  file: File,
+  onProgress: (pct: number, loaded: number, total: number) => void
+): Promise<FirmwareUploadResponse> {
+  return new Promise<FirmwareUploadResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const { token, csrfToken } = useAuthStore.getState();
+
+    xhr.open("POST", "/api/v1/system/firmware-ab/upload", true);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("X-Firmware-Filename", normalizeFirmwareUploadFilename(file.name));
+    xhr.setRequestHeader("X-QM-CSRF", csrfToken || "1");
+    if (token && /^[0-9a-fA-F]{16,64}$/.test(token)) {
+      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    }
+
+    xhr.upload.onprogress = (ev) => {
+      const total = ev.lengthComputable && ev.total > 0 ? ev.total : file.size;
+      const loaded = ev.loaded;
+      const pct = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      onProgress(pct, loaded, total);
+    };
+
+    xhr.onload = () => {
+      const text = xhr.responseText || "";
+      if (xhr.status === 401) {
+        useWsStore.getState().disconnect();
+        useAuthStore.getState().clearAuth();
+        if (window.location.hash !== "#/login") {
+          window.location.hash = "#/login";
+        }
+        reject(new ApiError(401, "Session expired"));
+        return;
+      }
+      let parsed: Record<string, unknown> | undefined;
+      try {
+        const raw = JSON.parse(text) as unknown;
+        if (raw && typeof raw === "object") parsed = raw as Record<string, unknown>;
+      } catch {
+        // non-JSON response handled below
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress(100, file.size, file.size);
+        if (parsed) {
+          resolve(parsed as unknown as FirmwareUploadResponse);
+        } else {
+          reject(new ApiError(xhr.status, "Invalid upload response from daemon"));
+        }
+        return;
+      }
+      let msg = text.trim() || `HTTP ${xhr.status}`;
+      if (typeof parsed?.error === "string" && parsed.error) msg = parsed.error;
+      else if (typeof parsed?.message === "string" && parsed.message) msg = parsed.message;
+      else if (/^<!doctype\s+html|^<html\b/i.test(msg)) msg = `HTTP ${xhr.status} (/api/v1/system/firmware-ab/upload)`;
+      else if (msg.length > 240) msg = `${msg.slice(0, 240)}…`;
+      reject(new ApiError(xhr.status, msg, parsed));
+    };
+
+    xhr.onerror = () => {
+      reject(new ApiError(0, "Network error while uploading firmware archive"));
+    };
+
+    xhr.onabort = () => {
+      reject(new ApiError(0, "Firmware upload aborted"));
+    };
+
+    xhr.send(file);
+  });
+}
+
 export async function inspectFirmwareAb(params: {
   path: string;
   scope?: FirmwareAbScope;
@@ -131,7 +223,7 @@ export async function flashFirmwareAb(body: FirmwareAbFlashRequest): Promise<{
   });
 }
 
-export async function switchFirmwareAbSlot(body: FirmwareAbSwitchRequest): Promise<{
+export async function switchFirmwareAb(body: FirmwareAbSwitchRequest): Promise<{
   ok: boolean;
   rebooting: boolean;
 }> {
@@ -140,6 +232,8 @@ export async function switchFirmwareAbSlot(body: FirmwareAbSwitchRequest): Promi
     body: JSON.stringify(body),
   });
 }
+
+export const switchFirmwareAbSlot = switchFirmwareAb;
 
 export async function confirmFirmwareAbSlot(): Promise<{ ok: boolean }> {
   return apiFetch("/api/v1/system/firmware-ab/confirm", {

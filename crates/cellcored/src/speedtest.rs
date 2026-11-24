@@ -18,8 +18,8 @@ use tokio::{
 use crate::{
     auth::now_secs,
     state::{
-        AppState, SpeedtestLiveState, SpeedtestRun, SpeedtestSample, format_now_hms, mono_ms,
-        save_json_atomic_async,
+        AppState, ModemSnapshot, SpeedtestLiveState, SpeedtestRfSnapshot, SpeedtestRun,
+        SpeedtestSample, format_now_hms, mono_ms, save_json_atomic_async,
     },
 };
 
@@ -935,6 +935,11 @@ async fn run_native_pipeline(
         broadcast_speedtest(state, &live);
     }
 
+    let rf = {
+        let modem = state.modem.read().await;
+        capture_rf_snapshot(&modem)
+    };
+
     let run = SpeedtestRun {
         id: format!("st-{ts}"),
         timestamp: format_now_hms(),
@@ -954,6 +959,7 @@ async fn run_native_pipeline(
         external_ip: ext_ip,
         result_url: None,
         engine: Some("native".into()),
+        rf,
     };
 
     let hist_snap = {
@@ -1146,6 +1152,24 @@ fn broadcast_speedtest(state: &AppState, live: &SpeedtestLiveState) {
         }
         state.broadcast_json(&obj);
     }
+}
+
+pub fn capture_rf_snapshot(modem: &ModemSnapshot) -> Option<SpeedtestRfSnapshot> {
+    let s = modem.serving.as_ref()?;
+    let ca_bandwidth_mhz: f64 = modem
+        .carriers
+        .iter()
+        .filter_map(|c| c.bandwidth_mhz.filter(|v| v.is_finite() && *v > 0.0))
+        .sum();
+    Some(SpeedtestRfSnapshot {
+        rat: s.rat.clone(),
+        band: s.band.clone(),
+        pci: s.pci,
+        ca_count: modem.carriers.len(),
+        ca_bandwidth_mhz: round2(ca_bandwidth_mhz),
+        rsrp: s.rsrp.filter(|v| v.is_finite()).map(|v| v.round() as i32),
+        sinr: s.sinr.filter(|v| v.is_finite()).map(|v| v.round() as i32),
+    })
 }
 
 fn round2(n: f64) -> f64 {
@@ -1350,5 +1374,42 @@ mod tests {
         assert!(app.speedtest_pid.lock().await.is_none());
         assert!(app.speedtest_cancel.lock().await.is_none());
         assert!(!SPEEDTEST_RUNNING.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn captures_rf_snapshot_from_serving_and_ca_carriers() {
+        let mut modem = ModemSnapshot::default();
+        assert!(capture_rf_snapshot(&modem).is_none());
+
+        modem.serving = Some(crate::parsers::ServingCellInfo {
+            rat: "NR5G-SA".into(),
+            band: "n41".into(),
+            pci: Some(258),
+            rsrp: Some(-94.6),
+            sinr: Some(19.4),
+            ..Default::default()
+        });
+        modem.carriers = vec![
+            crate::parsers::CarrierComponent {
+                role: "PCC".into(),
+                band: "n41".into(),
+                bandwidth_mhz: Some(100.0),
+                ..Default::default()
+            },
+            crate::parsers::CarrierComponent {
+                role: "SCC".into(),
+                band: "n25".into(),
+                bandwidth_mhz: Some(20.0),
+                ..Default::default()
+            },
+        ];
+        let rf = capture_rf_snapshot(&modem).expect("rf snapshot");
+        assert_eq!(rf.rat, "NR5G-SA");
+        assert_eq!(rf.band, "n41");
+        assert_eq!(rf.pci, Some(258));
+        assert_eq!(rf.ca_count, 2);
+        assert_eq!(rf.ca_bandwidth_mhz, 120.0);
+        assert_eq!(rf.rsrp, Some(-95));
+        assert_eq!(rf.sinr, Some(19));
     }
 }

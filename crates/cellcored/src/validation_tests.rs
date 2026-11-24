@@ -1432,17 +1432,18 @@ async fn r10_cfun_recovery_respects_bounded_radio_lock() {
     let start = Radio::new("2:4:66", "41", "41:71", "AUTO", 0);
     let (t, m, _sbx) = setup_modem("r10-lock", start.clone()).await;
 
-    // 1. R10Status is completely lock-free and keeps its 17-key output while radio_lock is held
+    // 1. R10Status is completely lock-free and keeps its 19-key output while radio_lock is held
     let guard = crate::radio::lock(&t.app).await;
     let t0 = std::time::Instant::now();
     let st = crate::ipc::dispatch_ipc(t.app.clone(), crate::ipc::IpcRequest::R10Status, true).await;
     assert!(st.ok, "{:?}", st.error);
     assert!(t0.elapsed() < Duration::from_secs(2), "R10Status blocked on radio_lock");
-    assert_eq!(st.output.lines().count(), 17, "{}", st.output);
+    assert_eq!(st.output.lines().count(), 19, "{}", st.output);
     for key in [
         "wan_up=", "wan_uptime=", "l3_device=", "modem_uptime_s=", "at_token_ok=", "cfun=",
         "rsrp_dbm=", "rat=", "band=", "mode=", "lte_band=", "lte_rsrp_dbm=", "lte_rsrq_db=",
         "nr_band=", "nr_rsrp_dbm=", "nr_sinr_db=", "nr_rsrq_db=",
+        "wan_v4_usable=", "wan_v6_usable=",
     ] {
         assert!(st.output.contains(key), "missing {key}: {}", st.output);
     }

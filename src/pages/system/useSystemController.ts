@@ -1,6 +1,13 @@
 import React, { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch, confirmFirmwareAbSlot, getFirmwareAbStatus, inspectFirmwareAb } from "../../lib/api";
+import {
+  apiFetch,
+  confirmFirmwareAbSlot,
+  getFirmwareAbStaged,
+  getFirmwareAbStatus,
+  inspectFirmwareAb,
+  uploadFirmwareAbZip,
+} from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { useWsStore } from "../../stores/ws-store";
 import { useToastStore } from "../../stores/toast-store";
@@ -13,6 +20,7 @@ import type {
   FirmwareAbSlot,
   FirmwareAbStatus,
   ReconcileReport,
+  StagedFirmwareFile,
   SystemInternals,
 } from "../../types/cellcore";
 
@@ -84,6 +92,28 @@ export interface MaintenanceInfo {
   alerts?: { smtpConfigured: boolean; recipient: string };
 }
 
+export interface AbUploadProgress {
+  pct: number;
+  loaded: number;
+  total: number;
+  speedBps: number;
+}
+
+export interface AbRebootWatch {
+  fromSlot: FirmwareAbSlot;
+  targetSlot: FirmwareAbSlot;
+  startedAt: number;
+  seenDown: boolean;
+  arrived: boolean;
+}
+
+interface AbInspectKey {
+  path: string;
+  scope: FirmwareAbScope;
+  allowProjectMismatch: boolean;
+  allowNoManifest: boolean;
+}
+
 /**
  * All System page state, queries and mutations. The handlers are carried over
  * unchanged from the pre-redesign page (same endpoints, same payloads); only the
@@ -129,8 +159,18 @@ export function useSystemController(tab: SysTab) {
   const [abPreserveCellcore, setAbPreserveCellcore] = useState(true);
   const [abVerifyReadback, setAbVerifyReadback] = useState(true);
   const [abActivateReboot, setAbActivateReboot] = useState(false);
+  const [abAllowProjectMismatch, setAbAllowProjectMismatch] = useState(false);
+  const [abAllowNoManifest, setAbAllowNoManifest] = useState(false);
   const [abInspect, setAbInspect] = useState<FirmwareAbInspectReport | null>(null);
+  const [abInspectKey, setAbInspectKey] = useState<AbInspectKey | null>(null);
   const [abPolling, setAbPolling] = useState(false);
+  const [abUploading, setAbUploading] = useState(false);
+  const [abUploadProgress, setAbUploadProgress] = useState<AbUploadProgress | null>(null);
+  const [abRebootWatch, setAbRebootWatch] = useState<AbRebootWatch | null>(null);
+  const [abPendingFlashReboot, setAbPendingFlashReboot] = useState<{
+    fromSlot: FirmwareAbSlot;
+    targetSlot: FirmwareAbSlot;
+  } | null>(null);
 
   const settings = useWsStore((s) => s.settings);
   const internalsStore = useWsStore((s) => s.internals);
@@ -178,12 +218,35 @@ export function useSystemController(tab: SysTab) {
     }
   }, [pkgInfoQuery.data, otaWatch, pushToast]);
 
+  const abRebootInFlight = abRebootWatch != null && !abRebootWatch.arrived;
+
   const firmwareAbQuery = useQuery<FirmwareAbStatus>({
     queryKey: ["firmware-ab"],
     queryFn: getFirmwareAbStatus,
-    enabled: tab === "ota" || abPolling,
-    refetchInterval: (query) => (abPolling || query.state.data?.job?.running ? 2000 : false),
+    enabled: tab === "ota" || abPolling || abRebootInFlight || abPendingFlashReboot != null,
+    refetchInterval: (query) =>
+      abRebootInFlight
+        ? 2500
+        : abPolling || abPendingFlashReboot != null || query.state.data?.job?.running
+          ? 2000
+          : false,
+    retry: abRebootInFlight || abPendingFlashReboot != null ? true : 1,
+    retryDelay: 2000,
   });
+
+  const abStagedQuery = useQuery<{ files: StagedFirmwareFile[] }>({
+    queryKey: ["firmware-ab-staged"],
+    queryFn: getFirmwareAbStaged,
+    enabled: tab === "ota" && !abRebootInFlight,
+    staleTime: 15_000,
+  });
+
+  // Auto-resume polling if an A/B flash job was already running on page open (e.g. started via CLI).
+  useEffect(() => {
+    if (firmwareAbQuery.data?.job?.running && !abPolling) {
+      setAbPolling(true);
+    }
+  }, [firmwareAbQuery.data?.job?.running, abPolling]);
 
   useEffect(() => {
     const j = firmwareAbQuery.data?.job;
@@ -191,12 +254,95 @@ export function useSystemController(tab: SysTab) {
     if (!j.running && j.finishedAt != null) {
       setAbPolling(false);
       if (j.ok === true) {
-        notify("ok", j.dryRun ? "A/B firmware dry-run passed cleanly" : "A/B firmware flash completed cleanly");
+        if (abPendingFlashReboot) {
+          const pending = abPendingFlashReboot;
+          setAbPendingFlashReboot(null);
+          const alreadyArrived = firmwareAbQuery.data?.activeSlot === pending.targetSlot;
+          setAbRebootWatch({
+            fromSlot: pending.fromSlot,
+            targetSlot: pending.targetSlot,
+            startedAt: Date.now(),
+            seenDown: alreadyArrived,
+            arrived: alreadyArrived,
+          });
+          if (alreadyArrived) {
+            void hydrateBootstrap();
+            void qc.invalidateQueries({ queryKey: ["sys-internals"] });
+            void qc.invalidateQueries({ queryKey: ["firmware-ab-staged"] });
+            pushToast(`Modem booted cleanly on Slot ${pending.targetSlot}!`, "success");
+          } else {
+            notify("ok", `A/B flash complete — rebooting into Slot ${pending.targetSlot}…`);
+          }
+        } else {
+          notify("ok", j.dryRun ? "A/B firmware dry-run passed cleanly" : "A/B firmware flash completed cleanly");
+        }
       } else if (j.ok === false) {
+        setAbPendingFlashReboot(null);
         notify("err", j.error || "A/B firmware flash failed");
       }
     }
-  }, [firmwareAbQuery.data, abPolling]);
+  }, [firmwareAbQuery.data, abPolling, abPendingFlashReboot, hydrateBootstrap, qc, pushToast]);
+
+  // If a flash+reboot job dropped offline before we observed job.ok===true, hand off to abRebootWatch.
+  useEffect(() => {
+    if (!abPendingFlashReboot) return;
+    const active = firmwareAbQuery.data?.activeSlot;
+    if (active && active === abPendingFlashReboot.targetSlot) {
+      const pending = abPendingFlashReboot;
+      setAbPendingFlashReboot(null);
+      setAbPolling(false);
+      setAbRebootWatch({
+        fromSlot: pending.fromSlot,
+        targetSlot: pending.targetSlot,
+        startedAt: Date.now(),
+        seenDown: true,
+        arrived: true,
+      });
+      void hydrateBootstrap();
+      void qc.invalidateQueries({ queryKey: ["sys-internals"] });
+      void qc.invalidateQueries({ queryKey: ["firmware-ab-staged"] });
+      pushToast(`Modem booted cleanly on Slot ${pending.targetSlot}!`, "success");
+    } else if (firmwareAbQuery.failureCount > 0 || firmwareAbQuery.isError) {
+      const pending = abPendingFlashReboot;
+      setAbPendingFlashReboot(null);
+      setAbPolling(false);
+      setAbRebootWatch({
+        fromSlot: pending.fromSlot,
+        targetSlot: pending.targetSlot,
+        startedAt: Date.now(),
+        seenDown: true,
+        arrived: false,
+      });
+    }
+  }, [
+    abPendingFlashReboot,
+    firmwareAbQuery.data?.activeSlot,
+    firmwareAbQuery.failureCount,
+    firmwareAbQuery.isError,
+    hydrateBootstrap,
+    qc,
+    pushToast,
+  ]);
+
+  useEffect(() => {
+    if (!abRebootWatch || abRebootWatch.arrived) return;
+    if ((firmwareAbQuery.failureCount > 0 || firmwareAbQuery.isError) && !abRebootWatch.seenDown) {
+      setAbRebootWatch((prev) => (prev && !prev.arrived ? { ...prev, seenDown: true } : prev));
+    }
+  }, [abRebootWatch, firmwareAbQuery.failureCount, firmwareAbQuery.isError]);
+
+  useEffect(() => {
+    if (!abRebootWatch || abRebootWatch.arrived) return;
+    const active = firmwareAbQuery.data?.activeSlot;
+    if (active && active === abRebootWatch.targetSlot) {
+      setAbRebootWatch((prev) => (prev ? { ...prev, arrived: true } : prev));
+      setAbPolling(false);
+      void hydrateBootstrap();
+      void qc.invalidateQueries({ queryKey: ["sys-internals"] });
+      void qc.invalidateQueries({ queryKey: ["firmware-ab-staged"] });
+      pushToast(`Modem booted cleanly on Slot ${abRebootWatch.targetSlot}!`, "success");
+    }
+  }, [abRebootWatch, firmwareAbQuery.data?.activeSlot, hydrateBootstrap, qc, pushToast]);
 
   const maintQuery = useQuery({
     queryKey: ["sys-maintenance"],
@@ -493,22 +639,83 @@ export function useSystemController(tab: SysTab) {
     }
   }
 
-  async function inspectAbPackage() {
-    const trimmed = abPath.trim();
+  async function inspectAbPackage(overridePath?: string) {
+    const trimmed = (overridePath ?? abPath).trim();
     if (!trimmed) {
       notify("err", "Enter the path to a firmware .zip or unpacked directory on the modem");
       return;
     }
     setBusy("ab-inspect");
     try {
-      const report = await inspectFirmwareAb({ path: trimmed, scope: abScope });
+      const report = await inspectFirmwareAb({
+        path: trimmed,
+        scope: abScope,
+        allowProjectMismatch: abAllowProjectMismatch,
+        allowNoManifest: abAllowNoManifest,
+      });
       setAbInspect(report);
+      setAbInspectKey({
+        path: trimmed,
+        scope: abScope,
+        allowProjectMismatch: abAllowProjectMismatch,
+        allowNoManifest: abAllowNoManifest,
+      });
       notify("ok", `Planned ${report.plan.partitions.length} inactive-slot partitions (${report.plan.targetSlot})`);
     } catch (e) {
       setAbInspect(null);
+      setAbInspectKey(null);
       notify("err", e instanceof Error ? e.message : "Package inspection failed");
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function uploadFirmwareAb(file: File) {
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      notify("err", "Please select a stock Quectel firmware .zip archive");
+      return;
+    }
+    if (file.size <= 0) {
+      notify("err", "Selected firmware archive is empty");
+      return;
+    }
+    setAbUploading(true);
+    setAbUploadProgress({ pct: 0, loaded: 0, total: file.size, speedBps: 0 });
+    const startedAt = performance.now();
+    let lastTs = startedAt;
+    let lastLoaded = 0;
+    let smoothedBps = 0;
+
+    try {
+      const res = await uploadFirmwareAbZip(file, (pct, loaded, total) => {
+        const now = performance.now();
+        const dt = (now - lastTs) / 1000;
+        if (dt >= 0.2) {
+          const instBps = (loaded - lastLoaded) / dt;
+          smoothedBps = smoothedBps > 0 ? smoothedBps * 0.65 + instBps * 0.35 : instBps;
+          lastTs = now;
+          lastLoaded = loaded;
+        } else if (smoothedBps === 0 && now > startedAt) {
+          smoothedBps = loaded / ((now - startedAt) / 1000);
+        }
+        setAbUploadProgress({
+          pct,
+          loaded,
+          total,
+          speedBps: Math.max(0, Math.round(smoothedBps)),
+        });
+      });
+      setAbPath(res.path);
+      setAbInspect(null);
+      setAbInspectKey(null);
+      notify("ok", `Uploaded ${file.name} to ${res.path}`);
+      await qc.invalidateQueries({ queryKey: ["firmware-ab-staged"] });
+      await inspectAbPackage(res.path);
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : "Firmware upload failed");
+    } finally {
+      setAbUploading(false);
+      setAbUploadProgress(null);
     }
   }
 
@@ -520,27 +727,39 @@ export function useSystemController(tab: SysTab) {
     }
     setBusy(dryRun ? "ab-dryrun" : "ab-flash");
     try {
+      const willReboot = !dryRun && abActivateReboot;
       const payload = {
         path: trimmed,
         scope: abScope,
         dryRun,
         preserveCellcore: abPreserveCellcore,
         verifyReadback: abVerifyReadback,
-        activateSlot: !dryRun && abActivateReboot,
-        reboot: !dryRun && abActivateReboot,
+        activateSlot: willReboot,
+        reboot: willReboot,
+        allowProjectMismatch: abAllowProjectMismatch,
+        allowNoManifest: abAllowNoManifest,
       };
-      if (!dryRun && abActivateReboot) {
-        await disruptiveFetch(
-          "A/B firmware flash & reboot",
-          "/api/v1/system/firmware-ab/flash",
-          { method: "POST", body: JSON.stringify(payload) },
-          { confirmed: true }
-        );
+      const res = willReboot
+        ? await disruptiveFetch<{ targetSlot?: string }>(
+            "A/B firmware flash & reboot",
+            "/api/v1/system/firmware-ab/flash",
+            { method: "POST", body: JSON.stringify(payload) },
+            { confirmed: true }
+          )
+        : await apiFetch<{ targetSlot?: string }>("/api/v1/system/firmware-ab/flash", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+      if (willReboot) {
+        const fromSlot: FirmwareAbSlot = firmwareAbQuery.data?.activeSlot ?? "_a";
+        const targetSlot: FirmwareAbSlot =
+          res.targetSlot === "_a" || res.targetSlot === "_b"
+            ? res.targetSlot
+            : firmwareAbQuery.data?.inactiveSlot ?? (fromSlot === "_a" ? "_b" : "_a");
+        setAbPendingFlashReboot({ fromSlot, targetSlot });
+        setAbRebootWatch(null);
       } else {
-        await apiFetch("/api/v1/system/firmware-ab/flash", {
-          method: "POST",
-          body: JSON.stringify(payload),
-        });
+        setAbPendingFlashReboot(null);
       }
       setAbPolling(true);
       await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
@@ -552,15 +771,27 @@ export function useSystemController(tab: SysTab) {
     }
   }
 
-  async function switchAbSlot(slot: FirmwareAbSlot, reboot: boolean) {
+  async function switchAbSlot(slot: FirmwareAbSlot, reboot: boolean, force?: boolean) {
     setBusy("ab-switch");
+    const fromSlot: FirmwareAbSlot = firmwareAbQuery.data?.activeSlot ?? (slot === "_a" ? "_b" : "_a");
     try {
+      const body = force ? { slot, reboot, force: true } : { slot, reboot };
       await disruptiveFetch(
         `Switch boot slot to ${slot}`,
         "/api/v1/system/firmware-ab/switch",
-        { method: "POST", body: JSON.stringify({ slot, reboot }) },
+        { method: "POST", body: JSON.stringify(body) },
         { confirmed: true }
       );
+      if (reboot) {
+        setAbPendingFlashReboot(null);
+        setAbRebootWatch({
+          fromSlot,
+          targetSlot: slot,
+          startedAt: Date.now(),
+          seenDown: false,
+          arrived: false,
+        });
+      }
       await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
       notify("ok", reboot ? `Switching to slot ${slot} and rebooting…` : `Next boot slot set to ${slot}`);
     } catch (e) {
@@ -582,6 +813,15 @@ export function useSystemController(tab: SysTab) {
       setBusy(null);
     }
   }
+
+  const abInspectCurrent = Boolean(
+    abInspect &&
+      abInspectKey &&
+      abInspectKey.path === abPath.trim() &&
+      abInspectKey.scope === abScope &&
+      abInspectKey.allowProjectMismatch === abAllowProjectMismatch &&
+      abInspectKey.allowNoManifest === abAllowNoManifest
+  );
 
   const useFahrenheit = settings?.temperatureUnit === "fahrenheit";
   const fmtTemp = (c: number) => (useFahrenheit ? `${Math.round(((c * 9) / 5 + 32) * 10) / 10} °F` : `${c} °C`);
@@ -649,6 +889,7 @@ export function useSystemController(tab: SysTab) {
     upgradePackage,
     // firmware a/b
     firmwareAbQuery,
+    abStagedQuery,
     abPath,
     setAbPath,
     abScope,
@@ -659,8 +900,18 @@ export function useSystemController(tab: SysTab) {
     setAbVerifyReadback,
     abActivateReboot,
     setAbActivateReboot,
+    abAllowProjectMismatch,
+    setAbAllowProjectMismatch,
+    abAllowNoManifest,
+    setAbAllowNoManifest,
     abInspect,
     setAbInspect,
+    abInspectCurrent,
+    abUploading,
+    abUploadProgress,
+    uploadFirmwareAb,
+    abRebootWatch,
+    setAbRebootWatch,
     inspectAbPackage,
     startAbFlash,
     switchAbSlot,

@@ -561,7 +561,45 @@ async fn build_r10_status_text_async(state: &AppState) -> String {
     if maintenance_pause {
         text.push_str("maintenance_pause=1\n");
     }
+    let (wan_v4_usable, wan_v6_usable) = resolve_wan_family_usable(
+        crate::dataplane::wds_v4_usable(),
+        crate::dataplane::wds_v6_usable(),
+        crate::dataplane::is_native_mode(),
+        crate::dataplane::is_wds_v4_connected(),
+        crate::dataplane::is_wds_v6_connected(),
+        wan_up,
+    );
+    text.push_str(&format!(
+        "wan_v4_usable={wan_v4_usable}\nwan_v6_usable={wan_v6_usable}\n"
+    ));
     text
+}
+
+pub(crate) fn resolve_wan_family_usable(
+    v4_usable: Option<bool>,
+    v6_usable: Option<bool>,
+    native_mode: bool,
+    v4_wds_connected: bool,
+    v6_wds_connected: bool,
+    wan_up: u8,
+) -> (u8, u8) {
+    let map_fam = |probe: Option<bool>, wds_conn: bool| -> u8 {
+        match probe {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => {
+                if native_mode {
+                    u8::from(wds_conn)
+                } else {
+                    u8::from(wan_up == 1)
+                }
+            }
+        }
+    };
+    (
+        map_fam(v4_usable, v4_wds_connected),
+        map_fam(v6_usable, v6_wds_connected),
+    )
 }
 
 pub(crate) async fn is_maintenance_pause_active(state: &AppState) -> bool {
@@ -1079,5 +1117,14 @@ lte_rsrq_db=\nnr_band=n41\nnr_rsrp_dbm=-101\nnr_sinr_db=9\nnr_rsrq_db=-11\n"
             resolve_native_wan_up(false, false, Some("rmnet_data0".into()), None, 500),
             (1, 500, "rmnet_data0".into())
         );
+    }
+
+    #[test]
+    fn resolves_per_family_wan_usable_flags() {
+        assert_eq!(resolve_wan_family_usable(Some(true), Some(false), true, true, true, 1), (1, 0));
+        assert_eq!(resolve_wan_family_usable(Some(false), Some(true), true, true, true, 1), (0, 1));
+        assert_eq!(resolve_wan_family_usable(None, None, true, true, false, 1), (1, 0));
+        assert_eq!(resolve_wan_family_usable(None, None, false, false, false, 1), (1, 1));
+        assert_eq!(resolve_wan_family_usable(None, None, false, false, false, 0), (0, 0));
     }
 }

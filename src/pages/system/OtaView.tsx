@@ -1,24 +1,31 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowLeftRight,
   ArrowRight,
   CheckCircle2,
+  ChevronRight,
+  Clock,
   Cpu,
   Download,
+  FileArchive,
   FileSearch,
   HardDrive,
+  Info,
   Loader2,
   Package,
   Play,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   TriangleAlert,
+  Upload,
+  X,
   XCircle,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, Input, Meter, Modal, Select, Skeleton, Switch } from "../../components/ui";
 import { FailoverWarning } from "../../components/obs";
-import type { FirmwareAbScope } from "../../types/cellcore";
+import type { FirmwareAbScope, FirmwareAbSlot } from "../../types/cellcore";
 import type { SystemController } from "./useSystemController";
 
 /** Split "4.0.0-1" into [4,0,0] + release "1" (display only; ordering is decided by the daemon). */
@@ -222,7 +229,9 @@ export function OtaView({ ctl }: { ctl: SystemController }) {
             <span>{relativeTime(d?.lastChecked, now)}</span>
           </Row>
           <Row label="Active boot slot">
-            <span className="font-mono">Slot {ctl.internals?.bootSlot || "_a"}</span>
+            <span className="font-mono">
+              Slot {ctl.firmwareAbQuery.data?.activeSlot || ctl.internals?.bootSlot || "_a"}
+            </span>
           </Row>
         </dl>
         <Button variant="secondary" className="mt-4 w-full" onClick={ctl.checkOtaFeed} disabled={checking || installing}>
@@ -274,19 +283,51 @@ function formatBytes(bytes: number | null | undefined): string {
   return `${bytes} B`;
 }
 
+function formatMb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatSpeedBps(bps: number): string {
+  if (!Number.isFinite(bps) || bps <= 0) return "—";
+  if (bps >= 1024 * 1024) return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
+  if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
+  return `${Math.round(bps)} B/s`;
+}
+
+function formatDirLabel(path: string): string {
+  if (path.startsWith("/usrdata/cache/")) return "/usrdata/cache";
+  if (path.startsWith("/tmp/")) return "/tmp";
+  const idx = path.lastIndexOf("/");
+  return idx > 0 ? path.slice(0, idx) : "/";
+}
+
 function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
   const q = ctl.firmwareAbQuery;
   const st = q.data;
   const job = st?.job;
   const running = Boolean(job?.running);
-  const [switchModalOpen, setSwitchModalOpen] = useState(false);
+  const [switchTarget, setSwitchTarget] = useState<FirmwareAbSlot | null>(null);
   const [flashModalOpen, setFlashModalOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [rebootNow, setRebootNow] = useState(() => Date.now());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const logPreRef = useRef<HTMLPreElement | null>(null);
+
+  const watch = ctl.abRebootWatch;
+  const rebooting = Boolean(watch && !watch.arrived);
+
+  useEffect(() => {
+    if (!rebooting) return;
+    setRebootNow(Date.now());
+    const t = window.setInterval(() => setRebootNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [rebooting]);
 
   const activeSlot = st?.activeSlot ?? null;
   const inactiveSlot = st?.inactiveSlot ?? null;
   const inactiveUnbootable =
     inactiveSlot === "_a" ? st?.slotAUnbootable === true : inactiveSlot === "_b" ? st?.slotBUnbootable === true : false;
-  const canSwitch = Boolean(st?.supported && inactiveSlot && !inactiveUnbootable && !running);
+  const canSwitch = Boolean(st?.supported && inactiveSlot && !inactiveUnbootable && !running && !rebooting);
   const needsConfirm = Boolean(
     st?.supported &&
       (st.trialBootActive === true ||
@@ -294,13 +335,46 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
   );
   const pct = job && job.total > 0 ? Math.round((job.completed / job.total) * 100) : 0;
   const displayLog = (job?.log?.length ? job.log : st?.lastState?.log) ?? [];
+  const lastLogLine = displayLog.length > 0 ? displayLog[displayLog.length - 1] : "";
+
+  useEffect(() => {
+    const el = logPreRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [displayLog.length, lastLogLine]);
+
+  const stagedFiles = ctl.abStagedQuery.data?.files ?? [];
+  const busyLock = running || ctl.abUploading || rebooting;
+  const spaceInsufficient = ctl.abInspectCurrent && ctl.abInspect?.tmpSpaceOk === false;
+  const flashGatedReason = !ctl.abPath.trim()
+    ? "Upload or select a firmware .zip package first."
+    : !ctl.abInspectCurrent
+      ? "Run Inspect & Plan for the current package and scope before flashing."
+      : spaceInsufficient
+        ? `Insufficient /tmp free space for extraction (${ctl.abInspect?.tmpAvailMib ?? "?"} MiB available; ≥128 MiB required).`
+        : null;
+  const canFlash = Boolean(!busyLock && ctl.busy !== "ab-flash" && flashGatedReason === null);
+
+  const vendorScripts: string[] = [];
+  if (st?.abUpdaterEnabled) vendorScripts.push("ab-updater");
+  if (st?.mirrorCopyEnabled) vendorScripts.push("mirror_copy");
+
+  const rebootElapsedSecs = watch ? Math.max(0, Math.floor((rebootNow - watch.startedAt) / 1000)) : 0;
+  const uploadProg = ctl.abUploadProgress;
+
+  function handleSelectedFiles(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    void ctl.uploadFirmwareAb(file);
+  }
 
   return (
     <>
       <Card className="lg:col-span-12 min-w-0">
         <CardHeader
           title="A/B Modem Firmware (Zero-USB)"
-          subtitle="Flash stock Quectel SDX75 firmware to the inactive NAND slot over Ethernet with MD5/SHA-256 verification and instant slot rollback."
+          subtitle="Upload or pick a stock Quectel SDX75 .zip, inspect partition hashes, and flash the inactive NAND slot over Ethernet with instant rollback."
           icon={<Cpu className="h-4 w-4" />}
           action={
             <div className="flex flex-wrap items-center gap-2">
@@ -315,7 +389,7 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                   Single-Slot Legacy
                 </Badge>
               )}
-              <Button variant="ghost" size="sm" onClick={() => void q.refetch()} disabled={q.isFetching}>
+              <Button variant="ghost" size="sm" onClick={() => void q.refetch()} disabled={q.isFetching || rebooting}>
                 <RefreshCw className={cn("h-3.5 w-3.5", q.isFetching && "animate-spin")} />
                 Refresh
               </Button>
@@ -343,6 +417,104 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
           </div>
         ) : (
           <div className="space-y-5">
+            {/* Guided Post-Reboot Reconnect & Arrival Banner */}
+            {watch && !watch.arrived && (
+              <div className="rounded-2xl border border-ember/35 bg-ember-soft/45 p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-ember-soft text-ember-ink">
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[13.5px] font-semibold text-ink">
+                        Rebooting into Slot {watch.targetSlot} — waiting for modem to come back online…
+                      </span>
+                      <Badge variant="info">
+                        {watch.fromSlot} → {watch.targetSlot}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-[12px] text-ink-2">
+                      {watch.seenDown
+                        ? "Modem link dropped as expected. Polling every 2.5 s for CellCore to come up on the new slot."
+                        : "Waiting for modem reboot to take effect. Keep this page open — CellCore will reconnect automatically."}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                  <Badge variant="neutral">
+                    <Clock className="h-3 w-3" />
+                    {rebootElapsedSecs}s elapsed
+                  </Badge>
+                </div>
+              </div>
+            )}
+
+            {watch?.arrived && (
+              <div className="rounded-2xl border border-jade/40 bg-jade-soft/50 p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-jade-soft text-jade-ink">
+                    <CheckCircle2 className="h-5 w-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[14px] font-semibold text-ink">
+                      Now running on Slot {watch.targetSlot}
+                      {st.projectRev ? ` (${st.projectRev})` : ""}
+                    </div>
+                    <p className="mt-0.5 text-[12.5px] text-ink-2">
+                      {needsConfirm
+                        ? `Slot ${watch.targetSlot} is currently in trial-boot probation. Confirm it once cellular health looks good, or roll back to Slot ${watch.fromSlot}.`
+                        : `Slot ${watch.targetSlot} is active and confirmed stable. Slot ${watch.fromSlot} remains intact if you ever need to roll back.`}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {needsConfirm && (
+                    <Button
+                      variant="success"
+                      size="sm"
+                      onClick={() => void ctl.confirmAbSlot()}
+                      disabled={ctl.busy === "ab-confirm" || running}
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      Confirm Slot {activeSlot ?? watch.targetSlot}
+                    </Button>
+                  )}
+                  {canSwitch && watch.fromSlot !== activeSlot && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setSwitchTarget(watch.fromSlot)}
+                      disabled={ctl.busy === "ab-switch"}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      Roll back to Slot {watch.fromSlot}
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => ctl.setAbRebootWatch(null)}
+                    aria-label="Dismiss arrival notice"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Stock Vendor Updater Advisory */}
+            {vendorScripts.length > 0 && (
+              <div className="rounded-2xl border border-saffron/35 bg-saffron-soft/45 px-4 py-3 flex items-start gap-2.5 text-[12.5px] text-ink-2">
+                <Info className="h-4 w-4 text-saffron-ink shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold text-ink">Stock vendor updater scripts detected:</span>{" "}
+                  <span className="font-mono text-ink">{vendorScripts.join(", ")}</span>{" "}
+                  {vendorScripts.length > 1 ? "are" : "is"} enabled in <span className="font-mono">/etc/rc.d</span>. CellCore
+                  automatically guards against active conflicts before flashing or switching slots.
+                </div>
+              </div>
+            )}
+
             {/* Slot Status Strip */}
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <div className="qm-subcard p-3.5">
@@ -396,7 +568,7 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                       variant="success"
                       size="sm"
                       onClick={() => void ctl.confirmAbSlot()}
-                      disabled={ctl.busy === "ab-confirm" || running}
+                      disabled={ctl.busy === "ab-confirm" || busyLock}
                     >
                       <CheckCircle2 className="h-3.5 w-3.5" />
                       Confirm {activeSlot}
@@ -405,7 +577,7 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                   <Button
                     variant="secondary"
                     size="sm"
-                    onClick={() => setSwitchModalOpen(true)}
+                    onClick={() => inactiveSlot && setSwitchTarget(inactiveSlot)}
                     disabled={!canSwitch || ctl.busy === "ab-switch"}
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5" />
@@ -421,8 +593,8 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                 <div>
                   <div className="text-[13.5px] font-semibold text-ink">Flash Inactive Slot ({inactiveSlot})</div>
                   <p className="text-[12px] text-muted mt-0.5">
-                    Copy a stock Quectel firmware <span className="font-mono">.zip</span> onto the modem over Ethernet (e.g.{" "}
-                    <span className="font-mono">scp firmware.zip root@modem:/tmp/</span>), then inspect and flash one image at a time.
+                    Upload a stock Quectel firmware <span className="font-mono">.zip</span> from your browser into{" "}
+                    <span className="font-mono">/usrdata/cache</span>, choose an already-staged archive, or enter a path manually.
                   </p>
                 </div>
                 {st.tmpAvailMib != null && (
@@ -431,6 +603,141 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                     /tmp {st.tmpAvailMib} MiB free
                   </Badge>
                 )}
+              </div>
+
+              {/* Drag-and-Drop Upload + Staged Picker */}
+              <div className="grid gap-3 lg:grid-cols-12">
+                <div className="lg:col-span-6">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".zip,application/zip,application/x-zip-compressed"
+                    className="hidden"
+                    disabled={busyLock}
+                    onChange={(e) => {
+                      handleSelectedFiles(e.target.files);
+                      e.target.value = "";
+                    }}
+                  />
+                  <div
+                    onDragOver={(e) => {
+                      if (busyLock) return;
+                      e.preventDefault();
+                      setDragOver(true);
+                    }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setDragOver(false);
+                      if (busyLock) return;
+                      handleSelectedFiles(e.dataTransfer.files);
+                    }}
+                    className={cn(
+                      "rounded-xl border border-dashed p-3.5 transition-colors",
+                      dragOver
+                        ? "border-ember bg-ember-soft/45"
+                        : "border-line-strong bg-sunk/40 hover:border-ember/60",
+                      busyLock && "opacity-65 pointer-events-none"
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-ember-soft text-ember-ink">
+                          {ctl.abUploading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Upload className="h-4 w-4" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-[12.5px] font-semibold text-ink">
+                            {ctl.abUploading ? "Uploading firmware archive…" : "Drop firmware .zip here"}
+                          </div>
+                          <div className="text-[11.5px] text-muted">
+                            Streamed directly to <span className="font-mono">/usrdata/cache</span> (max 250 MB)
+                          </div>
+                        </div>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={busyLock}
+                      >
+                        <Upload className="h-3.5 w-3.5" />
+                        Upload Firmware .zip
+                      </Button>
+                    </div>
+                    {ctl.abUploading && uploadProg && (
+                      <div className="mt-3 space-y-1.5">
+                        <Meter pct={uploadProg.pct} tone="ember" />
+                        <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11.5px] text-ink-2">
+                          <span>
+                            {uploadProg.pct}% · {formatMb(uploadProg.loaded)} / {formatMb(uploadProg.total)}
+                          </span>
+                          <span>{formatSpeedBps(uploadProg.speedBps)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Staged .zip Picker */}
+                <div className="lg:col-span-6 rounded-xl border border-line bg-sunk/40 p-3.5 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[12px] font-semibold text-ink-2 flex items-center gap-1.5">
+                      <FileArchive className="h-3.5 w-3.5 text-muted" />
+                      Staged .zip archives ({stagedFiles.length})
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void ctl.abStagedQuery.refetch()}
+                      disabled={ctl.abStagedQuery.isFetching || rebooting}
+                      className="h-7 px-2 text-[11.5px]"
+                    >
+                      <RefreshCw className={cn("h-3 w-3", ctl.abStagedQuery.isFetching && "animate-spin")} />
+                      Scan
+                    </Button>
+                  </div>
+                  {stagedFiles.length === 0 ? (
+                    <p className="text-[12px] text-muted my-auto">
+                      No staged <span className="font-mono">.zip</span> files found in <span className="font-mono">/tmp</span> or{" "}
+                      <span className="font-mono">/usrdata/cache</span>. Upload one or copy via <span className="font-mono">scp</span>.
+                    </p>
+                  ) : (
+                    <div className="flex flex-wrap gap-1.5 max-h-28 overflow-auto">
+                      {stagedFiles.map((f) => {
+                        const selected = ctl.abPath.trim() === f.path;
+                        return (
+                          <button
+                            key={f.path}
+                            type="button"
+                            disabled={busyLock}
+                            onClick={() => {
+                              ctl.setAbPath(f.path);
+                              ctl.setAbInspect(null);
+                              void ctl.inspectAbPackage(f.path);
+                            }}
+                            title={`${f.path} (${formatBytes(f.sizeBytes)})`}
+                            className={cn(
+                              "inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-left text-[11.5px] transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed",
+                              selected
+                                ? "border-ember bg-ember-soft/60 text-ink"
+                                : "border-line bg-raised text-ink-2 hover:border-line-strong hover:text-ink"
+                            )}
+                          >
+                            <span className="font-mono font-semibold truncate max-w-[200px]">{f.name}</span>
+                            <span className="font-mono text-[10.5px] text-muted">{formatBytes(f.sizeBytes)}</span>
+                            <span className="rounded bg-sunk px-1 py-0.5 font-mono text-[10px] text-muted">
+                              {formatDirLabel(f.path)}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="grid gap-3 md:grid-cols-12">
@@ -442,8 +749,8 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                       ctl.setAbPath(e.target.value);
                       ctl.setAbInspect(null);
                     }}
-                    placeholder="/tmp/RM551EGL00AAR02A02M8G.zip"
-                    disabled={running}
+                    placeholder="/usrdata/cache/RM551EGL00AAR02A02M8G.zip"
+                    disabled={busyLock}
                     className="font-mono text-[12.5px]"
                   />
                 </div>
@@ -455,7 +762,7 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                       ctl.setAbScope(e.target.value as FirmwareAbScope);
                       ctl.setAbInspect(null);
                     }}
-                    disabled={running}
+                    disabled={busyLock}
                   >
                     <option value="rootfs">rootfs (boot + system — 2 partitions)</option>
                     <option value="baseband">baseband (modem + TZ + DSP — 15 partitions)</option>
@@ -468,31 +775,66 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                 <Switch
                   checked={ctl.abPreserveCellcore}
                   onChange={ctl.setAbPreserveCellcore}
-                  disabled={running}
+                  disabled={busyLock}
                   label="Preserve CellCore overlay"
                   description="Inject clean-room S03/S13 hooks into stock sysfs.ubi"
                 />
                 <Switch
                   checked={ctl.abVerifyReadback}
                   onChange={ctl.setAbVerifyReadback}
-                  disabled={running}
+                  disabled={busyLock}
                   label="Verify raw read-back"
                   description="SHA-256 read-back check on non-UBI partitions"
                 />
                 <Switch
                   checked={ctl.abActivateReboot}
                   onChange={ctl.setAbActivateReboot}
-                  disabled={running}
+                  disabled={busyLock}
                   label="Activate & reboot after flash"
                   description="Switch slot via abctl and reboot on full verification"
                 />
               </div>
 
+              {/* Advanced Overrides Disclosure */}
+              <details className="group rounded-xl border border-line bg-sunk/35 px-3.5 py-2.5">
+                <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[12px] font-semibold text-ink-2 select-none">
+                  <ChevronRight className="h-3.5 w-3.5 text-muted transition-transform group-open:rotate-90" />
+                  Advanced safety overrides
+                  {(ctl.abAllowProjectMismatch || ctl.abAllowNoManifest) && (
+                    <Badge variant="warning" className="ml-1">
+                      Override active
+                    </Badge>
+                  )}
+                </summary>
+                <div className="mt-3 grid gap-3 md:grid-cols-2 border-t border-line/70 pt-3">
+                  <Switch
+                    checked={ctl.abAllowProjectMismatch}
+                    onChange={(v) => {
+                      ctl.setAbAllowProjectMismatch(v);
+                      ctl.setAbInspect(null);
+                    }}
+                    disabled={busyLock}
+                    label="Allow project mismatch"
+                    description="Bypass package vs. modem project-name check (expert only)"
+                  />
+                  <Switch
+                    checked={ctl.abAllowNoManifest}
+                    onChange={(v) => {
+                      ctl.setAbAllowNoManifest(v);
+                      ctl.setAbInspect(null);
+                    }}
+                    disabled={busyLock}
+                    label="Allow missing md5.txt"
+                    description="Proceed even if the archive lacks a Quectel md5.txt manifest"
+                  />
+                </div>
+              </details>
+
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 <Button
                   variant="secondary"
                   onClick={() => void ctl.inspectAbPackage()}
-                  disabled={running || ctl.busy === "ab-inspect" || !ctl.abPath.trim()}
+                  disabled={busyLock || ctl.busy === "ab-inspect" || !ctl.abPath.trim()}
                 >
                   <FileSearch className="h-4 w-4" />
                   {ctl.busy === "ab-inspect" ? "Inspecting…" : "Inspect & Plan"}
@@ -500,7 +842,7 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                 <Button
                   variant="secondary"
                   onClick={() => void ctl.startAbFlash(true)}
-                  disabled={running || ctl.busy === "ab-dryrun" || !ctl.abPath.trim()}
+                  disabled={busyLock || ctl.busy === "ab-dryrun" || !ctl.abPath.trim()}
                 >
                   <Play className="h-4 w-4" />
                   {ctl.busy === "ab-dryrun" ? "Starting…" : "Dry Run"}
@@ -508,11 +850,23 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                 <Button
                   variant="tier1"
                   onClick={() => setFlashModalOpen(true)}
-                  disabled={running || ctl.busy === "ab-flash" || !ctl.abPath.trim()}
+                  disabled={!canFlash}
+                  title={flashGatedReason ?? undefined}
                 >
                   <Download className="h-4 w-4" />
                   {running ? "Flashing…" : `Flash Slot ${inactiveSlot}`}
                 </Button>
+                {flashGatedReason && !running && !rebooting && (
+                  <span
+                    className={cn(
+                      "text-[12px] flex items-center gap-1.5",
+                      spaceInsufficient ? "text-crimson-ink font-semibold" : "text-muted"
+                    )}
+                  >
+                    {spaceInsufficient && <TriangleAlert className="h-3.5 w-3.5 shrink-0" />}
+                    {flashGatedReason}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -530,11 +884,27 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                     {ctl.abInspect.plan.projectName && (
                       <Badge variant="neutral">{ctl.abInspect.plan.projectName}</Badge>
                     )}
+                    {!ctl.abInspect.tmpSpaceOk && (
+                      <Badge variant="danger" dot>
+                        /tmp space low ({ctl.abInspect.tmpAvailMib ?? "?"} MiB)
+                      </Badge>
+                    )}
                   </div>
                   <span className="text-[11.5px] text-muted font-mono">
                     {ctl.abInspect.md5Entries} MD5 entries · {ctl.abInspect.sourceKind}
                   </span>
                 </div>
+
+                {!ctl.abInspect.tmpSpaceOk && (
+                  <div className="rounded-xl border border-crimson/35 bg-crimson-soft/45 px-3 py-2 text-[12px] text-crimson-ink flex items-center gap-2">
+                    <TriangleAlert className="h-4 w-4 shrink-0" />
+                    <span>
+                      Flashing is blocked because <span className="font-mono">/tmp</span> has only{" "}
+                      {ctl.abInspect.tmpAvailMib ?? "?"} MiB free. Free up temporary files or store the archive in{" "}
+                      <span className="font-mono">/usrdata/cache</span> and re-inspect.
+                    </span>
+                  </div>
+                )}
 
                 {ctl.abInspect.plan.warnings.length > 0 && (
                   <ul className="space-y-1 text-[12px] text-saffron-ink">
@@ -619,7 +989,10 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
                 {running && <Meter pct={pct} tone="ember" />}
                 {job?.error && <p className="text-[12.5px] text-crimson-ink">{job.error}</p>}
                 {displayLog.length > 0 && (
-                  <pre className="qm-subcard max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-sunk p-3 font-mono text-[11.5px] text-ink-2">
+                  <pre
+                    ref={logPreRef}
+                    className="qm-subcard max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-sunk p-3 font-mono text-[11.5px] text-ink-2"
+                  >
                     {displayLog.join("\n")}
                   </pre>
                 )}
@@ -631,29 +1004,30 @@ function FirmwareAbSection({ ctl }: { ctl: SystemController }) {
 
       {/* Switch Slot Confirmation Modal */}
       <Modal
-        open={switchModalOpen}
-        onClose={() => setSwitchModalOpen(false)}
-        title={`Switch to Slot ${inactiveSlot ?? ""} & Reboot?`}
+        open={switchTarget != null}
+        onClose={() => setSwitchTarget(null)}
+        title={`Switch to Slot ${switchTarget ?? ""} & Reboot?`}
       >
         <FailoverWarning action="Switching boot slots" />
         <p className="mt-3 text-[13px] text-ink-2">
           This sets the next boot slot from <span className="font-mono text-ink">{activeSlot}</span> to{" "}
-          <span className="font-mono text-ink">{inactiveSlot}</span> via <span className="font-mono">abctl --set_active</span> and
+          <span className="font-mono text-ink">{switchTarget}</span> via <span className="font-mono">abctl --set_active</span> and
           reboots the modem. Slot <span className="font-mono text-ink">{activeSlot}</span> remains untouched for instant rollback if
           SBL trial boot fails.
         </p>
         <div className="mt-5 flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => setSwitchModalOpen(false)}>
+          <Button variant="secondary" onClick={() => setSwitchTarget(null)}>
             Cancel
           </Button>
           <Button
             variant="danger"
             onClick={() => {
-              setSwitchModalOpen(false);
-              if (inactiveSlot) void ctl.switchAbSlot(inactiveSlot, true);
+              const target = switchTarget;
+              setSwitchTarget(null);
+              if (target) void ctl.switchAbSlot(target, true);
             }}
           >
-            Switch to {inactiveSlot} & Reboot
+            Switch to {switchTarget} & Reboot
           </Button>
         </div>
       </Modal>

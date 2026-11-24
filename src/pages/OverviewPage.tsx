@@ -28,8 +28,8 @@ import { hrefFor } from "../stores/route-store";
 import { useToastStore } from "../stores/toast-store";
 import { useLiveness, useWsStore } from "../stores/ws-store";
 import { Badge, Button, CopyButton, LiveDot, Meter, SignalDial, Skeleton, Sparkline, signalQuality } from "../components/ui";
-import { InteractiveAreaChart } from "../components/Charts";
-import { EventRow, FailoverBadge } from "../components/obs";
+import { InteractiveAreaChart, type ChartMarker } from "../components/Charts";
+import { EventRow, FailoverBadge, eventLabel } from "../components/obs";
 import { useObsStore } from "../stores/obs-store";
 import type { OverviewPulse } from "../types/cellcore";
 import { heatInk, heatVerdict } from "./system/parts";
@@ -830,10 +830,25 @@ const RecentEventsPanel = React.memo(function RecentEventsPanel() {
   );
 });
 
+const SIGNAL_CHART_EVENT_TYPES = new Set([
+  "handover",
+  "band_change",
+  "ca_change",
+  "rat_change",
+  "quecwatch_recovery",
+  "failover_start",
+  "failover_end",
+]);
+
+function toEpochMs(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
 const SignalHistoryPanel = React.memo(function SignalHistoryPanel() {
   const [sigMetric, setSigMetric] = useState<"rsrp" | "sinr" | "rsrq">("rsrp");
   const signalHistory = useWsStore((s) => s.signalHistory);
   const rsrqHistory = useWsStore((s) => s.rsrqHistory);
+  const recentEvents = useObsStore((s) => s.recent);
 
   const points = sigMetric === "rsrp" ? signalHistory.rsrp : sigMetric === "sinr" ? signalHistory.sinr : rsrqHistory;
   const series = useMemo(
@@ -849,6 +864,41 @@ const SignalHistoryPanel = React.memo(function SignalHistoryPanel() {
     [points, sigMetric]
   );
   const labels = useMemo(() => points.map((p) => p.label), [points]);
+
+  const markers = useMemo<ChartMarker[]>(() => {
+    if (points.length < 2 || recentEvents.length === 0) return [];
+    const ptMs = points.map((p) => toEpochMs(p.ts));
+    const minMs = ptMs[0];
+    const maxMs = ptMs[ptMs.length - 1];
+    const padMs = 60_000;
+    const out: ChartMarker[] = [];
+    for (const ev of recentEvents) {
+      if (!SIGNAL_CHART_EVENT_TYPES.has(ev.type)) continue;
+      const evMs = toEpochMs(ev.ts);
+      if (evMs < minMs - padMs || evMs > maxMs + padMs) continue;
+      let bestIdx = 0;
+      let bestDiff = Math.abs(ptMs[0] - evMs);
+      for (let i = 1; i < ptMs.length; i++) {
+        const diff = Math.abs(ptMs[i] - evMs);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      const tone: ChartMarker["tone"] =
+        ev.severity === "critical" || ev.type === "quecwatch_recovery"
+          ? "danger"
+          : ev.severity === "warning" || ev.type === "failover_start"
+            ? "warn"
+            : "info";
+      out.push({
+        index: bestIdx,
+        label: ev.title || eventLabel(ev.type),
+        tone,
+      });
+    }
+    return out;
+  }, [points, recentEvents]);
 
   return (
     <Panel>
@@ -876,6 +926,7 @@ const SignalHistoryPanel = React.memo(function SignalHistoryPanel() {
       <InteractiveAreaChart
         series={series}
         labels={labels}
+        markers={markers}
         height={175}
         emptyLabel="Waiting for 1-minute signal samples…"
       />

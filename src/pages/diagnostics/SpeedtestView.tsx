@@ -69,6 +69,56 @@ function Delta({ latest, base }: { latest: number; base: number | null }) {
   );
 }
 
+interface SpeedtestRfSnapshotCompat {
+  rat?: string | null;
+  band?: string | null;
+  pci?: number | null;
+  caCount?: number | null;
+  caBandwidthMhz?: number | null;
+  rsrp?: number | null;
+  sinr?: number | null;
+}
+
+function getRunRf(run: Partial<SpeedtestRun> | null | undefined): SpeedtestRfSnapshotCompat | null {
+  if (!run || typeof run !== "object") return null;
+  const rf = (run as Partial<SpeedtestRun> & { rf?: SpeedtestRfSnapshotCompat | null }).rf;
+  if (!rf || typeof rf !== "object") return null;
+  if (!rf.band && !rf.rat && rf.pci == null && rf.rsrp == null && rf.sinr == null && rf.caBandwidthMhz == null) {
+    return null;
+  }
+  return rf;
+}
+
+function RfSnapshotPill({ rf, compact = false }: { rf: SpeedtestRfSnapshotCompat; compact?: boolean }) {
+  const bandPart = rf.band || rf.rat || "RF";
+  const bwPart = rf.caBandwidthMhz != null && Number.isFinite(rf.caBandwidthMhz) ? `${Math.round(rf.caBandwidthMhz)} MHz` : null;
+  const caPart = rf.caCount != null && rf.caCount > 1 ? `${rf.caCount}CA` : null;
+  const pciPart = rf.pci != null ? `PCI ${rf.pci}` : null;
+  const sigPart =
+    rf.rsrp != null || rf.sinr != null
+      ? `${rf.rsrp != null ? rf.rsrp : "--"} dBm / ${rf.sinr != null ? rf.sinr : "--"} dB`
+      : null;
+
+  return (
+    <span
+      className={cn(
+        "inline-flex flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded-lg border border-line bg-sunk/70 px-2 py-0.5 font-mono qm-tabular text-ink-2",
+        compact ? "text-[10.5px] leading-snug" : "text-[11.5px] leading-snug"
+      )}
+      title="Captured radio conditions during this speedtest run"
+    >
+      <Radio className="h-3 w-3 shrink-0 text-ember-ink" />
+      <span className="font-semibold text-ink">
+        {bandPart}
+        {bwPart ? ` · ${bwPart}` : ""}
+        {caPart ? ` (${caPart})` : ""}
+      </span>
+      {pciPart && <span className="text-muted">· {pciPart}</span>}
+      {sigPart && <span className="text-ink-2">· {sigPart}</span>}
+    </span>
+  );
+}
+
 const LiveRadioStrip = React.memo(function LiveRadioStrip() {
   const modem = useWsStore((s) => s.modem);
   if (!modem || modem.carriers.length === 0) return null;
@@ -243,7 +293,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
               <Numeral label="Upload" dot="bg-berry" value={fmtMbps(activeRunDisplay?.uploadMbps)} />
             </div>
 
-            <div className="flex flex-wrap gap-x-6 gap-y-2 text-[13px] text-ink-2 qm-tabular">
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-[13px] text-ink-2 qm-tabular">
               <span>
                 <span className="text-muted">Idle ping </span>
                 <b className="text-ink">{activeRunDisplay?.pingMs ? `${activeRunDisplay.pingMs} ms` : "--"}</b>
@@ -265,6 +315,15 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                 </span>
               )}
             </div>
+
+            {(() => {
+              const latestRf = !isLive ? getRunRf(activeRunDisplay) : null;
+              return latestRf ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <RfSnapshotPill rf={latestRf} />
+                </div>
+              ) : null;
+            })()}
 
             {/* Phase stepper */}
             <div className="space-y-2.5">
@@ -456,7 +515,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
           }
         />
         <div className="w-full max-w-full overflow-x-auto rounded-2xl border border-line max-h-[420px] overflow-y-auto">
-          <table className="w-full min-w-[720px] text-left text-[12.5px] qm-tabular">
+          <table className="w-full min-w-[820px] text-left text-[12.5px] qm-tabular">
             <thead className="sticky top-0 z-[1] bg-sunk text-[11.5px] font-semibold text-muted">
               <tr>
                 <th className="py-2.5 px-3">When</th>
@@ -465,12 +524,14 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                 <th className="py-2.5 px-3 text-right">Ping</th>
                 <th className="py-2.5 px-3 text-right">Loaded ↓ / ↑</th>
                 <th className="py-2.5 px-3 text-center">Grade</th>
+                <th className="py-2.5 px-3">Radio</th>
                 <th className="py-2.5 px-3">Server</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line bg-surface">
               {speedtestHistory.map((run) => {
                 const [d, t] = run.timestamp.split(" ");
+                const rf = getRunRf(run);
                 return (
                   <tr key={run.id} className="hover:bg-sunk/60">
                     <td className="py-2.5 px-3 whitespace-nowrap">
@@ -492,6 +553,9 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                     <td className="py-2.5 px-3 text-center">
                       <GradeChip grade={run.bufferbloatGrade} />
                     </td>
+                    <td className="py-2.5 px-3">
+                      {rf ? <RfSnapshotPill rf={rf} compact /> : <span className="text-muted">--</span>}
+                    </td>
                     <td className="py-2.5 px-3 max-w-[200px]">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span className="truncate text-ink-2">{run.serverName || "--"}</span>
@@ -502,7 +566,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
               })}
               {speedtestHistory.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-8 text-center text-[13px] text-muted">
+                  <td colSpan={8} className="py-8 text-center text-[13px] text-muted">
                     No saved runs yet. Results land here automatically.
                   </td>
                 </tr>

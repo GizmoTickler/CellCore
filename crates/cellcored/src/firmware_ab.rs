@@ -1570,7 +1570,19 @@ pub fn inspect_package(
 // ---------------------------------------------------------------------------
 
 struct AbFlockGuard {
-    _file: fs::File,
+    file: fs::File,
+}
+
+impl Drop for AbFlockGuard {
+    fn drop(&mut self) {
+        // Explicitly unlock before closing: in a multi-threaded daemon (or
+        // parallel test suite) another thread may be mid-fork() before
+        // O_CLOEXEC takes effect, keeping the open file description alive
+        // briefly after close(2). LOCK_UN releases the lock immediately.
+        unsafe {
+            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 fn acquire_ab_flock() -> Result<AbFlockGuard, String> {
@@ -1595,7 +1607,7 @@ fn acquire_ab_flock() -> Result<AbFlockGuard, String> {
         }
         return Err(format!("flock {lock_path}: {err}"));
     }
-    Ok(AbFlockGuard { _file: file })
+    Ok(AbFlockGuard { file })
 }
 
 struct RemoveFileGuard(Option<PathBuf>);
@@ -2827,6 +2839,19 @@ pub struct FlashBody {
     pub allow_no_manifest: bool,
 }
 
+fn broadcast_ab_flash_progress(app: &crate::state::AppState, j: &AbJobProgress) {
+    app.broadcast_json(&serde_json::json!({
+        "channel": "ab_flash",
+        "running": j.running,
+        "phase": j.phase,
+        "currentPartition": j.current_partition,
+        "completed": j.completed,
+        "total": j.total,
+        "ok": j.ok,
+        "error": j.error,
+    }));
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2880,7 +2905,7 @@ pub async fn post_firmware_ab_flash(
 
     let total = inspect.plan.partitions.len();
     let started = crate::auth::now_secs();
-    {
+    let initial_snap = {
         let mut j = ctx.app.ab_flash.job.write().await;
         *j = AbJobProgress {
             running: true,
@@ -2900,7 +2925,9 @@ pub async fn post_firmware_ab_flash(
                 inspect.plan.target_slot.suffix()
             )],
         };
-    }
+        j.clone()
+    };
+    broadcast_ab_flash_progress(&ctx.app, &initial_snap);
 
     let opts = FlashOptions {
         dry_run: body.dry_run,
@@ -2917,15 +2944,19 @@ pub async fn post_firmware_ab_flash(
         let plan_run = plan.clone();
         let res = crate::paths::spawn_blocking(move || {
             execute_flash(&plan_run, &source, opts, |line, cur, done, tot| {
-                let mut j = app_cb.ab_flash.job.blocking_write();
-                j.current_partition = cur.map(str::to_string);
-                j.completed = done;
-                j.total = tot;
-                j.log.push(line.to_string());
-                if j.log.len() > MAX_LOG_LINES {
-                    let drop_n = j.log.len() - MAX_LOG_LINES;
-                    j.log.drain(0..drop_n);
-                }
+                let snap = {
+                    let mut j = app_cb.ab_flash.job.blocking_write();
+                    j.current_partition = cur.map(str::to_string);
+                    j.completed = done;
+                    j.total = tot;
+                    j.log.push(line.to_string());
+                    if j.log.len() > MAX_LOG_LINES {
+                        let drop_n = j.log.len() - MAX_LOG_LINES;
+                        j.log.drain(0..drop_n);
+                    }
+                    j.clone()
+                };
+                broadcast_ab_flash_progress(&app_cb, &snap);
             })
         })
         .await;
@@ -2933,7 +2964,7 @@ pub async fn post_firmware_ab_flash(
         let finished = crate::auth::now_secs();
         match res {
             Ok(Ok(st)) => {
-                {
+                let final_snap = {
                     let mut j = app.ab_flash.job.write().await;
                     j.running = false;
                     j.phase = st.status.clone();
@@ -2942,7 +2973,9 @@ pub async fn post_firmware_ab_flash(
                     j.finished_at = Some(finished);
                     j.ok = Some(true);
                     j.error = None;
-                }
+                    j.clone()
+                };
+                broadcast_ab_flash_progress(&app, &final_snap);
                 app.push_daemon_log(format!(
                     "firmware-ab: {}",
                     st.message.as_deref().unwrap_or("completed")
@@ -2956,7 +2989,7 @@ pub async fn post_firmware_ab_flash(
                 }
             }
             Ok(Err(e)) => {
-                {
+                let final_snap = {
                     let mut j = app.ab_flash.job.write().await;
                     j.running = false;
                     j.phase = "failed".into();
@@ -2964,17 +2997,23 @@ pub async fn post_firmware_ab_flash(
                     j.ok = Some(false);
                     j.error = Some(e.clone());
                     j.log.push(format!("[{}] ERROR: {e}", crate::state::format_now_hms()));
-                }
+                    j.clone()
+                };
+                broadcast_ab_flash_progress(&app, &final_snap);
                 app.push_daemon_log(format!("firmware-ab failed: {e}"));
             }
             Err(e) => {
                 let msg = format!("flash worker panicked: {e}");
-                let mut j = app.ab_flash.job.write().await;
-                j.running = false;
-                j.phase = "failed".into();
-                j.finished_at = Some(finished);
-                j.ok = Some(false);
-                j.error = Some(msg);
+                let final_snap = {
+                    let mut j = app.ab_flash.job.write().await;
+                    j.running = false;
+                    j.phase = "failed".into();
+                    j.finished_at = Some(finished);
+                    j.ok = Some(false);
+                    j.error = Some(msg);
+                    j.clone()
+                };
+                broadcast_ab_flash_progress(&app, &final_snap);
             }
         }
     });
@@ -3993,8 +4032,12 @@ mtd36: 11200000 00040000 "usrdata"
         assert_eq!(rci.image_set_to_boot, Some(1));
     }
 
+    // Serialize unit tests that acquire the process-wide A/B OPERATION_LOCK.
+    static TEST_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn end_to_end_dry_run_against_synthetic_firmware_dir() {
+        let _op_guard = TEST_OP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sbx = crate::paths::TestSandbox::new("fw-ab-dryrun");
         sbx.write("/proc/mtd", PROC_MTD_R02A02);
         sbx.write("/proc/cmdline", "ubi.mtd=55 SLOT_SUFFIX=_a root=ubi0:rootfs\n");
@@ -4103,6 +4146,7 @@ mtd36: 11200000 00040000 "usrdata"
 
     #[test]
     fn switch_slot_refuses_dirty_target_slot_unless_forced() {
+        let _op_guard = TEST_OP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sbx = crate::paths::TestSandbox::new("fw-ab-dirty-slot");
         sbx.write("/proc/mtd", PROC_MTD_R02A02);
         sbx.write("/proc/cmdline", "ubi.mtd=55 SLOT_SUFFIX=_a root=ubi0:rootfs\n");

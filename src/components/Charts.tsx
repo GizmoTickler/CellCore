@@ -80,9 +80,28 @@ export interface SeriesConfig {
   unit?: string;
 }
 
+export interface ChartMarker {
+  index: number;
+  label: string;
+  tone?: "info" | "warn" | "danger";
+}
+
+function markerColor(tone?: "info" | "warn" | "danger"): string {
+  if (tone === "danger") return "var(--qm-crimson)";
+  if (tone === "warn") return "var(--qm-saffron)";
+  return "var(--qm-ember)";
+}
+
+function markerPriority(tone?: "info" | "warn" | "danger"): number {
+  if (tone === "danger") return 3;
+  if (tone === "warn") return 2;
+  return 1;
+}
+
 export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
   series,
   labels,
+  markers,
   height = 175,
   minOverride,
   maxOverride,
@@ -91,6 +110,7 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
 }: {
   series: SeriesConfig[];
   labels?: string[];
+  markers?: ChartMarker[];
   height?: number;
   minOverride?: number;
   maxOverride?: number;
@@ -192,6 +212,29 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
     setHoverIdx(Math.max(0, Math.min(count - 1, idx)));
   }
 
+  const validMarkers = useMemo(() => {
+    if (!markers || markers.length === 0 || count === 0) return [];
+    return markers.filter((m) => Number.isFinite(m.index) && m.index >= 0 && m.index < count);
+  }, [markers, count]);
+
+  const groupedMarkers = useMemo(() => {
+    const byIdx = new Map<number, { index: number; tone: "info" | "warn" | "danger"; items: ChartMarker[] }>();
+    for (const m of validMarkers) {
+      const idx = Math.round(m.index);
+      const tone = m.tone ?? "info";
+      const existing = byIdx.get(idx);
+      if (!existing) {
+        byIdx.set(idx, { index: idx, tone, items: [m] });
+      } else {
+        existing.items.push(m);
+        if (markerPriority(tone) > markerPriority(existing.tone)) {
+          existing.tone = tone;
+        }
+      }
+    }
+    return [...byIdx.values()];
+  }, [validMarkers]);
+
   if (count === 0) {
     return (
       <div
@@ -210,6 +253,15 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
         ? padL + plotW
         : padL + (activeIdx / (count - 1)) * plotW
       : null;
+
+  const markerSnapRadius = Math.min(3, Math.max(1, Math.round(count / 50)));
+  const nearbyMarkers =
+    activeIdx != null && validMarkers.length > 0
+      ? [...validMarkers]
+          .filter((m) => Math.abs(Math.round(m.index) - activeIdx) <= markerSnapRadius)
+          .sort((a, b) => Math.abs(a.index - activeIdx) - Math.abs(b.index - activeIdx))
+          .slice(0, 3)
+      : [];
 
   const unit = series[0]?.unit ?? "";
 
@@ -361,6 +413,38 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
           </g>
         )}
 
+        {/* Event marker ticks + top dots */}
+        {groupedMarkers.length > 0 && (
+          <g>
+            {groupedMarkers.map((gm) => {
+              const mx = count <= 1 ? padL + plotW : padL + (gm.index / (count - 1)) * plotW;
+              const col = markerColor(gm.tone);
+              const isNear = activeIdx != null && Math.abs(gm.index - activeIdx) <= markerSnapRadius;
+              return (
+                <g key={`m-${gm.index}`}>
+                  <line
+                    x1={mx}
+                    y1={padT}
+                    x2={mx}
+                    y2={padT + plotH}
+                    style={{ stroke: col }}
+                    strokeWidth={isNear ? "1.6" : "1.15"}
+                    strokeDasharray="2.5 3"
+                    opacity={isNear ? "0.9" : "0.5"}
+                  />
+                  <circle
+                    cx={mx}
+                    cy={padT - 1}
+                    r={isNear ? "3.4" : "2.5"}
+                    style={{ fill: col, stroke: "var(--qm-surface)" }}
+                    strokeWidth="1"
+                  />
+                </g>
+              );
+            })}
+          </g>
+        )}
+
         {/* Hover crosshair + active dots */}
         {activeIdx != null && activeX != null && (
           <g>
@@ -405,7 +489,7 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
       {activeIdx != null && activeX != null && (
         <div
           data-testid="chart-hover-tooltip"
-          className="pointer-events-none absolute top-1 z-20 rounded-lg border border-line bg-ink text-paper px-2.5 py-1.5 text-[11px] shadow-md"
+          className="pointer-events-none absolute top-1 z-20 max-w-[240px] rounded-lg border border-line bg-ink text-paper px-2.5 py-1.5 text-[11px] shadow-md"
           style={{
             left: `${Math.max(10, Math.min(72, (activeX / width) * 100))}%`,
           }}
@@ -433,6 +517,19 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
               );
             })}
           </div>
+          {nearbyMarkers.length > 0 && (
+            <div className="mt-1.5 space-y-0.5 border-t border-paper/15 pt-1">
+              {nearbyMarkers.map((m, i) => (
+                <div key={`tm-${m.index}-${i}`} className="flex items-start gap-1.5 text-[10.5px] leading-tight">
+                  <span
+                    className="mt-1 h-1.5 w-1.5 rounded-full shrink-0"
+                    style={{ backgroundColor: markerColor(m.tone) }}
+                  />
+                  <span className="font-medium break-words">{m.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -442,6 +539,7 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
 export const SmoothAreaChart = React.memo(function SmoothAreaChart({
   values,
   labels,
+  markers,
   label = "Value",
   stroke = "var(--qm-ember)",
   unit = "",
@@ -452,6 +550,7 @@ export const SmoothAreaChart = React.memo(function SmoothAreaChart({
 }: {
   values: number[];
   labels?: string[];
+  markers?: ChartMarker[];
   label?: string;
   stroke?: string;
   unit?: string;
@@ -468,6 +567,7 @@ export const SmoothAreaChart = React.memo(function SmoothAreaChart({
     <InteractiveAreaChart
       series={series}
       labels={labels}
+      markers={markers}
       height={height}
       minOverride={minOverride}
       maxOverride={maxOverride}
@@ -480,6 +580,7 @@ export const DualAreaChart = React.memo(function DualAreaChart({
   primaryValues,
   secondaryValues,
   labels,
+  markers,
   primaryLabel = "Download",
   secondaryLabel = "Upload",
   primaryColor = "var(--qm-jade)",
@@ -490,6 +591,7 @@ export const DualAreaChart = React.memo(function DualAreaChart({
   primaryValues: number[];
   secondaryValues: number[];
   labels?: string[];
+  markers?: ChartMarker[];
   primaryLabel?: string;
   secondaryLabel?: string;
   primaryColor?: string;
@@ -508,6 +610,7 @@ export const DualAreaChart = React.memo(function DualAreaChart({
     <InteractiveAreaChart
       series={series}
       labels={labels}
+      markers={markers}
       height={height}
       minOverride={0}
     />

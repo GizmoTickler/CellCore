@@ -89,6 +89,7 @@ pub const READ_DENY: &[&str] = &[
     "/api/v1/system/acme",
     "/api/v1/cellular/profiles",
     "/api/v1/security/audit",
+    "/api/v1/diagnostics/snapshot",
 ];
 
 /// The config export is readable, but not with SIM identifiers.

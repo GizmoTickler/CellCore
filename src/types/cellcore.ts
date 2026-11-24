@@ -298,6 +298,16 @@ export interface SpeedtestSample {
   latencyIqm?: number | null;
 }
 
+export interface SpeedtestRfSnapshot {
+  rat: string;
+  band: string;
+  pci?: number | null;
+  caCount: number;
+  caBandwidthMhz: number;
+  rsrp?: number | null;
+  sinr?: number | null;
+}
+
 export interface SpeedtestRun {
   id: string;
   timestamp: string;
@@ -316,6 +326,7 @@ export interface SpeedtestRun {
   serverLocation?: string | null;
   externalIp?: string | null;
   engine?: string | null;
+  rf?: SpeedtestRfSnapshot | null;
 }
 
 export interface SpeedtestLiveState {
@@ -610,8 +621,29 @@ export interface FirmwareAbStatus {
   projectName?: string | null;
   projectRev?: string | null;
   tmpAvailMib?: number | null;
+  abUpdaterEnabled?: boolean;
+  mirrorCopyEnabled?: boolean;
   job: FirmwareAbJobProgress;
   lastState: FirmwareAbPersistedState;
+}
+
+export interface StagedFirmwareFile {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  mtimeSecs: number;
+}
+
+export interface FirmwareUploadResponse {
+  ok: boolean;
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface FirmwareAbWsPayload {
+  channel: "ab_flash";
+  job: FirmwareAbJobProgress;
 }
 
 export interface FirmwareAbPlannedPartition {
@@ -662,4 +694,5 @@ export interface FirmwareAbFlashRequest {
 export interface FirmwareAbSwitchRequest {
   slot?: FirmwareAbSlot;
   reboot?: boolean;
+  force?: boolean;
 }

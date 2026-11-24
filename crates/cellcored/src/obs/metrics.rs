@@ -786,6 +786,27 @@ pub fn render(m: &MetricsInput) -> String {
         p.head("dataplane_wds_connected", "1 when the native QMI WDS session for the IP family is connected.", "gauge");
         p.sample("dataplane_wds_connected", &[("family", "v4")], b(dp.wds_v4_connected));
         p.sample("dataplane_wds_connected", &[("family", "v6")], b(dp.wds_v6_connected));
+        p.head("wan_family_usable", "1 when active data-plane liveness probe confirms the IP family is passing traffic.", "gauge");
+        p.sample("wan_family_usable", &[("family", "v4")], b(dp.wds_v4_usable.unwrap_or(dp.wds_v4_connected)));
+        p.sample("wan_family_usable", &[("family", "v6")], b(dp.wds_v6_usable.unwrap_or(dp.wds_v6_connected)));
+        if dp.wds_tx_drops.is_some() || dp.wds_rx_drops.is_some() {
+            p.head("qmi_wds_pkt_drops_total", "QMI WDS hardware packet drops reported by the modem baseband.", "counter");
+            if let Some(v) = dp.wds_tx_drops {
+                p.sample("qmi_wds_pkt_drops_total", &[("direction", "tx")], f64::from(v));
+            }
+            if let Some(v) = dp.wds_rx_drops {
+                p.sample("qmi_wds_pkt_drops_total", &[("direction", "rx")], f64::from(v));
+            }
+        }
+        if dp.wds_tx_overflows.is_some() || dp.wds_rx_overflows.is_some() {
+            p.head("qmi_wds_pkt_overflows_total", "QMI WDS hardware buffer overflows reported by the modem baseband.", "counter");
+            if let Some(v) = dp.wds_tx_overflows {
+                p.sample("qmi_wds_pkt_overflows_total", &[("direction", "tx")], f64::from(v));
+            }
+            if let Some(v) = dp.wds_rx_overflows {
+                p.sample("qmi_wds_pkt_overflows_total", &[("direction", "rx")], f64::from(v));
+            }
+        }
         p.opt_gauge("dataplane_ipa_clk_mhz", "Current Qualcomm IPA hardware offload clock rate (MHz).", dp.ipa_clk_mhz.map(|v| v as f64));
         p.gauge("dataplane_sfe_loaded", "1 when Qualcomm shortcut-fe (SFE) fastpath modules are loaded.", b(dp.sfe_loaded));
         p.gauge("dataplane_tuning_warnings", "Number of active high-throughput kernel tuning warnings.", dp.tuning_warnings as f64);
@@ -1225,5 +1246,27 @@ mod tests {
         assert_eq!(parse_eth_speed_mbps("down"), Some(0.0));
         assert_eq!(parse_eth_speed_mbps("1000Mb/s"), Some(1000.0));
         assert_eq!(parse_eth_speed_mbps(""), None);
+    }
+
+    #[test]
+    fn renders_v200_wan_family_usable_and_qmi_wds_pkt_drop_counters() {
+        let mut m = sample_input();
+        m.dataplane.mode = "native";
+        m.dataplane.wds_v4_connected = true;
+        m.dataplane.wds_v6_connected = true;
+        m.dataplane.wds_v4_usable = Some(true);
+        m.dataplane.wds_v6_usable = Some(false);
+        m.dataplane.wds_tx_drops = Some(12);
+        m.dataplane.wds_rx_drops = Some(34);
+        m.dataplane.wds_tx_overflows = Some(5);
+        m.dataplane.wds_rx_overflows = Some(7);
+
+        let t = render(&m);
+        assert_eq!(line_value(&t, "cellcore_wan_family_usable{family=\"v4\"}").as_deref(), Some("1"));
+        assert_eq!(line_value(&t, "cellcore_wan_family_usable{family=\"v6\"}").as_deref(), Some("0"));
+        assert_eq!(line_value(&t, "cellcore_qmi_wds_pkt_drops_total{direction=\"tx\"}").as_deref(), Some("12"));
+        assert_eq!(line_value(&t, "cellcore_qmi_wds_pkt_drops_total{direction=\"rx\"}").as_deref(), Some("34"));
+        assert_eq!(line_value(&t, "cellcore_qmi_wds_pkt_overflows_total{direction=\"tx\"}").as_deref(), Some("5"));
+        assert_eq!(line_value(&t, "cellcore_qmi_wds_pkt_overflows_total{direction=\"rx\"}").as_deref(), Some("7"));
     }
 }

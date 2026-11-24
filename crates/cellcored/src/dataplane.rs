@@ -4,11 +4,12 @@
 use std::{
     collections::HashMap,
     fs,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -268,6 +269,14 @@ pub struct DataplaneSnapshot {
     pub reconnect_attempts: u64,
     pub netlink_updates: u64,
     pub last_indication: Option<String>,
+    pub v4_usable: Option<bool>,
+    pub v6_usable: Option<bool>,
+    pub v4_probe_failures: u8,
+    pub v6_probe_failures: u8,
+    pub wds_tx_drops: Option<u32>,
+    pub wds_rx_drops: Option<u32>,
+    pub wds_tx_overflows: Option<u32>,
+    pub wds_rx_overflows: Option<u32>,
     pub warnings: Vec<String>,
 }
 
@@ -352,6 +361,9 @@ static NATIVE_CONNECTED_SINCE: AtomicU64 = AtomicU64::new(0);
 static NATIVE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NATIVE_WDS_V4_CONNECTED: AtomicBool = AtomicBool::new(false);
 static NATIVE_WDS_V6_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// Per-family active data-plane usability: `0 = unknown`, `1 = down`, `2 = usable`.
+static WDS_V4_USABLE: AtomicU8 = AtomicU8::new(0);
+static WDS_V6_USABLE: AtomicU8 = AtomicU8::new(0);
 static FORCE_FW_HEAL: AtomicBool = AtomicBool::new(false);
 static SFE_LOADED_BY_US: AtomicBool = AtomicBool::new(false);
 
@@ -413,6 +425,50 @@ pub fn clear_persisted_native_state() {
 pub fn is_wds_connected() -> bool {
     NATIVE_WDS_V4_CONNECTED.load(Ordering::Acquire)
         || NATIVE_WDS_V6_CONNECTED.load(Ordering::Acquire)
+}
+
+pub fn is_wds_v4_connected() -> bool {
+    NATIVE_WDS_V4_CONNECTED.load(Ordering::Acquire)
+}
+
+pub fn is_wds_v6_connected() -> bool {
+    NATIVE_WDS_V6_CONNECTED.load(Ordering::Acquire)
+}
+
+/// Latest active data-plane IPv4 liveness probe state (`None` = unknown, `Some(false)` = down, `Some(true)` = usable).
+pub fn wds_v4_usable() -> Option<bool> {
+    match WDS_V4_USABLE.load(Ordering::Acquire) {
+        2 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// Latest active data-plane IPv6 liveness probe state (`None` = unknown, `Some(false)` = down, `Some(true)` = usable).
+pub fn wds_v6_usable() -> Option<bool> {
+    match WDS_V6_USABLE.load(Ordering::Acquire) {
+        2 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+fn set_wds_family_usable(is_v6: bool, val: Option<bool>) {
+    let code = match val {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    if is_v6 {
+        WDS_V6_USABLE.store(code, Ordering::Release);
+    } else {
+        WDS_V4_USABLE.store(code, Ordering::Release);
+    }
+}
+
+/// Read-only cached snapshot for diagnostics & health endpoints (no QMI/AT/sysfs I/O).
+pub async fn current_snapshot() -> DataplaneSnapshot {
+    hub().snapshot.read().await.clone()
 }
 
 /// Immediately wake the native supervisor to re-assert native fw4/nft/iptables rules
@@ -665,6 +721,194 @@ pub(crate) fn validate_ippt_dev_type(raw: &str) -> Result<String, String> {
         return Ok(norm);
     }
     Err(format!("invalid ipptDevType {raw:?} (expected eth0, eth1, usb, or any)"))
+}
+
+pub(crate) fn mask_ipv6_prefix(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let len = prefix_len.min(128);
+    let bits = u128::from(addr);
+    let mask = if len == 0 {
+        0u128
+    } else {
+        u128::MAX << (128 - u32::from(len))
+    };
+    Ipv6Addr::from(bits & mask)
+}
+
+/// Construct a standards-compliant RFC 4861 / RFC 9096 ICMPv6 Router Advertisement
+/// deprecating an old IPv6 prefix (`preferred_lifetime = 0`, `valid_lifetime = 300 s`,
+/// `L=1, A=1`, router lifetime `1800 s`). Checksum bytes are zeroed so the Linux kernel
+/// fills the ICMPv6 checksum on `AF_INET6`/`SOCK_RAW`/`IPPROTO_ICMPV6`.
+pub(crate) fn build_rfc9096_deprecate_ra(old_prefix: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
+    let plen = prefix_len.min(128);
+    let masked = mask_ipv6_prefix(old_prefix, plen);
+    let mut pkt = Vec::with_capacity(48);
+    // ICMPv6 Router Advertisement header (16 bytes)
+    pkt.push(134); // Type = 134 (Router Advertisement)
+    pkt.push(0); // Code = 0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // Checksum (computed by kernel)
+    pkt.push(64); // Cur Hop Limit
+    pkt.push(0); // Flags (M=0, O=0)
+    pkt.extend_from_slice(&1800u16.to_be_bytes()); // Router Lifetime = 1800 s
+    pkt.extend_from_slice(&0u32.to_be_bytes()); // Reachable Time
+    pkt.extend_from_slice(&0u32.to_be_bytes()); // Retrans Timer
+    // Prefix Information Option (PIO, 32 bytes, Type=3, Length=4 -> 32 bytes)
+    pkt.push(3); // Type = 3 (Prefix Information)
+    pkt.push(4); // Length = 4 (in 8-octet units = 32 bytes)
+    pkt.push(plen); // Prefix Length
+    pkt.push(0xC0); // Flags: L=1 (0x80) | A=1 (0x40)
+    pkt.extend_from_slice(&300u32.to_be_bytes()); // Valid Lifetime = 300 s
+    pkt.extend_from_slice(&0u32.to_be_bytes()); // Preferred Lifetime = 0 s (deprecated)
+    pkt.extend_from_slice(&0u32.to_be_bytes()); // Reserved2
+    pkt.extend_from_slice(&masked.octets()); // Prefix (16 bytes)
+    pkt
+}
+
+async fn send_rfc9096_deprecate_ra_on_lan(old_prefix: Ipv6Addr) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let ifindex = unsafe { libc::if_nametoindex(c"br-lan".as_ptr()) };
+        if ifindex == 0 {
+            return Err("br-lan interface not found".to_string());
+        }
+        let raw_fd = unsafe {
+            libc::socket(
+                libc::AF_INET6,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_ICMPV6,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(format!(
+                "ICMPv6 raw socket failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let hops: libc::c_int = 255;
+        let rc_hops = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MULTICAST_HOPS,
+                (&hops as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc_hops < 0 {
+            return Err(format!(
+                "IPV6_MULTICAST_HOPS failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mif: libc::c_uint = ifindex;
+        let rc_if = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MULTICAST_IF,
+                (&mif as *const libc::c_uint).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        };
+        if rc_if < 0 {
+            return Err(format!(
+                "IPV6_MULTICAST_IF(br-lan) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut dst: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        dst.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        dst.sin6_addr.s6_addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).octets();
+        dst.sin6_scope_id = ifindex;
+        let ra = build_rfc9096_deprecate_ra(old_prefix, 64);
+        for i in 0..2 {
+            let sent = unsafe {
+                libc::sendto(
+                    fd.as_raw_fd(),
+                    ra.as_ptr().cast::<libc::c_void>(),
+                    ra.len(),
+                    0,
+                    (&dst as *const libc::sockaddr_in6).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                return Err(format!(
+                    "sendto(ff02::1) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if i == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("RFC 9096 RA task panicked: {e}"))?
+}
+
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const LIVENESS_PROBE_STANDBY_MS: u64 = 60_000;
+const LIVENESS_PROBE_FAILOVER_MS: u64 = 15_000;
+const LIVENESS_ZOMBIE_THRESHOLD: u8 = 3;
+const WDS_STATS_POLL_INTERVAL_MS: u64 = 30_000;
+
+/// Pure state transition for per-family active liveness probes.
+/// Returns `(usable, next_failures, trigger_zombie_reconnect)`.
+pub(crate) fn evaluate_liveness_probe_outcome(prev_failures: u8, probe_ok: bool) -> (Option<bool>, u8, bool) {
+    if probe_ok {
+        (Some(true), 0, false)
+    } else {
+        let next = prev_failures.saturating_add(1);
+        (Some(false), next, next >= LIVENESS_ZOMBIE_THRESHOLD)
+    }
+}
+
+async fn tcp_connect_probe_bound(addr: SocketAddr, iface: &str, timeout: Duration) -> bool {
+    let sock = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+    };
+    let Ok(sock) = sock else {
+        return false;
+    };
+    let mut ifname = iface.as_bytes().to_vec();
+    ifname.push(0);
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            ifname.as_ptr().cast::<libc::c_void>(),
+            ifname.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    tokio::time::timeout(timeout, sock.connect(addr))
+        .await
+        .is_ok_and(|res| res.is_ok())
+}
+
+async fn probe_family_liveness(iface: &str, is_v6: bool) -> bool {
+    let targets: [SocketAddr; 2] = if is_v6 {
+        [
+            SocketAddr::from((Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111), 443)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888), 443)),
+        ]
+    } else {
+        [
+            SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 443)),
+            SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 443)),
+        ]
+    };
+    for addr in targets {
+        if tcp_connect_probe_bound(addr, iface, LIVENESS_PROBE_TIMEOUT).await {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn ipv6_upper64_prefix(addr: &str) -> Option<String> {
@@ -1784,6 +2028,17 @@ struct NativeHandles {
     last_applied_v4_ip: Option<String>,
     last_applied_v6_ip: Option<String>,
     last_applied_v6_key: Option<(String, u8)>,
+    prev_v6_prefix: Option<Ipv6Addr>,
+    v4_usable: Option<bool>,
+    v6_usable: Option<bool>,
+    v4_probe_failures: u8,
+    v6_probe_failures: u8,
+    last_liveness_probe_ms: u64,
+    last_wds_stats_ms: u64,
+    wds_tx_drops: Option<u32>,
+    wds_rx_drops: Option<u32>,
+    wds_tx_overflows: Option<u32>,
+    wds_rx_overflows: Option<u32>,
     last_link_mtu: u32,
     last_applied_sig: Option<AppliedCfgSig>,
     last_resolved_iface: Option<String>,
@@ -1821,6 +2076,17 @@ impl NativeHandles {
             last_applied_v4_ip: None,
             last_applied_v6_ip: None,
             last_applied_v6_key: None,
+            prev_v6_prefix: None,
+            v4_usable: None,
+            v6_usable: None,
+            v4_probe_failures: 0,
+            v6_probe_failures: 0,
+            last_liveness_probe_ms: 0,
+            last_wds_stats_ms: 0,
+            wds_tx_drops: None,
+            wds_rx_drops: None,
+            wds_tx_overflows: None,
+            wds_rx_overflows: None,
             last_link_mtu: 1500,
             last_applied_sig: None,
             last_resolved_iface: None,
@@ -2606,6 +2872,19 @@ async fn teardown_native_handles(state: &AppState, nh: &mut NativeHandles, cfg: 
     NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
     NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
     NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+    set_wds_family_usable(false, None);
+    set_wds_family_usable(true, None);
+    nh.v4_usable = None;
+    nh.v6_usable = None;
+    nh.v4_probe_failures = 0;
+    nh.v6_probe_failures = 0;
+    nh.last_liveness_probe_ms = 0;
+    nh.last_wds_stats_ms = 0;
+    nh.wds_tx_drops = None;
+    nh.wds_rx_drops = None;
+    nh.wds_tx_overflows = None;
+    nh.wds_rx_overflows = None;
+    nh.prev_v6_prefix = None;
     let iface = nh
         .last_resolved_iface
         .clone()
@@ -3199,6 +3478,12 @@ pub struct DataplaneMetricsView {
     pub mode: &'static str,
     pub wds_v4_connected: bool,
     pub wds_v6_connected: bool,
+    pub wds_v4_usable: Option<bool>,
+    pub wds_v6_usable: Option<bool>,
+    pub wds_tx_drops: Option<u32>,
+    pub wds_rx_drops: Option<u32>,
+    pub wds_tx_overflows: Option<u32>,
+    pub wds_rx_overflows: Option<u32>,
     pub ipa_clk_mhz: Option<u64>,
     pub ipa_hardware_offload_pct: Option<u8>,
     pub qrtr_ssr_total: u64,
@@ -3222,6 +3507,12 @@ pub async fn metrics_view() -> DataplaneMetricsView {
         mode,
         wds_v4_connected: snap.wds_v4.state == "connected",
         wds_v6_connected: snap.wds_v6.state == "connected",
+        wds_v4_usable: snap.v4_usable,
+        wds_v6_usable: snap.v6_usable,
+        wds_tx_drops: snap.wds_tx_drops,
+        wds_rx_drops: snap.wds_rx_drops,
+        wds_tx_overflows: snap.wds_tx_overflows,
+        wds_rx_overflows: snap.wds_rx_overflows,
         ipa_clk_mhz: snap.kernel.ipa_offload.clk_rate_mhz,
         ipa_hardware_offload_pct: snap.kernel.ipa_offload.eth_hardware_offload_pct,
         qrtr_ssr_total: snap.qrtr.ssr_count,
@@ -3304,6 +3595,8 @@ pub async fn restore_from_persisted_state() -> Result<Vec<String>, String> {
 
     NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
     NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+    set_wds_family_usable(false, None);
+    set_wds_family_usable(true, None);
     NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
 
     if st.native_active {
@@ -3437,6 +3730,18 @@ fn handle_modem_ssr(
     NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
     NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
     NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+    set_wds_family_usable(false, None);
+    set_wds_family_usable(true, None);
+    nh.v4_usable = None;
+    nh.v6_usable = None;
+    nh.v4_probe_failures = 0;
+    nh.v6_probe_failures = 0;
+    nh.last_liveness_probe_ms = 0;
+    nh.last_wds_stats_ms = 0;
+    nh.wds_tx_drops = None;
+    nh.wds_rx_drops = None;
+    nh.wds_tx_overflows = None;
+    nh.wds_rx_overflows = None;
     state.push_daemon_log(format!("dataplane: QRTR SSR #{ssr_count} detected on node {node}: {reason}"));
     crate::obs::emit(
         crate::obs::EventKind::ModemSsr,
@@ -3606,6 +3911,9 @@ async fn apply_qmi_indication(
                     nh.v4_client = None;
                     nh.v4_handle = None;
                     nh.last_v4_ip = None;
+                    nh.v4_usable = None;
+                    nh.v4_probe_failures = 0;
+                    set_wds_family_usable(false, None);
                     NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                     s.wds_v4.state = "disconnected";
                     s.wds_v4.pkt_status = Some(ps);
@@ -3620,6 +3928,9 @@ async fn apply_qmi_indication(
                     nh.v6_handle = None;
                     nh.last_v6_ip = None;
                     nh.last_v6_key = None;
+                    nh.v6_usable = None;
+                    nh.v6_probe_failures = 0;
+                    set_wds_family_usable(true, None);
                     NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
                     s.wds_v6.state = "disconnected";
                     s.wds_v6.pkt_status = Some(ps);
@@ -3783,6 +4094,16 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                 NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
                 NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
                 NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                set_wds_family_usable(false, None);
+                set_wds_family_usable(true, None);
+                nh.v4_usable = None;
+                nh.v6_usable = None;
+                nh.v4_probe_failures = 0;
+                nh.v6_probe_failures = 0;
+                nh.wds_tx_drops = None;
+                nh.wds_rx_drops = None;
+                nh.wds_tx_overflows = None;
+                nh.wds_rx_overflows = None;
                 if nh.has_native_state() {
                     teardown_native_handles(&state, &mut nh, &cfg).await;
                 }
@@ -4283,6 +4604,31 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                                         nh.last_applied_v6_key = new_v6_key;
                                     }
                                     nh.v6_dns_routes = applied.v6_dns;
+                                    if let Some(v6_s) = applied.v6_addr_str.as_deref()
+                                        && let Ok(v6_addr) = v6_s.parse::<Ipv6Addr>()
+                                        && !v6_addr.is_unspecified()
+                                        && !v6_addr.is_loopback()
+                                        && !v6_addr.is_multicast()
+                                        && !v6_addr.is_unicast_link_local()
+                                    {
+                                        let new_prefix = mask_ipv6_prefix(v6_addr, 64);
+                                        if let Some(old_prefix) = nh.prev_v6_prefix
+                                            && old_prefix != new_prefix
+                                        {
+                                            state.push_daemon_log(format!(
+                                                "dataplane: native IPv6 prefix rotated {old_prefix}/64 -> {new_prefix}/64; broadcasting RFC 9096 deprecation RAs on br-lan"
+                                            ));
+                                            let st_ra = state.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = send_rfc9096_deprecate_ra_on_lan(old_prefix).await {
+                                                    st_ra.push_daemon_log(format!(
+                                                        "dataplane: RFC 9096 deprecation RA skipped/failed for {old_prefix}/64: {e}"
+                                                    ));
+                                                }
+                                            });
+                                        }
+                                        nh.prev_v6_prefix = Some(new_prefix);
+                                    }
                                 }
                                 nh.last_applied_sig = Some(cur_sig);
                                 nh.last_resolved_iface = Some(resolved_iface.clone());
@@ -4418,6 +4764,196 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                         }
                     }
 
+                    if v4_rt.is_none() {
+                        nh.v4_usable = None;
+                        nh.v4_probe_failures = 0;
+                        set_wds_family_usable(false, None);
+                    }
+                    if v6_rt.is_none() {
+                        nh.v6_usable = None;
+                        nh.v6_probe_failures = 0;
+                        set_wds_family_usable(true, None);
+                    }
+
+                    // 3. Poll QMI WDS hardware packet statistics (drops/overflows) every 30 s.
+                    let stats_now_ms = crate::state::mono_ms();
+                    if let Some(cli) = nh
+                        .v4_client
+                        .as_ref()
+                        .or(nh.v6_client.as_ref())
+                        .filter(|c| c.is_alive())
+                    {
+                        if nh.last_wds_stats_ms == 0
+                            || stats_now_ms.saturating_sub(nh.last_wds_stats_ms) >= WDS_STATS_POLL_INTERVAL_MS
+                        {
+                            nh.last_wds_stats_ms = stats_now_ms;
+                            if let Ok(pstats) = wds::get_pkt_statistics(cli.as_ref()).await {
+                                nh.wds_tx_drops = pstats.tx_dropped;
+                                nh.wds_rx_drops = pstats.rx_dropped;
+                                nh.wds_tx_overflows = pstats.tx_overflows;
+                                nh.wds_rx_overflows = pstats.rx_overflows;
+                            }
+                        }
+                    } else {
+                        nh.last_wds_stats_ms = 0;
+                        nh.wds_tx_drops = None;
+                        nh.wds_rx_drops = None;
+                        nh.wds_tx_overflows = None;
+                        nh.wds_rx_overflows = None;
+                    }
+
+                    // 4. Per-family active data-plane liveness probe ("Zombie PDN" detection).
+                    let probe_now_ms = crate::state::mono_ms();
+                    let probe_interval_ms = if crate::obs::failover::is_active() {
+                        LIVENESS_PROBE_FAILOVER_MS
+                    } else {
+                        LIVENESS_PROBE_STANDBY_MS
+                    };
+                    let mut zombie_reconnected = false;
+                    if (v4_rt.is_some() || v6_rt.is_some())
+                        && !crate::speedtest::is_self_traffic_active()
+                        && (nh.last_liveness_probe_ms == 0
+                            || probe_now_ms.saturating_sub(nh.last_liveness_probe_ms) >= probe_interval_ms)
+                    {
+                        nh.last_liveness_probe_ms = probe_now_ms;
+                        let probe_iface = nh.last_resolved_iface.clone().unwrap_or_else(|| cfg.iface.clone());
+                        let check_v4 = v4_rt.is_some();
+                        let check_v6 = v6_rt.is_some();
+                        let (v4_ok, v6_ok) = tokio::join!(
+                            async {
+                                if check_v4 {
+                                    Some(probe_family_liveness(&probe_iface, false).await)
+                                } else {
+                                    None
+                                }
+                            },
+                            async {
+                                if check_v6 {
+                                    Some(probe_family_liveness(&probe_iface, true).await)
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+
+                        if let Some(ok) = v4_ok {
+                            let (usable, fails, trigger) =
+                                evaluate_liveness_probe_outcome(nh.v4_probe_failures, ok);
+                            nh.v4_usable = usable;
+                            nh.v4_probe_failures = fails;
+                            set_wds_family_usable(false, usable);
+                            if trigger {
+                                state.push_daemon_log(format!(
+                                    "dataplane: zombie IPv4 PDN detected on {probe_iface} ({fails} consecutive probe failures); triggering surgical IPv4 WDS reconnect"
+                                ));
+                                crate::obs::emit(
+                                    crate::obs::EventKind::BearerChange,
+                                    crate::obs::Severity::Warning,
+                                    format!("Zombie IPv4 PDN detected on {probe_iface}; reconnecting IPv4 bearer"),
+                                    serde_json::json!({
+                                        "family": "v4",
+                                        "iface": probe_iface,
+                                        "reason": "zombie_pdn",
+                                        "failures": fails,
+                                    }),
+                                );
+                                if let (Some(cli), Some(hdl)) = (&nh.v4_client, nh.v4_handle.take()) {
+                                    let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
+                                }
+                                nh.v4_client = None;
+                                nh.last_v4_ip = None;
+                                nh.v4_backoff.reset();
+                                nh.v4_next_retry_ms = 0;
+                                nh.v4_last_error = Some("zombie PDN probe failure".into());
+                                nh.v4_usable = None;
+                                nh.v4_probe_failures = 0;
+                                set_wds_family_usable(false, None);
+                                NATIVE_WDS_V4_CONNECTED.store(false, Ordering::Release);
+                                snap.wds_v4.state = "reconnecting";
+                                v4_rt = None;
+                                let prev_sig = nh
+                                    .last_applied_sig
+                                    .clone()
+                                    .unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                teardown_ipa_and_routes(
+                                    &mut nh,
+                                    &flush_if,
+                                    &prev_sig,
+                                    true,
+                                    false,
+                                    &mut snap.warnings,
+                                )
+                                .await;
+                                flush_rmnet_stale_family(
+                                    flush_if.clone(),
+                                    flush_tbl,
+                                    Some(libc::AF_INET as u8),
+                                )
+                                .await;
+                                zombie_reconnected = true;
+                            }
+                        }
+
+                        if let Some(ok) = v6_ok {
+                            let (usable, fails, trigger) =
+                                evaluate_liveness_probe_outcome(nh.v6_probe_failures, ok);
+                            nh.v6_usable = usable;
+                            nh.v6_probe_failures = fails;
+                            set_wds_family_usable(true, usable);
+                            if trigger {
+                                state.push_daemon_log(format!(
+                                    "dataplane: zombie IPv6 PDN detected on {probe_iface} ({fails} consecutive probe failures); triggering surgical IPv6 WDS reconnect"
+                                ));
+                                crate::obs::emit(
+                                    crate::obs::EventKind::BearerChange,
+                                    crate::obs::Severity::Warning,
+                                    format!("Zombie IPv6 PDN detected on {probe_iface}; reconnecting IPv6 bearer"),
+                                    serde_json::json!({
+                                        "family": "v6",
+                                        "iface": probe_iface,
+                                        "reason": "zombie_pdn",
+                                        "failures": fails,
+                                    }),
+                                );
+                                if let (Some(cli), Some(hdl)) = (&nh.v6_client, nh.v6_handle.take()) {
+                                    let _ = wds::stop_network_interface(cli.as_ref(), hdl).await;
+                                }
+                                nh.v6_client = None;
+                                nh.last_v6_ip = None;
+                                nh.last_v6_key = None;
+                                nh.v6_backoff.reset();
+                                nh.v6_next_retry_ms = 0;
+                                nh.v6_last_error = Some("zombie PDN probe failure".into());
+                                nh.v6_usable = None;
+                                nh.v6_probe_failures = 0;
+                                set_wds_family_usable(true, None);
+                                NATIVE_WDS_V6_CONNECTED.store(false, Ordering::Release);
+                                snap.wds_v6.state = "reconnecting";
+                                v6_rt = None;
+                                let prev_sig = nh
+                                    .last_applied_sig
+                                    .clone()
+                                    .unwrap_or_else(|| AppliedCfgSig::from(&cfg));
+                                teardown_ipa_and_routes(
+                                    &mut nh,
+                                    &flush_if,
+                                    &prev_sig,
+                                    false,
+                                    true,
+                                    &mut snap.warnings,
+                                )
+                                .await;
+                                flush_rmnet_stale_family(
+                                    flush_if.clone(),
+                                    flush_tbl,
+                                    Some(libc::AF_INET6 as u8),
+                                )
+                                .await;
+                                zombie_reconnected = true;
+                            }
+                        }
+                    }
+
                     let (healthy, sleep_dur, sup_state) = evaluate_native_bearer_health(
                         v4_rt.is_some(),
                         v6_rt.is_some(),
@@ -4436,7 +4972,11 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
                     } else if v4_rt.is_none() && v6_rt.is_none() {
                         NATIVE_CONNECTED_SINCE.store(0, Ordering::Release);
                     }
-                    next_sleep = sleep_dur;
+                    next_sleep = if zombie_reconnected {
+                        Duration::from_secs(1)
+                    } else {
+                        sleep_dur
+                    };
                     snap.supervisor_state = sup_state;
                 }
             }
@@ -4480,6 +5020,14 @@ async fn supervisor_loop(state: AppState, h: Arc<DataplaneHub>) {
         snap.active_ippt_mac = nh.ipa_ippt_mac.clone();
         snap.ipa_ippt_active = nh.ipa_ippt_active;
         snap.ipa_v6_sharing_prefix = nh.ipa_v6_sharing_prefix.clone();
+        snap.v4_usable = nh.v4_usable;
+        snap.v6_usable = nh.v6_usable;
+        snap.v4_probe_failures = nh.v4_probe_failures;
+        snap.v6_probe_failures = nh.v6_probe_failures;
+        snap.wds_tx_drops = nh.wds_tx_drops;
+        snap.wds_rx_drops = nh.wds_rx_drops;
+        snap.wds_tx_overflows = nh.wds_tx_overflows;
+        snap.wds_rx_overflows = nh.wds_rx_overflows;
         let tw = h.tuning_warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.kernel = collect_kernel_telemetry_async(cfg.kernel_tuning, tw, Some(active_iface), cached_tick_procs).await;
         if cfg.preserve_ipa_offload && !snap.kernel.ipa_dev_present {
@@ -5727,5 +6275,49 @@ mod tests {
         set_native_wds_state_for_test(true, false, false);
         assert!(!is_wds_connected());
         set_native_wds_state_for_test(false, false, false);
+    }
+
+    #[test]
+    fn rfc9096_deprecate_ra_has_exact_rfc4861_wire_layout() {
+        let host_addr: Ipv6Addr = "2607:fb90:1234:5678::abcd:1234".parse().unwrap();
+        let pkt = build_rfc9096_deprecate_ra(host_addr, 64);
+        assert_eq!(pkt.len(), 48, "16-byte RA header + 32-byte PIO");
+        // ICMPv6 RA header
+        assert_eq!(pkt[0], 134, "ICMPv6 Type must be 134 (Router Advertisement)");
+        assert_eq!(pkt[1], 0, "ICMPv6 Code must be 0");
+        assert_eq!(&pkt[2..4], &[0, 0], "Checksum left zero for kernel");
+        assert_eq!(pkt[4], 64, "Cur Hop Limit");
+        assert_eq!(pkt[5], 0, "RA flags");
+        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 1800, "Router Lifetime = 1800 s");
+        assert_eq!(u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]), 0);
+        assert_eq!(u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]), 0);
+        // Prefix Information Option (PIO)
+        assert_eq!(pkt[16], 3, "PIO Type must be 3");
+        assert_eq!(pkt[17], 4, "PIO Length must be 4 (32 bytes)");
+        assert_eq!(pkt[18], 64, "Prefix Length must be 64");
+        assert_eq!(pkt[19], 0xC0, "PIO Flags must have L=1, A=1 (0xC0)");
+        assert_eq!(
+            u32::from_be_bytes([pkt[20], pkt[21], pkt[22], pkt[23]]),
+            300,
+            "Valid Lifetime must be 300 s"
+        );
+        assert_eq!(
+            u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]),
+            0,
+            "Preferred Lifetime must be 0 s (RFC 9096 deprecated)"
+        );
+        assert_eq!(u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]), 0);
+        let expected_prefix: Ipv6Addr = "2607:fb90:1234:5678::".parse().unwrap();
+        assert_eq!(&pkt[32..48], &expected_prefix.octets());
+    }
+
+    #[test]
+    fn zombie_pdn_liveness_probe_triggers_after_three_consecutive_failures() {
+        assert_eq!(evaluate_liveness_probe_outcome(0, true), (Some(true), 0, false));
+        assert_eq!(evaluate_liveness_probe_outcome(0, false), (Some(false), 1, false));
+        assert_eq!(evaluate_liveness_probe_outcome(1, false), (Some(false), 2, false));
+        assert_eq!(evaluate_liveness_probe_outcome(2, false), (Some(false), 3, true));
+        // A passing probe resets failure streak cleanly.
+        assert_eq!(evaluate_liveness_probe_outcome(2, true), (Some(true), 0, false));
     }
 }

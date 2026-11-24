@@ -174,16 +174,25 @@ pub async fn post_run(Json(req): Json<RunReq>) -> Response {
 
     let mut cmd = Command::new(resolve(&prog));
     cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            if let Ok(mut j) = job.lock() {
-                j.done = true;
-                j.cancel = None;
-                j.output = format!("failed to start {prog}: {e}").into_bytes();
+    let mut child = {
+        let mut attempt = 0u8;
+        loop {
+            match cmd.spawn() {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < 5 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    if let Ok(mut j) = job.lock() {
+                        j.done = true;
+                        j.cancel = None;
+                        j.output = format!("failed to start {prog}: {e}").into_bytes();
+                    }
+                    drop(permit);
+                    return server(format!("failed to start {prog}"));
+                }
             }
-            drop(permit);
-            return server(format!("failed to start {prog}"));
         }
     };
     let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, job: Arc<Mutex<Job>>| async move {

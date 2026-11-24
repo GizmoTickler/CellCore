@@ -3478,6 +3478,138 @@ pub async fn get_health(State(ctx): State<HttpCtx>) -> Response {
     Json(serde_json::json!({ "checks": checks, "passed": passed, "total": 4 })).into_response()
 }
 
+fn is_secret_diag_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.contains("imei")
+        || k.contains("iccid")
+        || k.contains("imsi")
+        || k.contains("phone")
+        || k.contains("msisdn")
+        || k.contains("token")
+        || k.contains("password")
+        || k.contains("passwd")
+        || k.contains("secret")
+        || k.contains("apikey")
+        || k.contains("api_key")
+        || k.contains("privatekey")
+        || k.contains("private_key")
+        || k.contains("authkey")
+        || k.contains("webhook")
+}
+
+fn redact_diag_json(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s) => serde_json::Value::String(crate::state::redact_sensitive(&s)),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(redact_diag_json).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if is_secret_diag_key(&k) {
+                    continue;
+                }
+                out.insert(k, redact_diag_json(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        other => other,
+    }
+}
+
+pub(crate) async fn build_diagnostics_snapshot(app: &crate::state::AppState) -> serde_json::Value {
+    let generated_at = now_secs();
+    let modem = app.modem.read().await.clone();
+    let internals = app.internals.read().await.clone();
+    let dev_uptime = app.device_uptime.read().await.uptime_seconds;
+    let uptime_secs = if dev_uptime > 0 {
+        dev_uptime
+    } else {
+        crate::ipc::read_proc_uptime_secs()
+    };
+    let trial_boot_active =
+        crate::paths::spawn_blocking(crate::firmware_ab::read_trialboot_status)
+            .await
+            .ok()
+            .flatten();
+    let dp = crate::dataplane::current_snapshot().await;
+    let dp_warnings: Vec<String> = dp
+        .warnings
+        .iter()
+        .map(|w| crate::state::redact_sensitive(w))
+        .collect();
+    let failover = crate::obs::failover::status_json();
+    let (lw_enabled, lw_runtime) = {
+        let enabled = app.settings.read().await.quecwatch_enabled;
+        let rt = app.quecwatch.read().await.clone();
+        (enabled, rt)
+    };
+    let recent_events: Vec<serde_json::Value> = {
+        let evs = crate::obs::lock(&crate::obs::obs().events).query(None, &[], 25);
+        evs.into_iter()
+            .map(|ev| {
+                let detail = if ev.kind == crate::obs::EventKind::SmsReceived {
+                    serde_json::json!({ "redacted": true })
+                } else {
+                    redact_diag_json(ev.detail)
+                };
+                serde_json::json!({
+                    "id": ev.id,
+                    "ts": ev.ts,
+                    "type": ev.kind,
+                    "severity": ev.severity,
+                    "title": crate::state::redact_sensitive(&ev.title),
+                    "detail": detail,
+                })
+            })
+            .collect()
+    };
+
+    serde_json::json!({
+        "version": app.version,
+        "generatedAt": generated_at,
+        "uptimeSecs": uptime_secs,
+        "bootSlot": internals.boot_slot,
+        "trialBootActive": trial_boot_active,
+        "serving": modem.serving,
+        "carriers": modem.carriers,
+        "mimo": modem.mimo,
+        "thermals": modem.thermals,
+        "dataplane": {
+            "mode": dp.mode,
+            "supervisorState": dp.supervisor_state,
+            "wdsV4State": dp.wds_v4.state,
+            "wdsV6State": dp.wds_v6.state,
+            "v4Usable": dp.v4_usable,
+            "v6Usable": dp.v6_usable,
+            "v4ProbeFailures": dp.v4_probe_failures,
+            "v6ProbeFailures": dp.v6_probe_failures,
+            "wdsTxDrops": dp.wds_tx_drops,
+            "wdsRxDrops": dp.wds_rx_drops,
+            "wdsTxOverflows": dp.wds_tx_overflows,
+            "wdsRxOverflows": dp.wds_rx_overflows,
+            "ipaOffload": dp.kernel.ipa_offload,
+            "ipaIpptActive": dp.ipa_ippt_active,
+            "sfeLoaded": dp.sfe_loaded,
+            "qrtrSsrCount": dp.qrtr.ssr_count,
+            "indicationsReceived": dp.indications_received,
+            "reconnectAttempts": dp.reconnect_attempts,
+            "netlinkUpdates": dp.netlink_updates,
+            "warnings": dp_warnings,
+        },
+        "failover": failover,
+        "linkWatch": {
+            "enabled": lw_enabled,
+            "runtime": lw_runtime,
+        },
+        "recentEvents": recent_events,
+    })
+}
+
+pub async fn get_diagnostics_snapshot(State(ctx): State<HttpCtx>) -> Response {
+    Json(build_diagnostics_snapshot(&ctx.app).await).into_response()
+}
+
 pub async fn get_quecwatch(State(ctx): State<HttpCtx>) -> Response {
     let s = ctx.app.settings.read().await.clone();
     let rt = ctx.app.quecwatch.read().await.clone();
@@ -5332,5 +5464,106 @@ qcmap_lan.@profile[3].ippt_mac_addr='02:00:5e:10:00:01'\n";
                 assert!(ctx.app.auth.validate_token(&sess_keep.token, false).await.is_some());
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn diagnostics_snapshot_is_structured_and_redacts_all_secrets() {
+        let env = crate::paths::TestSandbox::new("diag-snapshot-redact");
+        let ctx = HttpCtx::for_tests(&env.root);
+
+        let fake_imei = "356938035643809";
+        let fake_iccid = "8901260123456789012";
+        let fake_imsi = "310260123456789";
+        let fake_phone = "+15551234567";
+        let fake_pw = "SuperSecretPass!99";
+
+        {
+            let mut sec = ctx.app.secrets.write().await;
+            sec.imei = fake_imei.into();
+            sec.iccid = fake_iccid.into();
+            sec.imsi = fake_imsi.into();
+            sec.previous_imei = Some("356938035643800".into());
+        }
+        {
+            let mut m = ctx.app.modem.write().await;
+            m.identity.masked_imei = "356938...3809".into();
+            m.identity.phone_number = fake_phone.into();
+            m.serving = Some(crate::parsers::ServingCellInfo {
+                state: "NOCONN".into(),
+                rat: "NR5G-SA".into(),
+                band: "n41".into(),
+                pci: Some(258),
+                rsrp: Some(-95.0),
+                sinr: Some(18.0),
+                ..Default::default()
+            });
+            m.thermals.push(crate::parsers::TempSensor {
+                sensor: "pa1".into(),
+                celsius: 42.5,
+                domain: String::new(),
+            });
+        }
+        {
+            let mut intr = ctx.app.internals.write().await;
+            intr.boot_slot = "_a".into();
+        }
+        let (_, api_tok) = ctx
+            .app
+            .tokens
+            .create("diag-test", crate::tokens::TokenKind::Rw, None)
+            .unwrap();
+
+        // Inject an event carrying secret-looking fields to ensure recursive redaction strips them.
+        crate::obs::emit(
+            crate::obs::EventKind::BearerChange,
+            crate::obs::Severity::Info,
+            format!("Test event with {fake_imei}"),
+            serde_json::json!({
+                "imei": fake_imei,
+                "iccid": fake_iccid,
+                "imsi": fake_imsi,
+                "phoneNumber": fake_phone,
+                "password": fake_pw,
+                "apiToken": api_tok,
+                "safeField": "ok",
+            }),
+        );
+
+        let snap = build_diagnostics_snapshot(&ctx.app).await;
+        assert_eq!(snap["version"], "test");
+        assert!(snap["generatedAt"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(snap["bootSlot"], "_a");
+        assert_eq!(snap["serving"]["band"], "n41");
+        assert!(snap["carriers"].is_array());
+        assert!(snap["mimo"].is_object());
+        assert!(snap["thermals"].is_array());
+        assert!(snap["dataplane"].is_object());
+        assert!(snap["failover"].is_object());
+        assert!(snap["linkWatch"].is_object());
+        assert!(snap["recentEvents"].is_array());
+
+        let text = serde_json::to_string(&snap).unwrap();
+        for forbidden in [
+            fake_imei,
+            fake_iccid,
+            fake_imsi,
+            fake_phone,
+            fake_pw,
+            &api_tok,
+            "356938035643800",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "secret value {forbidden} leaked into diagnostics snapshot: {text}"
+            );
+        }
+        // Also ensure secret field names do not appear inside snapshot JSON
+        let lower = text.to_ascii_lowercase();
+        for forbidden_key in ["\"imei\"", "\"iccid\"", "\"imsi\"", "\"phonenumber\"", "\"password\"", "\"apitoken\""] {
+            assert!(
+                !lower.contains(forbidden_key),
+                "secret field {forbidden_key} leaked into diagnostics snapshot: {text}"
+            );
+        }
     }
 }

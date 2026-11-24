@@ -8,7 +8,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -38,10 +38,79 @@ pub const DEFERRED_REBOOT_MAX_AGE_SECS: u64 = 6 * 3600;
 const GUARD_MAX_BODY: usize = 64 * 1024;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static LAST_PREWARM_MONO_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_PREWARM_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Cheap check for the deferral points (scheduler, LinkWatch, profiles).
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Fire a lightweight detached async RRC wake probe via `rmnet_data*` so the
+/// cellular modem transitions RRC Idle -> Connected immediately when failover
+/// begins, before user TCP SYNs hit the link.
+pub(crate) fn spawn_rrc_prewarm_probe(force: bool) {
+    let now_ms = crate::state::mono_ms();
+    let prev = LAST_PREWARM_MONO_MS.load(Ordering::Acquire);
+    if !force && prev != 0 && now_ms.saturating_sub(prev) < 5_000 {
+        return;
+    }
+    LAST_PREWARM_MONO_MS.store(now_ms, Ordering::Release);
+
+    #[cfg(test)]
+    {
+        TEST_PREWARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            let udp_ok = tokio::task::spawn_blocking(send_rrc_prewarm_udp_poke)
+                .await
+                .unwrap_or(false);
+            if !udp_ok {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    crate::telemetry::icmp_ping_once("1.1.1.1", 0xFA11),
+                )
+                .await;
+            }
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn send_rrc_prewarm_udp_poke() -> bool {
+    use std::os::fd::AsRawFd;
+    let iface = crate::netlink::detect_active_rmnet_wan_live().unwrap_or_else(|| {
+        let cand = crate::ipc::detect_first_up_rmnet();
+        if cand == "none" { String::new() } else { cand }
+    });
+    if iface.is_empty() {
+        return false;
+    }
+    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let _ = sock.set_nonblocking(true);
+    let mut ifname = iface.into_bytes();
+    ifname.push(0);
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            ifname.as_ptr().cast::<libc::c_void>(),
+            ifname.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    // Minimal 12-byte DNS header poke to 1.1.1.1:53 to trigger UL RRC resume immediately.
+    let poke = [0xFA, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    sock.send_to(&poke, "1.1.1.1:53").is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +395,7 @@ pub fn human_secs(s: u64) -> String {
 fn emit_transition(tr: Transition) {
     match tr {
         Transition::Started(ep) => {
+            spawn_rrc_prewarm_probe(true);
             lock(&obs().persisted).failover_episodes += 1;
             obs().mark_state_dirty();
             emit(
@@ -392,6 +462,9 @@ pub fn set_hint(role: Role) -> String {
     if let Some(tr) = tr {
         emit_transition(tr);
     } else {
+        if role == Role::Active {
+            spawn_rrc_prewarm_probe(false);
+        }
         broadcast_status();
     }
     format!("result=ok role={} ttl_s={}\n", role.as_str(), cfg.hint_ttl_secs)
@@ -997,5 +1070,30 @@ mod tests {
         let tr = f.tick_with_self_traffic(165, at(165), 0, 100_000, true, &c);
         assert!(matches!(tr, Some(Transition::Ended(_))));
         assert!(!f.active);
+    }
+
+    #[test]
+    fn failover_active_transition_and_hint_trigger_rrc_prewarm_probe() {
+        let before = TEST_PREWARM_COUNT.load(Ordering::Relaxed);
+        emit_transition(Transition::Started(Episode {
+            started_at: 100,
+            bytes: 0,
+            source: Source::Hint,
+        }));
+        let after_start = TEST_PREWARM_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after_start > before,
+            "Transition::Started must trigger RRC pre-warm probe"
+        );
+
+        // Reset cooldown and verify set_hint(Role::Active) fires pre-warm even if already active
+        LAST_PREWARM_MONO_MS.store(0, Ordering::Release);
+        let _ = set_hint(Role::Active);
+        assert!(
+            TEST_PREWARM_COUNT.load(Ordering::Relaxed) > after_start,
+            "set_hint(Role::Active) must trigger RRC pre-warm probe"
+        );
+        // Clean up global failover state after test
+        let _ = set_hint(Role::Standby);
     }
 }

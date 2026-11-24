@@ -762,6 +762,202 @@ pub(crate) async fn tick_cell_lock_deadman(
     tracker.reprobe_stage = (tracker.reprobe_stage + 1).min(2);
 }
 
+pub const BAND_ESCAPE_UNREG_SECS: u64 = 45;
+pub const BAND_ESCAPE_RESTORE_HEALTHY_SECS: u64 = 60;
+
+#[derive(Debug, Default)]
+pub struct BandLockEscapeTracker {
+    pub unregistered_since: Option<Instant>,
+    pub saved_mode_pref: Option<String>,
+    pub healthy_standby_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandEscapeAction {
+    None,
+    ProbeAndEscape,
+    Restore,
+}
+
+/// True when the active radio configuration restricts fallback connectivity
+/// during failover: `mode_pref == "NR5G"` only, or an NR5G band lock that
+/// excludes low-band `n71`.
+pub fn is_restrictive_band_or_mode(mode_pref: &str, nr5g_bands: &[String]) -> bool {
+    let mode_upper = mode_pref.trim().to_ascii_uppercase();
+    let nr_only = mode_upper == "NR5G";
+    let missing_n71 = !nr5g_bands.is_empty() && !nr5g_bands.iter().any(|b| b.trim() == "71");
+    nr_only || missing_n71
+}
+
+/// Pure failover-aware band-lock escape state machine.
+pub fn evaluate_band_escape(
+    tracker: &mut BandLockEscapeTracker,
+    failover_active: bool,
+    cfun: i32,
+    registered: bool,
+    now: Instant,
+) -> BandEscapeAction {
+    if tracker.saved_mode_pref.is_none() {
+        tracker.healthy_standby_since = None;
+        if !failover_active || cfun != 1 || registered {
+            tracker.unregistered_since = None;
+            return BandEscapeAction::None;
+        }
+        let since = *tracker.unregistered_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= Duration::from_secs(BAND_ESCAPE_UNREG_SECS) {
+            BandEscapeAction::ProbeAndEscape
+        } else {
+            BandEscapeAction::None
+        }
+    } else {
+        tracker.unregistered_since = None;
+        if failover_active || cfun != 1 || !registered {
+            tracker.healthy_standby_since = None;
+            return BandEscapeAction::None;
+        }
+        let since = *tracker.healthy_standby_since.get_or_insert(now);
+        if now.saturating_duration_since(since)
+            >= Duration::from_secs(BAND_ESCAPE_RESTORE_HEALTHY_SECS)
+        {
+            BandEscapeAction::Restore
+        } else {
+            BandEscapeAction::None
+        }
+    }
+}
+
+pub(crate) async fn tick_band_lock_escape(
+    state: &AppState,
+    tracker: &mut BandLockEscapeTracker,
+    now: Instant,
+) {
+    let (cfun, serving) = {
+        let m = state.modem.read().await;
+        (m.identity.cfun, m.serving.clone())
+    };
+    let action = evaluate_band_escape(
+        tracker,
+        crate::obs::failover::is_active(),
+        cfun,
+        is_modem_registered(serving.as_ref()),
+        now,
+    );
+    match action {
+        BandEscapeAction::None => {}
+        BandEscapeAction::ProbeAndEscape => {
+            if !sim_ready_for_deadman(state).await {
+                tracker.unregistered_since = Some(now);
+                return;
+            }
+            let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+            let cmds = vec![
+                ("AT+QNWPREFCFG=\"mode_pref\"".into(), Duration::from_secs(4)),
+                ("AT+QNWPREFCFG=\"nr5g_band\"".into(), Duration::from_secs(4)),
+            ];
+            let Ok(res) = state.smd.exec_batch(cmds, Priority::Emergency).await else {
+                tracker.unregistered_since = Some(now);
+                return;
+            };
+            let mode_body = res
+                .first()
+                .and_then(|r| r.as_ref().ok())
+                .map(|r| r.body.as_str())
+                .unwrap_or("");
+            let nr_body = res
+                .get(1)
+                .and_then(|r| r.as_ref().ok())
+                .map(|r| r.body.as_str())
+                .unwrap_or("");
+            let mode_pref = crate::handlers::parse_mode_pref(mode_body)
+                .unwrap_or_else(|| "AUTO".into());
+            let nr5g_bands = crate::parsers::parse_qnw_band_list(nr_body, "nr5g_band");
+            if !is_restrictive_band_or_mode(&mode_pref, &nr5g_bands) {
+                tracker.unregistered_since = Some(now);
+                return;
+            }
+            let widened = if mode_pref.eq_ignore_ascii_case("AUTO") {
+                true
+            } else {
+                state
+                    .smd
+                    .exec(
+                        "AT+QNWPREFCFG=\"mode_pref\",AUTO",
+                        Priority::Emergency,
+                        Duration::from_secs(6),
+                    )
+                    .await
+                    .is_ok_and(|r| r.ok)
+            };
+            if widened {
+                tracker.saved_mode_pref = Some(mode_pref.clone());
+                tracker.unregistered_since = None;
+                tracker.healthy_standby_since = None;
+                crate::handlers::forget_radio_mode(state);
+                let msg = format!(
+                    "Failover band-lock escape hatch widened mode_pref from {mode_pref} to AUTO after {}s unregistered",
+                    BAND_ESCAPE_UNREG_SECS
+                );
+                state.push_daemon_log(&msg);
+                push_alert(state, "band_escape", &msg).await;
+                crate::obs::emit(
+                    crate::obs::EventKind::BandChange,
+                    crate::obs::Severity::Warning,
+                    "Failover band-lock escape hatch widened mode_pref to AUTO",
+                    serde_json::json!({
+                        "escaped": true,
+                        "previousModePref": mode_pref,
+                        "newModePref": "AUTO",
+                        "nr5gBands": nr5g_bands,
+                    }),
+                );
+            } else {
+                tracker.unregistered_since = Some(now);
+            }
+        }
+        BandEscapeAction::Restore => {
+            let Some(saved) = tracker.saved_mode_pref.clone() else {
+                return;
+            };
+            let _guard = crate::radio::lock_bounded(state, Duration::from_secs(6)).await;
+            let restored = if saved.eq_ignore_ascii_case("AUTO") {
+                true
+            } else {
+                state
+                    .smd
+                    .exec(
+                        format!("AT+QNWPREFCFG=\"mode_pref\",{saved}"),
+                        Priority::Background,
+                        Duration::from_secs(6),
+                    )
+                    .await
+                    .is_ok_and(|r| r.ok)
+            };
+            if restored {
+                tracker.saved_mode_pref = None;
+                tracker.healthy_standby_since = None;
+                crate::handlers::forget_radio_mode(state);
+                let msg = format!(
+                    "Restored mode_pref to {saved} after failover ended and registration stayed healthy for {}s",
+                    BAND_ESCAPE_RESTORE_HEALTHY_SECS
+                );
+                state.push_daemon_log(&msg);
+                push_alert(state, "band_escape", &msg).await;
+                crate::obs::emit(
+                    crate::obs::EventKind::BandChange,
+                    crate::obs::Severity::Info,
+                    format!("Restored mode_pref to {saved} after failover"),
+                    serde_json::json!({
+                        "escaped": false,
+                        "restoredModePref": saved,
+                    }),
+                );
+            } else {
+                tracker.healthy_standby_since = Some(now);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct UsageFlushTracker {
     pub pending_pre_ntp_rx: u64,
@@ -826,6 +1022,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
         let mut init_urcs = true;
         let mut last_history: Option<Instant> = None;
         let mut deadman = CellLockDeadmanTracker::default();
+        let mut band_escape = BandLockEscapeTracker::default();
         loop {
             st_rf.hb_rf_ms.store(mono_ms(), Ordering::Release);
             refresh_modem_snapshot(&st_rf, Priority::Telemetry, init_urcs).await;
@@ -840,6 +1037,7 @@ pub fn spawn_background_tasks(state: AppState, mut rf_refresh_rx: mpsc::Receiver
                 Duration::from_secs(25),
             )
             .await;
+            tick_band_lock_escape(&st_rf, &mut band_escape, now_inst).await;
 
             if last_history.is_none_or(|t| now_inst.saturating_duration_since(t) >= Duration::from_secs(60)) {
                 last_history = Some(now_inst);
@@ -5314,5 +5512,60 @@ mod tests {
         stabilize_idle_mimo_chains(&mut cur_ho, &prev_mimo, Some(&idle_same), Some(&prev_cell));
         assert_eq!(cur_ho.rsrp[2], None);
         assert_eq!(cur_ho.rsrp[3], None);
+    }
+
+    #[test]
+    fn failover_band_lock_escape_hatch_policy_and_timers() {
+        // Pure restrictiveness predicate
+        assert!(is_restrictive_band_or_mode("NR5G", &["41".into(), "71".into()]));
+        assert!(is_restrictive_band_or_mode("LTE:NR5G", &["41".into(), "25".into()]));
+        assert!(!is_restrictive_band_or_mode("AUTO", &["41".into(), "71".into()]));
+        assert!(!is_restrictive_band_or_mode("LTE:NR5G", &[]));
+
+        let t0 = Instant::now();
+        let mut tr = BandLockEscapeTracker::default();
+
+        // Standby unregistered must NEVER trigger escape
+        assert_eq!(evaluate_band_escape(&mut tr, false, 1, false, t0), BandEscapeAction::None);
+        assert_eq!(
+            evaluate_band_escape(&mut tr, false, 1, false, t0 + Duration::from_secs(120)),
+            BandEscapeAction::None
+        );
+
+        // Failover active + unregistered for < 45 s -> wait
+        assert_eq!(evaluate_band_escape(&mut tr, true, 1, false, t0), BandEscapeAction::None);
+        assert_eq!(
+            evaluate_band_escape(&mut tr, true, 1, false, t0 + Duration::from_secs(44)),
+            BandEscapeAction::None
+        );
+        // At 45 s -> ProbeAndEscape
+        assert_eq!(
+            evaluate_band_escape(&mut tr, true, 1, false, t0 + Duration::from_secs(45)),
+            BandEscapeAction::ProbeAndEscape
+        );
+
+        // Simulate escape committed
+        tr.saved_mode_pref = Some("NR5G".into());
+        tr.unregistered_since = None;
+
+        // Still in failover -> never restore yet
+        let t1 = t0 + Duration::from_secs(50);
+        assert_eq!(evaluate_band_escape(&mut tr, true, 1, true, t1), BandEscapeAction::None);
+        assert_eq!(
+            evaluate_band_escape(&mut tr, true, 1, true, t1 + Duration::from_secs(120)),
+            BandEscapeAction::None
+        );
+
+        // Failover ended & registered healthy -> wait 60 s then Restore
+        let t2 = t1 + Duration::from_secs(125);
+        assert_eq!(evaluate_band_escape(&mut tr, false, 1, true, t2), BandEscapeAction::None);
+        assert_eq!(
+            evaluate_band_escape(&mut tr, false, 1, true, t2 + Duration::from_secs(59)),
+            BandEscapeAction::None
+        );
+        assert_eq!(
+            evaluate_band_escape(&mut tr, false, 1, true, t2 + Duration::from_secs(60)),
+            BandEscapeAction::Restore
+        );
     }
 }

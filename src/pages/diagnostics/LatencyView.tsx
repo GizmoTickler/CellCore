@@ -5,11 +5,27 @@ import { apiFetch } from "../../lib/api";
 import { useDraft } from "../../lib/draft";
 import { cn } from "../../lib/utils";
 import { useWsStore } from "../../stores/ws-store";
+import { useObsStore } from "../../stores/obs-store";
 import { useToastStore } from "../../stores/toast-store";
 import type { PingPoint } from "../../types/cellcore";
 import { Badge, Button, Card, CardHeader, Input, LiveDot, SegmentedTabs, Switch } from "../../components/ui";
-import { SmoothAreaChart } from "../../components/Charts";
+import { SmoothAreaChart, type ChartMarker } from "../../components/Charts";
+import { eventLabel } from "../../components/obs";
 import { TONE_FILL, TONE_INK, errMsg, type HeaderFn, type Tone } from "./shared";
+
+const CHART_EVENT_TYPES = new Set([
+  "handover",
+  "band_change",
+  "ca_change",
+  "rat_change",
+  "quecwatch_recovery",
+  "failover_start",
+  "failover_end",
+]);
+
+function toEpochMs(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
 
 type LatWindow = "realtime" | "hourly" | "twelvehour" | "daily";
 
@@ -34,6 +50,7 @@ export function LatencyView({ header }: { header: HeaderFn }) {
   const [latWindow, setLatWindow] = useState<LatWindow>("realtime");
   const [busy, setBusy] = useState(false);
   const pingHistory = useWsStore((s) => s.pingHistory);
+  const recentEvents = useObsStore((s) => s.recent);
 
   const latencyQuery = useQuery({
     queryKey: ["diag-latency", latWindow],
@@ -49,6 +66,41 @@ export function LatencyView({ header }: { header: HeaderFn }) {
     if (latWindow === "realtime") return pingHistory;
     return latencyQuery.data?.data ?? [];
   }, [latWindow, pingHistory, latencyQuery.data]);
+
+  const latencyMarkers = useMemo<ChartMarker[]>(() => {
+    if (displayedPingPoints.length < 2 || recentEvents.length === 0) return [];
+    const ptMs = displayedPingPoints.map((p) => toEpochMs(p.ts));
+    const minMs = ptMs[0];
+    const maxMs = ptMs[ptMs.length - 1];
+    const padMs = latWindow === "realtime" ? 15_000 : 60_000;
+    const out: ChartMarker[] = [];
+    for (const ev of recentEvents) {
+      if (!CHART_EVENT_TYPES.has(ev.type)) continue;
+      const evMs = toEpochMs(ev.ts);
+      if (evMs < minMs - padMs || evMs > maxMs + padMs) continue;
+      let bestIdx = 0;
+      let bestDiff = Math.abs(ptMs[0] - evMs);
+      for (let i = 1; i < ptMs.length; i++) {
+        const diff = Math.abs(ptMs[i] - evMs);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      const tone: ChartMarker["tone"] =
+        ev.severity === "critical" || ev.type === "quecwatch_recovery"
+          ? "danger"
+          : ev.severity === "warning" || ev.type === "failover_start"
+            ? "warn"
+            : "info";
+      out.push({
+        index: bestIdx,
+        label: ev.title || eventLabel(ev.type),
+        tone,
+      });
+    }
+    return out;
+  }, [displayedPingPoints, recentEvents, latWindow]);
 
   const latencySummary = useMemo(() => {
     if (displayedPingPoints.length === 0) return { min: "--", avg: "--", max: "--", loss: "--" };
@@ -196,6 +248,7 @@ export function LatencyView({ header }: { header: HeaderFn }) {
               p.timestamp.slice(11, 16) ||
               new Date(p.ts).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit" })
           )}
+          markers={latencyMarkers}
           label="RTT"
           unit="ms"
           stroke="var(--qm-ember)"

@@ -524,6 +524,7 @@ pub(crate) fn build_router(ctx: HttpCtx) -> Router {
         .route("/api/v1/network/lan", get(handlers::get_network_lan).post(handlers::post_network_lan))
         .route("/api/v1/network/data-usage", get(handlers::get_data_usage).post(handlers::post_data_usage).delete(handlers::delete_data_usage))
         .route("/api/v1/diagnostics/health", get(handlers::get_health))
+        .route("/api/v1/diagnostics/snapshot", get(handlers::get_diagnostics_snapshot))
         .route("/api/v1/diagnostics/linkwatch", get(handlers::get_quecwatch).post(handlers::post_quecwatch))
         .route("/api/v1/diagnostics/quecwatch", get(handlers::get_quecwatch).post(handlers::post_quecwatch))
         .route("/api/v1/diagnostics/latency", get(handlers::get_latency).post(handlers::post_latency))

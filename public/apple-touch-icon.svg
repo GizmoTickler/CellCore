@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180" fill="none">
+  <defs>
+    <radialGradient id="cc-touch-glow" cx="50%" cy="46%" r="54%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#06b6d4" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#0b1215" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="cc-touch-stroke" x1="36" y1="24" x2="144" y2="156" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="55%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="cc-touch-core" x1="72" y1="72" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ecfdf5"/>
+      <stop offset="100%" stop-color="#67e8f9"/>
+    </linearGradient>
+  </defs>
+  <!-- Solid dark slate canvas + rounded square frame for iOS/PWA icon masks -->
+  <rect width="180" height="180" fill="#0b1215"/>
+  <rect x="6" y="6" width="168" height="168" rx="38" fill="#0b1215" stroke="#1e2d34" stroke-width="2"/>
+  <rect x="6" y="6" width="168" height="168" rx="38" fill="url(#cc-touch-glow)"/>
+
+  <!-- Outer cellular hexagon -->
+  <polygon
+    points="90,26 145,58 145,122 90,154 35,122 35,58"
+    stroke="url(#cc-touch-stroke)"
+    stroke-width="6"
+    stroke-linejoin="round"
+    fill="#0f1b20"
+    fill-opacity="0.72"
+  />
+
+  <!-- Inner 3-sector dashed signal ring -->
+  <polygon
+    points="90,46 128,68 128,112 90,134 52,112 52,68"
+    stroke="#34d399"
+    stroke-opacity="0.45"
+    stroke-width="3"
+    stroke-linejoin="round"
+    stroke-dasharray="22 14"
+  />
+
+  <!-- 3-sector RF spokes from core to alternate vertices -->
+  <path
+    d="M90 90 L90 31 M90 90 L141 119.5 M90 90 L39 119.5"
+    stroke="#22d3ee"
+    stroke-opacity="0.42"
+    stroke-width="3"
+    stroke-linecap="round"
+  />
+
+  <!-- Radiating 3-sector RF wave arcs -->
+  <path d="M71.5 70.5 A27 27 0 0 1 108.5 70.5" stroke="url(#cc-touch-stroke)" stroke-width="5.2" stroke-linecap="round"/>
+  <path d="M116.5 80 A27 27 0 0 1 100 115" stroke="url(#cc-touch-stroke)" stroke-width="5.2" stroke-linecap="round"/>
+  <path d="M80 115 A27 27 0 0 1 63.5 80" stroke="url(#cc-touch-stroke)" stroke-width="5.2" stroke-linecap="round"/>
+
+  <!-- Glowing RF center core -->
+  <circle cx="90" cy="90" r="14" fill="url(#cc-touch-core)"/>
+  <circle cx="90" cy="90" r="6" fill="#0b1215"/>
+
+  <!-- Corner vertex signal nodes -->
+  <circle cx="90" cy="26" r="5.5" fill="#34d399"/>
+  <circle cx="145" cy="122" r="5.5" fill="#22d3ee"/>
+  <circle cx="35" cy="122" r="5.5" fill="#22d3ee"/>
+</svg>

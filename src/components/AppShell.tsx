@@ -1,15 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Copy, Gauge, LogOut, Moon, MoreVertical, Palette, Power, RefreshCw, Search, ShieldAlert, Sun, Terminal, X } from "lucide-react";
-import { apiFetch } from "../lib/api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, Check, CheckCircle2, Copy, FileDown, Gauge, Loader2, Lock, LogOut, Moon, MoreVertical, Palette, Power, RefreshCw, Search, ShieldAlert, Sun, Terminal, X } from "lucide-react";
+import { apiFetch, confirmFirmwareAbSlot, getFirmwareAbStatus } from "../lib/api";
 import { disruptiveFetch, isCancelled } from "../lib/disruptive";
 import { NAV, sectionFor } from "../lib/nav";
-import { cn, copyToClipboard, formatBitrate } from "../lib/utils";
+import { cn, copyToClipboard, formatBitrate, formatBytes, formatDuration } from "../lib/utils";
 import { useAuthStore } from "../stores/auth-store";
 import { hrefFor, useRouteStore, type Section } from "../stores/route-store";
 import { LAYOUTS, resolveLayout, SKINS, skinMeta, useThemeStore } from "../stores/theme-store";
 import { useToastStore } from "../stores/toast-store";
 import { useLiveness, useWsStore } from "../stores/ws-store";
-import type { AppRoute } from "../types/cellcore";
+import type { AppRoute, FirmwareAbStatus, OverviewPulse } from "../types/cellcore";
 import { CommandPalette, type PaletteAction } from "./CommandPalette";
 import { NavIcon } from "./NavIcon";
 import { BrandLogo, BrandMark, Button, Kbd, LiveDot, Modal, signalQuality } from "./ui";
@@ -267,6 +268,169 @@ function AppearanceDialogInner({ onClose }: { onClose: () => void }) {
   );
 }
 
+/* ───────────────────────── Global Actionable Status Banners ───────────────────────── */
+
+const GlobalStatusBanners = React.memo(function GlobalStatusBanners() {
+  const qc = useQueryClient();
+  const toast = useToastStore((s) => s.push);
+  const failover = useObsStore((s) => s.failover);
+  const rxBps = useWsStore((s) => s.traffic.rxBps);
+  const txBps = useWsStore((s) => s.traffic.txBps);
+  const modemBypassed = useWsStore((s) =>
+    Boolean((s.modem as (typeof s.modem & { cellLockBypassed?: boolean }) | null)?.cellLockBypassed)
+  );
+  const [confirmingSlot, setConfirmingSlot] = useState(false);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
+
+  const abQuery = useQuery<FirmwareAbStatus>({
+    queryKey: ["firmware-ab"],
+    queryFn: getFirmwareAbStatus,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+
+  const pulseQuery = useQuery<OverviewPulse>({
+    queryKey: ["overview-pulse"],
+    queryFn: () => apiFetch<OverviewPulse>("/api/v1/overview/pulse"),
+    staleTime: 25_000,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+
+  const failoverActive = Boolean(failover?.active);
+  useEffect(() => {
+    if (!failoverActive) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const t = window.setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 5_000);
+    return () => window.clearInterval(t);
+  }, [failoverActive]);
+
+  const trialBootActive = abQuery.data?.trialBootActive === true;
+  const activeSlotLabel = abQuery.data?.activeSlot
+    ? abQuery.data.activeSlot.replace(/^_/, "").toUpperCase()
+    : "active";
+  const cellLockBypassed = modemBypassed || Boolean(pulseQuery.data?.cellLock?.bypassed);
+  const bypassReason = pulseQuery.data?.cellLock?.bypassReason?.trim() || "";
+
+  async function handleConfirmSlot() {
+    if (confirmingSlot) return;
+    setConfirmingSlot(true);
+    try {
+      await confirmFirmwareAbSlot();
+      await qc.invalidateQueries({ queryKey: ["firmware-ab"] });
+      toast("Active firmware slot confirmed", "success", `Slot ${activeSlotLabel} marked permanently bootable.`);
+    } catch (e) {
+      toast("Could not confirm slot", "error", e instanceof Error ? e.message : undefined);
+    } finally {
+      setConfirmingSlot(false);
+    }
+  }
+
+  if (!trialBootActive && !failoverActive && !cellLockBypassed) {
+    return null;
+  }
+
+  const liveBps = rxBps + txBps > 0 ? rxBps + txBps : (failover?.avgBps ?? 0);
+  const epBytes = failover?.episode?.bytes ?? null;
+  const epDuration =
+    failover?.episode?.startedAt != null
+      ? formatDuration(Math.max(0, nowSec - failover.episode.startedAt))
+      : null;
+
+  return (
+    <div
+      role="region"
+      aria-label="Critical gateway status"
+      className="border-b border-line bg-paper/90 backdrop-blur-sm"
+    >
+      <div className="divide-y divide-line/60">
+        {trialBootActive && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2.5 bg-saffron-soft/85 px-4 py-2 text-[12.5px] text-saffron-ink sm:px-6 lg:px-10"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span className="font-semibold">
+                Trial boot active on Slot {activeSlotLabel} — confirm once stable
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 px-2.5 text-[11.5px]"
+                onClick={() => void handleConfirmSlot()}
+                disabled={confirmingSlot}
+              >
+                {confirmingSlot ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                )}
+                {confirmingSlot ? "Confirming…" : "Confirm Slot"}
+              </Button>
+              <a
+                href={hrefFor("/system", "ota")}
+                className="inline-flex h-7 items-center rounded-full border border-saffron/40 bg-surface/80 px-2.5 text-[11.5px] font-semibold text-saffron-ink hover:bg-surface transition"
+              >
+                Open A/B Updates
+              </a>
+            </div>
+          </div>
+        )}
+
+        {failoverActive && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 bg-saffron-soft/65 px-4 py-1.5 text-[12px] text-saffron-ink sm:px-6 lg:px-10 qm-tabular"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+              <span className="font-bold tracking-wide">FAILOVER ACTIVE</span>
+              <span>· {formatBitrate(liveBps)}</span>
+              {epBytes != null && (
+                <span>
+                  · {formatBytes(epBytes, 1)}
+                  {epDuration ? ` (${epDuration})` : ""}
+                </span>
+              )}
+            </div>
+            <a
+              href={hrefFor("/diagnostics", "events")}
+              className="shrink-0 text-[11.5px] font-bold underline decoration-saffron/50 underline-offset-2 hover:decoration-current"
+            >
+              View events →
+            </a>
+          </div>
+        )}
+
+        {cellLockBypassed && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-2 bg-crimson-soft/80 px-4 py-1.5 text-[12px] text-crimson-ink sm:px-6 lg:px-10"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <Lock className="h-3.5 w-3.5 shrink-0" />
+              <span className="font-semibold">
+                Cell-lock dead-man switch bypassed
+                {bypassReason ? ` · ${bypassReason}` : " — modem temporarily roaming freely"}
+              </span>
+            </div>
+            <a
+              href={hrefFor("/cellular", "lock")}
+              className="inline-flex h-7 shrink-0 items-center rounded-full border border-crimson/40 bg-surface/80 px-2.5 text-[11.5px] font-semibold text-crimson-ink hover:bg-surface transition"
+            >
+              Inspect Cell Lock
+            </a>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 /* ───────────────────────── Live WS Alerts Strip ───────────────────────── */
 
 function AlertsStrip() {
@@ -456,6 +620,35 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
         keywords: "terminal",
         icon: <Terminal className="h-4 w-4" />,
         run: () => (window.location.hash = hrefFor("/diagnostics", "at")),
+      },
+      {
+        id: "diagnostic-snapshot",
+        label: "Download diagnostic snapshot",
+        hint: "Redacted JSON bundle (zero IMEI, ICCID, or tokens)",
+        keywords: "diagnostics snapshot export bundle debug json support redacted",
+        icon: <FileDown className="h-4 w-4" />,
+        run: () => {
+          toast("Capturing diagnostic snapshot…", "info");
+          apiFetch<unknown>("/api/v1/diagnostics/snapshot")
+            .then((data) => {
+              const now = new Date();
+              const pad = (n: number) => String(n).padStart(2, "0");
+              const filename = `cellcore-diag-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.json`;
+              const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = filename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              toast("Diagnostic snapshot downloaded", "success", `${filename} · Redacted (zero IMEI, ICCID, or tokens)`);
+            })
+            .catch((e) => {
+              toast("Diagnostic snapshot failed", "error", e instanceof Error ? e.message : "Could not capture snapshot");
+            });
+        },
       },
       {
         id: "copy-ip",
@@ -825,6 +1018,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
 
       <main className="min-w-0 flex-1">
         {layout === "dock" && <StatusLine onSearch={() => setPaletteOpen(true)} />}
+        <GlobalStatusBanners />
         <div className={cn("px-4 sm:px-6 lg:px-10 pt-5 pb-28 lg:pb-12", layout === "rail" ? "lg:pt-9" : "lg:pt-8")}>
           <div className={cn("mx-auto w-full space-y-6", layout === "rail" ? "max-w-[1240px]" : "max-w-[1320px]")}>
             <AlertsStrip />

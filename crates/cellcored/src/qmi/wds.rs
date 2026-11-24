@@ -20,7 +20,6 @@ pub const WDS_GET_PKT_SRVC_STATUS: u16 = 0x0022;
 pub const WDS_PKT_SRVC_STATUS_IND: u16 = 0x0022;
 #[allow(dead_code)]
 pub const WDS_GET_CURRENT_CHANNEL_RATE: u16 = 0x0023;
-#[allow(dead_code)]
 pub const WDS_GET_PKT_STATISTICS: u16 = 0x0024;
 pub const WDS_GET_PROFILE_LIST: u16 = 0x002A;
 pub const WDS_GET_PROFILE_SETTINGS: u16 = 0x002B;
@@ -30,7 +29,6 @@ pub const WDS_SET_AUTO_CONNECT: u16 = 0x0051;
 pub const WDS_BIND_MUX_DATA_PORT: u16 = 0x00A2;
 
 pub const RUNTIME_SETTINGS_MASK: u32 = 0x0000_6B10;
-#[allow(dead_code)]
 pub const PKT_STATS_MASK_ALL: u32 = 0x0000_03FF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -264,7 +262,6 @@ pub struct WdsChannelRate {
     pub max_rx_bps: u32,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WdsPktStatistics {
@@ -305,7 +302,6 @@ pub fn parse_channel_rate_tlvs(tlvs: &[(u8, Vec<u8>)]) -> Result<WdsChannelRate,
     })
 }
 
-#[allow(dead_code)]
 pub fn parse_pkt_statistics_tlvs(tlvs: &[(u8, Vec<u8>)]) -> WdsPktStatistics {
     WdsPktStatistics {
         tx_packets_ok: read_u32_le(tlvs, 0x10),
@@ -330,7 +326,6 @@ pub async fn get_current_channel_rate(client: &dyn QmiClient) -> Result<WdsChann
     parse_channel_rate_tlvs(&tlvs)
 }
 
-#[allow(dead_code)]
 pub async fn get_pkt_statistics(client: &dyn QmiClient) -> Result<WdsPktStatistics, QmiError> {
     let mut w = TlvWriter::new();
     w.push_u32(0x01, PKT_STATS_MASK_ALL);

@@ -244,6 +244,18 @@ pub struct SpeedtestSample {
     pub latency_iqm: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedtestRfSnapshot {
+    pub rat: String,
+    pub band: String,
+    pub pci: Option<i32>,
+    pub ca_count: usize,
+    pub ca_bandwidth_mhz: f64,
+    pub rsrp: Option<i32>,
+    pub sinr: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SpeedtestRun {
@@ -266,6 +278,8 @@ pub struct SpeedtestRun {
     pub result_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rf: Option<SpeedtestRfSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
