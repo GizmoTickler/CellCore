@@ -1907,19 +1907,19 @@ fn flash_raw_mtd_partition(
         let _verify_guard = RemoveFileGuard(Some(verify_path.clone()));
         let v_str = verify_path.to_str().ok_or("non-UTF-8 verify path")?;
         let len_s = img_size.to_string();
-        let nanddump_bin = crate::paths::program("/usr/sbin/nanddump");
-
-        if Path::new(&nanddump_bin).exists() {
-            run_tool_timeout(
-                "/usr/sbin/nanddump",
-                &["--bb=skipbad", "-l", &len_s, "-f", v_str, &mtd_dev],
-                Duration::from_secs(180),
-            )?;
-        } else {
+        // Prefer Quectel's native `/usr/bin/mtdimg --read` (256 KiB bulk reads, ~24x faster
+        // on Qualcomm QPIC NAND than `nanddump`'s 4 KiB page-by-page reads).
+        if Path::new(&mtdimg_bin).exists() {
             run_tool_timeout(
                 "/usr/bin/mtdimg",
                 &["-n", &len_s, "--read", &part.target_partition, v_str],
-                Duration::from_secs(180),
+                Duration::from_secs(300),
+            )?;
+        } else {
+            run_tool_timeout(
+                "/usr/sbin/nanddump",
+                &["-q", "--bb=skipbad", "-l", &len_s, "-f", v_str, &mtd_dev],
+                Duration::from_secs(600),
             )?;
         }
 

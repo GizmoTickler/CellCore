@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.1 — 24× Faster Native NAND Read-Back Verification
+
+- **A/B Firmware Flasher (`crates/cellcored/src/firmware_ab.rs`):**
+  - Switched raw MTD SHA-256 read-back verification to prefer Quectel's native `mtdimg --read` (256 KiB eraseblock bulk reads — `18 s` for 41.5 MiB `boot_b` vs `7m 28s` with `nanddump` 4 KiB page reads on QPIC NAND), keeping `nanddump -q --bb=skipbad` as fallback with a 600 s timeout.
+
 ## 1.9.0 — Zero-USB Native A/B Firmware Flasher & Clean-Room USB Provisioning CLI
 
 - **Native Zero-USB Inactive-Slot A/B Firmware Flasher (`crates/cellcored/src/firmware_ab.rs`, `cli.rs`, `http.rs`, `main.rs`, `tokens.rs`, `obs/failover.rs`, `OtaView.tsx`):**
