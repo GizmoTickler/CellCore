@@ -610,9 +610,9 @@ export function SignalDial({
   const shown = value;
   const sweep = 260;
   const start = 90 + (360 - sweep) / 2; // 140°, SVG 0° = east, clockwise
-  const r = 84;
-  const sinrR = 64;
-  const coreR = 52;
+  const r = 86;
+  const sinrR = 68;
+  const coreR = 57;
   const c = 100;
   const outerLen = (sweep / 360) * 2 * Math.PI * r;
   const sinrLen = (sweep / 360) * 2 * Math.PI * sinrR;
@@ -895,11 +895,11 @@ export function SignalDial({
 
         {peakReticle}
       </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center pt-1 text-center pointer-events-none">
-        <div className={cn("qm-display font-semibold leading-none", onDark ? "text-on-ember" : "text-ink")} style={{ fontSize: size * 0.24 }}>
+      <div className="absolute inset-0 flex flex-col items-center justify-center pt-7 text-center pointer-events-none">
+        <div className={cn("qm-display font-semibold leading-none", onDark ? "text-on-ember" : "text-ink")} style={{ fontSize: size * 0.215 }}>
           <RollingNumber value={shown} decimals={0} fallback="—" />
         </div>
-        <div className={cn("mt-1 text-[12px] font-semibold tracking-wide", onDark ? "text-on-ember" : "text-muted")}>{unit}</div>
+        <div className={cn("mt-1.5 text-[11.5px] font-semibold tracking-wide", onDark ? "text-on-ember" : "text-muted")}>{unit}</div>
         {caption && <div className="mt-2">{caption}</div>}
       </div>
     </div>

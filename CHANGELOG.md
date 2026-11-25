@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.1 — Multi-Ring Telemetry Core Centering & `rmnet_data*` Primary Interface Selection
+
+- **Multi-Ring `SignalDial` Geometry (`src/components/ui.tsx`):** Expanded concentric ring radii (`r=86`, `sinrR=68`, `coreR=57`) and aligned center readout to the SVG circle origin (`pt-7`, `size * 0.215`) so the hero RSRP numeral sits dead-center inside the inner frosted glass core with generous clearance from the cyan SINR arc.
+- **Primary WAN Interface Selection (`src/lib/parsers.ts`):** Updated `pickActiveRmnetInterfaces()` to prefer L3 bearer interfaces (`rmnet_data*`) over the raw Qualcomm QMAP parent mux (`rmnet_ipa0`).
+
 ## 2.1.0 — Futuristic Glass UX Overhaul, 60/120 fps Motion Engine & Interactive Telemetry Cockpit
 
 - **Zero-Dependency 60/120 fps Motion Physics & Opt-In HUD SFX (`src/lib/motion.ts`, `src/lib/hud-fx.ts`, `src/stores/theme-store.ts`, `public/theme-init.js`):**

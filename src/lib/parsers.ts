@@ -646,7 +646,10 @@ export function pickActiveRmnetInterfaces(list: TrafficInterfaceStats[]): {
   primary: TrafficInterfaceStats | null;
   lan: TrafficInterfaceStats | null;
 } {
-  const rmnets = list.filter((i) => i.name.startsWith("rmnet"));
+  const allRmnets = list.filter((i) => i.name.startsWith("rmnet"));
+  // Prefer actual L3 bearer interfaces (rmnet_data*) over the raw Qualcomm QMAP parent mux (rmnet_ipa0).
+  const dataRmnets = allRmnets.filter((i) => i.name.startsWith("rmnet_data"));
+  const rmnets = dataRmnets.length > 0 ? dataRmnets : allRmnets;
   const lan = list.find((i) => i.name === "eth0") ?? list.find((i) => i.name.startsWith("eth")) ?? null;
 
   if (rmnets.length === 0) return { primary: null, lan };
