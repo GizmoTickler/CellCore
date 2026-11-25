@@ -141,6 +141,27 @@ pub fn parse_cf_meta_headers(headers_text: &str) -> (Option<String>, Option<Stri
     (ext_ip, colo)
 }
 
+/// Parse Cloudflare `/cdn-cgi/trace` plain-text `key=value` body for `ip` and `colo`.
+pub fn parse_cf_trace_body(body_text: &str) -> (Option<String>, Option<String>) {
+    let mut ext_ip = None;
+    let mut colo = None;
+    for line in body_text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim();
+            if key == "ip" && !val.is_empty() {
+                ext_ip = Some(val.to_string());
+            } else if key == "colo"
+                && val.len() == 3
+                && val.bytes().all(|b| b.is_ascii_alphabetic())
+            {
+                colo = Some(val.to_ascii_uppercase());
+            }
+        }
+    }
+    (ext_ip, colo)
+}
+
 /// Check whether HTTP response headers request closing the keep-alive connection.
 fn header_requests_close(headers_text: &str) -> bool {
     for line in headers_text.lines() {
@@ -302,13 +323,29 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePath {
+    /// Native Cloudflare edge endpoint (`/cdn-cgi/trace`): bypasses the
+    /// `/__down` JS Worker (which adds 30-100 ms overhead and tarpits rapid
+    /// `bytes=0` probes to 400-4000+ ms, causing bogus latency, jitter, and loss).
+    CfTrace,
+    /// Legacy fallback (`/__down?measId=...&bytes=0`) used only if a non-Cloudflare
+    /// or test server does not serve `/cdn-cgi/trace`.
+    DownZero,
+}
+
 async fn probe_http_rtt_typed(
     stream: &mut TcpStream,
     host: &str,
     meas_id: u64,
-) -> Result<(f64, String), ProbeErr> {
+    path: ProbePath,
+) -> Result<(f64, String, String, bool), ProbeErr> {
+    let req_path = match path {
+        ProbePath::CfTrace => "/cdn-cgi/trace".to_string(),
+        ProbePath::DownZero => format!("/__down?measId={meas_id}&bytes=0"),
+    };
     let req = format!(
-        "GET /__down?measId={meas_id}&bytes=0 HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/1.2\r\nConnection: keep-alive\r\n\r\n"
+        "GET {req_path} HTTP/1.1\r\nHost: {host}\r\nReferer: https://speed.cloudflare.com/\r\nUser-Agent: CellCore-NativeSpeedtest/2.0\r\nConnection: keep-alive\r\n\r\n"
     );
     let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(3), stream.write_all(req.as_bytes()))
@@ -326,29 +363,42 @@ async fn probe_http_rtt_typed(
         })?;
     let (hdr, rest) = read_http_headers_typed(stream).await?;
     let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut body = rest;
+    let mut framing_clean = true;
     if let Some(cl) = parse_content_length(&hdr)
-        && cl > rest.len()
+        && cl > body.len()
     {
-        let mut rem = cl - rest.len();
+        let mut rem = cl - body.len();
         let mut sink = [0u8; 2048];
         let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while rem > 0 {
             let take = rem.min(sink.len());
             match tokio::time::timeout_at(drain_deadline, stream.read(&mut sink[..take])).await {
-                Ok(Ok(n)) if n > 0 => rem -= n,
-                _ => break,
+                Ok(Ok(n)) if n > 0 => {
+                    if body.len() < 4096 {
+                        let keep = n.min(4096 - body.len());
+                        body.extend_from_slice(&sink[..keep]);
+                    }
+                    rem -= n;
+                }
+                _ => {
+                    framing_clean = false;
+                    break;
+                }
             }
         }
     }
-    Ok((rtt_ms, hdr))
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    Ok((rtt_ms, hdr, body_text, framing_clean))
 }
 
 async fn probe_http_rtt(
     stream: &mut TcpStream,
     host: &str,
     meas_id: u64,
-) -> Result<(f64, String), String> {
-    probe_http_rtt_typed(stream, host, meas_id)
+    path: ProbePath,
+) -> Result<(f64, String, String, bool), String> {
+    probe_http_rtt_typed(stream, host, meas_id, path)
         .await
         .map_err(|e| match e {
             ProbeErr::KeepAliveClosed => "keep-alive closed".into(),
@@ -588,15 +638,16 @@ async fn native_ul_worker(
     }
 }
 
-/// Probe a single loaded HTTP RTT, transparently reconnecting once when the
-/// remote server closes an idle/max-requests keep-alive socket so normal
-/// keep-alive recycles are never miscounted as packet loss.
+/// Probe a single HTTP RTT, transparently reconnecting once when the remote
+/// server closes an idle/max-requests keep-alive socket so normal keep-alive
+/// recycles are never miscounted as packet loss.
 async fn probe_once_with_keepalive_retry(
     stream_opt: &mut Option<TcpStream>,
     addr: SocketAddr,
     host: &str,
     meas_id: u64,
     bypass_dev: Option<&str>,
+    path: ProbePath,
 ) -> Result<f64, ()> {
     let mut reused = stream_opt.is_some();
     for _attempt in 0..2 {
@@ -610,12 +661,17 @@ async fn probe_once_with_keepalive_retry(
             }
         }
         let s = stream_opt.as_mut().expect("stream populated");
-        match probe_http_rtt_typed(s, host, meas_id).await {
-            Ok((rtt, hdr)) => {
-                if header_requests_close(&hdr) {
+        match probe_http_rtt_typed(s, host, meas_id, path).await {
+            Ok((rtt, hdr, _body, clean)) => {
+                let status = parse_http_status(&hdr);
+                if !clean || header_requests_close(&hdr) {
                     *stream_opt = None;
                 }
-                return Ok(rtt);
+                if (200..300).contains(&status) {
+                    return Ok(rtt);
+                }
+                *stream_opt = None;
+                return Err(());
             }
             Err(ProbeErr::KeepAliveClosed) if reused => {
                 *stream_opt = None;
@@ -637,6 +693,7 @@ async fn native_loaded_ping_worker(
     host: String,
     meas_id: u64,
     bypass_dev: Option<String>,
+    probe_path: ProbePath,
     samples: Arc<Mutex<Vec<f64>>>,
     probes_sent: Arc<AtomicU64>,
     probes_failed: Arc<AtomicU64>,
@@ -652,6 +709,7 @@ async fn native_loaded_ping_worker(
                 &host,
                 meas_id,
                 bypass_dev.as_deref(),
+                probe_path,
             ) => r,
         };
         if *stop_rx.borrow() {
@@ -805,19 +863,37 @@ async fn run_native_pipeline(
     let probes_failed = Arc::new(AtomicU64::new(0));
 
     let mut ping_opt: Option<TcpStream> = Some(ping_stream);
+    let mut probe_path = ProbePath::CfTrace;
     for i in 0..10 {
         if *cancel_rx.borrow() {
             return Ok(());
         }
         if i == 0 {
             let s = ping_opt.as_mut().expect("initial stream");
-            let (_rtt, hdr) = probe_http_rtt(s, host, meas_id).await?;
-            if header_requests_close(&hdr) {
-                ping_opt = None;
-            }
-            let (ip, c) = parse_cf_meta_headers(&hdr);
-            ext_ip = ip;
-            colo = c;
+            let (hdr, body) = match probe_http_rtt(s, host, meas_id, ProbePath::CfTrace).await {
+                Ok((_rtt, h, b, clean)) if (200..300).contains(&parse_http_status(&h)) => {
+                    if !clean || header_requests_close(&h) {
+                        ping_opt = None;
+                    }
+                    (h, b)
+                }
+                _ => {
+                    // Fallback for custom/mock servers that do not expose /cdn-cgi/trace.
+                    probe_path = ProbePath::DownZero;
+                    ping_opt = None;
+                    let mut s2 = connect_native_socket(addr, bypass_dev.as_deref(), None, None).await?;
+                    let (_rtt, h, b, clean) =
+                        probe_http_rtt(&mut s2, host, meas_id, ProbePath::DownZero).await?;
+                    if clean && !header_requests_close(&h) {
+                        ping_opt = Some(s2);
+                    }
+                    (h, b)
+                }
+            };
+            let (hdr_ip, hdr_colo) = parse_cf_meta_headers(&hdr);
+            let (body_ip, body_colo) = parse_cf_trace_body(&body);
+            ext_ip = hdr_ip.or(body_ip);
+            colo = hdr_colo.or(body_colo);
             let mut live = state.speedtest_live.write().await;
             live.phase = "ping".into();
             live.progress = 8;
@@ -835,6 +911,7 @@ async fn run_native_pipeline(
             host,
             meas_id,
             bypass_dev.as_deref(),
+            probe_path,
         )
         .await
         {
@@ -867,6 +944,7 @@ async fn run_native_pipeline(
         host,
         meas_id,
         bypass_dev.clone(),
+        probe_path,
         "download",
         20,
         40,
@@ -891,6 +969,7 @@ async fn run_native_pipeline(
         host,
         meas_id,
         bypass_dev,
+        probe_path,
         "upload",
         60,
         38,
@@ -979,6 +1058,7 @@ async fn run_native_transfer_phase(
     host: &str,
     meas_id: u64,
     bypass_dev: Option<String>,
+    probe_path: ProbePath,
     phase: &str,
     prog_base: u8,
     prog_span: u8,
@@ -1020,6 +1100,7 @@ async fn run_native_transfer_phase(
         host.to_string(),
         meas_id,
         bypass_dev,
+        probe_path,
         Arc::clone(&rtt_samples),
         probes_sent,
         probes_failed,
@@ -1191,6 +1272,10 @@ mod tests {
             parse_cf_meta_headers(hdr),
             (Some("203.0.113.42".into()), Some("IAD".into()))
         );
+        assert_eq!(
+            parse_cf_trace_body("fl=123\nip=203.0.113.99\ncolo=ord\n"),
+            (Some("203.0.113.99".into()), Some("ORD".into()))
+        );
         assert!(header_requests_close(hdr));
         assert!(!header_requests_close("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"));
     }
@@ -1225,9 +1310,16 @@ mod tests {
 
         let mut stream_opt: Option<TcpStream> = None;
         for _ in 0..6 {
-            let rtt = probe_once_with_keepalive_retry(&mut stream_opt, addr, "127.0.0.1", 42, None)
-                .await
-                .expect("keep-alive close/EOF must reconnect transparently without loss");
+            let rtt = probe_once_with_keepalive_retry(
+                &mut stream_opt,
+                addr,
+                "127.0.0.1",
+                42,
+                None,
+                ProbePath::CfTrace,
+            )
+            .await
+            .expect("keep-alive close/EOF must reconnect transparently without loss");
             assert!(rtt >= 0.0);
         }
         server.abort();
@@ -1255,7 +1347,16 @@ mod tests {
                             break;
                         };
                         let first = hdr.lines().next().unwrap_or("");
-                        if first.contains("bytes=0") {
+                        if first.starts_with("GET /cdn-cgi/trace") {
+                            let body = "fl=999\nip=198.51.100.7\ncolo=IAD\n";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\ncf-ray: abcdef123456-IAD\r\nConnection: keep-alive\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if sock.write_all(resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        } else if first.contains("bytes=0") {
                             let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncf-meta-ip: 198.51.100.7\r\ncf-ray: abcdef123456-IAD\r\nConnection: keep-alive\r\n\r\n";
                             if sock.write_all(resp.as_bytes()).await.is_err() {
                                 break;

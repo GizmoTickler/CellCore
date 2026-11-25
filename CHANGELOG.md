@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.2 — Cloudflare Edge `/cdn-cgi/trace` Latency Probes (Zero Worker Tarpit) & iPhone PWA Top Safe-Area
+
+- **Native Speedtest Latency, Jitter & Packet Loss (`crates/cellcored/src/speedtest.rs`):**
+  - Switched idle and loaded latency probes from `GET /__down?bytes=0` (which invoked Cloudflare's JS Worker and got tarpitted to 360–4,000+ ms on rapid probes, inflating idle ping to >120 ms, jitter to >180 ms, and reporting false 2–5% packet loss) to `GET /cdn-cgi/trace` (native Cloudflare edge proxy, zero Worker overhead, ~25–35 ms RTT matching raw ICMP, 0% loss, returning `ip` and `colo` directly), keeping `/__down?bytes=0` as an automatic fallback for non-Cloudflare test servers.
+  - Enforced strict keep-alive framing cleanup (`framing_clean`) and 2xx status validation on latency probes so incomplete body drains never desync keep-alive sockets.
+- **iPhone PWA Top Safe-Area (`src/components/AppShell.tsx`):**
+  - Added `pt-[calc(0.625rem+env(safe-area-inset-top))]` to the mobile sticky `<header>` so standalone iOS Home Screen (`black-translucent` + `viewport-fit=cover`) clears the status bar / Dynamic Island cleanly.
+
 ## 2.0.1 — QMI WDS Sentinel Filter & Initial Liveness Probe Settle Guard
 
 - **QMI WDS Packet Statistics (`crates/cellcored/src/qmi/wds.rs`):** Filtered QMI `"not available"` sentinel values (`0xFFFF_FFFF` / `0xFFFF_FFFF_FFFF_FFFF`) in `parse_pkt_statistics_tlvs()` so unsupported SDX75 overflow counters never export `4294967295` to Prometheus.

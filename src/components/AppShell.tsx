@@ -922,7 +922,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       {layout === "top" && topbar}
 
       {/* Phones: compact top bar (all layouts) */}
-      <header className="lg:hidden sticky top-0 z-30 flex items-center justify-between gap-2 border-b border-line/70 bg-paper/85 px-4 py-2.5 backdrop-blur-md">
+      <header className="lg:hidden sticky top-0 z-30 flex items-center justify-between gap-2 border-b border-line/70 bg-paper/85 px-4 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur-md">
         <div className="flex min-w-0 items-center gap-2">
           <a href="#/" className="flex items-center gap-2">
             <BrandMark className="h-8 w-8" />
