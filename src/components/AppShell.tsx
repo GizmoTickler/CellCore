@@ -1,19 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Check, CheckCircle2, Copy, FileDown, Gauge, Loader2, Lock, LogOut, Moon, MoreVertical, Palette, Power, RefreshCw, Search, ShieldAlert, Sun, Terminal, X } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, Copy, FileDown, Gauge, Loader2, Lock, LogOut, Moon, MoreVertical, Palette, Power, RefreshCw, Search, ShieldAlert, Sparkles, Sun, Terminal, Volume2, VolumeX, X } from "lucide-react";
 import { apiFetch, confirmFirmwareAbSlot, getFirmwareAbStatus } from "../lib/api";
 import { disruptiveFetch, isCancelled } from "../lib/disruptive";
+import { playHudLock, playHudNav, triggerHaptic } from "../lib/hud-fx";
+import { useSpringPill } from "../lib/motion";
 import { NAV, sectionFor } from "../lib/nav";
 import { cn, copyToClipboard, formatBitrate, formatBytes, formatDuration } from "../lib/utils";
 import { useAuthStore } from "../stores/auth-store";
 import { hrefFor, useRouteStore, type Section } from "../stores/route-store";
-import { LAYOUTS, resolveLayout, SKINS, skinMeta, useThemeStore } from "../stores/theme-store";
+import { LAYOUTS, resolveLayout, SKINS, skinMeta, useThemeStore, type MotionQuality } from "../stores/theme-store";
 import { useToastStore } from "../stores/toast-store";
 import { useLiveness, useWsStore } from "../stores/ws-store";
 import type { AppRoute, FirmwareAbStatus, OverviewPulse } from "../types/cellcore";
 import { CommandPalette, type PaletteAction } from "./CommandPalette";
 import { NavIcon } from "./NavIcon";
-import { BrandLogo, BrandMark, Button, Kbd, LiveDot, Modal, signalQuality } from "./ui";
+import { BrandLogo, BrandMark, Button, Kbd, LiveDot, Modal, Switch, signalQuality } from "./ui";
 import { FailoverBadge, FailoverConfirmHost, FailoverWarning, useFailoverActive } from "./obs";
 import { useObsStore } from "../stores/obs-store";
 
@@ -183,9 +185,32 @@ function AppearanceDialog({ open, onClose }: { open: boolean; onClose: () => voi
   return <AppearanceDialogInner onClose={onClose} />;
 }
 
+const MOTION_OPTIONS: ReadonlyArray<{ id: MotionQuality; label: string; hint: string }> = [
+  { id: "full", label: "Full", hint: "60/120fps springs & shimmer" },
+  { id: "balanced", label: "Balanced", hint: "Springs, no ambient loops" },
+  { id: "reduced", label: "Reduced", hint: "Instant, max battery" },
+];
+
 function AppearanceDialogInner({ onClose }: { onClose: () => void }) {
-  const { skin, setSkin, theme, setTheme, layoutPref, setLayoutPref } = useThemeStore();
+  const { skin, setSkin, theme, setTheme, layoutPref, setLayoutPref, motionQuality, setMotionQuality, hudSfx, setHudSfx } = useThemeStore();
   const meta = skinMeta(skin);
+  const activeMotion = MOTION_OPTIONS.find((m) => m.id === motionQuality) ?? MOTION_OPTIONS[0];
+
+  function handleTestSfx() {
+    if (hudSfx) {
+      playHudLock();
+      triggerHaptic(8);
+      return;
+    }
+    useThemeStore.setState({ hudSfx: true });
+    try {
+      playHudLock();
+      triggerHaptic(8);
+    } finally {
+      useThemeStore.setState({ hudSfx: false });
+    }
+  }
+
   return (
     <Modal open onClose={onClose} title="Appearance">
       <div className="space-y-5">
@@ -260,6 +285,74 @@ function AppearanceDialogInner({ onClose }: { onClose: () => void }) {
                   </button>
                 );
               })}
+            </div>
+          </div>
+        </div>
+        <div className="border-t border-line pt-4 space-y-4">
+          <div className="qm-eyebrow">Motion &amp; Feedback</div>
+          <div>
+            <div className="flex items-baseline justify-between gap-2 mb-1.5">
+              <span className="text-[12.5px] font-semibold text-ink">Motion Quality</span>
+              <span className="text-[11px] text-muted">{activeMotion.hint}</span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Motion Quality">
+              {MOTION_OPTIONS.map((opt) => {
+                const on = opt.id === motionQuality;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    aria-pressed={on}
+                    title={opt.hint}
+                    onClick={() => {
+                      setMotionQuality(opt.id);
+                      playHudNav();
+                    }}
+                    className={cn(
+                      "qm-spring-press rounded-full border py-1.5 px-2.5 text-[12px] font-bold transition cursor-pointer",
+                      on
+                        ? "border-ember bg-ember-soft text-ember-ink"
+                        : "border-line bg-surface/60 text-ink-2 hover:border-line-strong hover:text-ink"
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="rounded-xl border border-line bg-sunk/60 px-3 py-2.5 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-ink">
+                  {hudSfx ? <Volume2 className="h-3.5 w-3.5 text-ember-ink" /> : <VolumeX className="h-3.5 w-3.5 text-muted" />}
+                  HUD Sound Effects
+                </div>
+                <div className="text-[11px] text-muted mt-0.5">
+                  {hudSfx ? "Synthesized Web Audio clicks & chimes active" : "Off by default · synthesized Web Audio clicks"}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-2.5 text-[11.5px]"
+                  onClick={handleTestSfx}
+                >
+                  Test
+                </Button>
+                <Switch
+                  checked={hudSfx}
+                  ariaLabel="HUD Sound Effects"
+                  onChange={(next) => {
+                    setHudSfx(next);
+                    if (next) {
+                      playHudLock();
+                      triggerHaptic(8);
+                    }
+                  }}
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -348,7 +441,7 @@ const GlobalStatusBanners = React.memo(function GlobalStatusBanners() {
         {trialBootActive && (
           <div
             role="status"
-            className="flex flex-wrap items-center justify-between gap-2.5 bg-saffron-soft/85 px-4 py-2 text-[12.5px] text-saffron-ink sm:px-6 lg:px-10"
+            className="qm-scan-alert flex flex-wrap items-center justify-between gap-2.5 bg-saffron-soft/85 px-4 py-2 text-[12.5px] text-saffron-ink sm:px-6 lg:px-10"
           >
             <div className="flex items-center gap-2 min-w-0">
               <AlertTriangle className="h-4 w-4 shrink-0" />
@@ -384,7 +477,7 @@ const GlobalStatusBanners = React.memo(function GlobalStatusBanners() {
         {failoverActive && (
           <div
             role="status"
-            className="flex flex-wrap items-center justify-between gap-2 bg-saffron-soft/65 px-4 py-1.5 text-[12px] text-saffron-ink sm:px-6 lg:px-10 qm-tabular"
+            className="qm-scan-alert flex flex-wrap items-center justify-between gap-2 bg-saffron-soft/65 px-4 py-1.5 text-[12px] text-saffron-ink sm:px-6 lg:px-10 qm-tabular"
           >
             <div className="flex items-center gap-2 min-w-0">
               <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
@@ -409,7 +502,8 @@ const GlobalStatusBanners = React.memo(function GlobalStatusBanners() {
         {cellLockBypassed && (
           <div
             role="alert"
-            className="flex flex-wrap items-center justify-between gap-2 bg-crimson-soft/80 px-4 py-1.5 text-[12px] text-crimson-ink sm:px-6 lg:px-10"
+            style={{ "--qm-alert-color": "var(--qm-crimson)" } as React.CSSProperties}
+            className="qm-scan-alert flex flex-wrap items-center justify-between gap-2 bg-crimson-soft/80 px-4 py-1.5 text-[12px] text-crimson-ink sm:px-6 lg:px-10"
           >
             <div className="flex items-center gap-2 min-w-0">
               <Lock className="h-3.5 w-3.5 shrink-0" />
@@ -504,6 +598,8 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [rebooting, setRebooting] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
+  const topNavRef = useRef<HTMLElement>(null);
+  const mobileNavRef = useRef<HTMLDivElement>(null);
 
   const theme = useThemeStore((s) => s.theme);
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
@@ -511,8 +607,14 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
   const setSkin = useThemeStore((s) => s.setSkin);
   const layoutPref = useThemeStore((s) => s.layoutPref);
   const setLayoutPref = useThemeStore((s) => s.setLayoutPref);
+  const motionQuality = useThemeStore((s) => s.motionQuality);
+  const setMotionQuality = useThemeStore((s) => s.setMotionQuality);
+  const hudSfx = useThemeStore((s) => s.hudSfx);
+  const setHudSfx = useThemeStore((s) => s.setHudSfx);
   const layout = resolveLayout(skin, layoutPref);
   const darkOnly = Boolean(skinMeta(skin).darkOnly);
+  const topPill = useSpringPill(topNavRef, '[aria-current="page"]', [route, layout, skin]);
+  const mobilePill = useSpringPill(mobileNavRef, '[data-mobile-pill="true"]', [route, layout]);
   const clearAuth = useAuthStore((s) => s.clearAuth);
   const sub = useRouteStore((s) => s.sub);
   const toast = useToastStore((s) => s.push);
@@ -696,6 +798,35 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
           ]
         : []),
       {
+        id: "motion-quality",
+        label: `Cycle motion quality (current: ${motionQuality})`,
+        hint: "Full → Balanced → Reduced",
+        keywords: "motion animation spring reduced battery performance quality",
+        icon: <Sparkles className="h-4 w-4" />,
+        run: () => {
+          const order: MotionQuality[] = ["full", "balanced", "reduced"];
+          const next = order[(order.indexOf(motionQuality) + 1) % order.length];
+          setMotionQuality(next);
+          toast(`Motion quality: ${next}`, "info", MOTION_OPTIONS.find((m) => m.id === next)?.hint);
+        },
+      },
+      {
+        id: "hud-sfx",
+        label: hudSfx ? "Disable HUD sound effects" : "Enable HUD sound effects",
+        hint: hudSfx ? "Currently on · Web Audio clicks & chimes" : "Currently off · synthesized Web Audio clicks",
+        keywords: "sound audio sfx hud click chime mute",
+        icon: hudSfx ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />,
+        run: () => {
+          const next = !hudSfx;
+          setHudSfx(next);
+          if (next) {
+            playHudLock();
+            triggerHaptic(8);
+          }
+          toast(next ? "HUD sound effects enabled" : "HUD sound effects disabled", "info");
+        },
+      },
+      {
         id: "reboot",
         label: "Reboot gateway…",
         hint: "Asks for confirmation",
@@ -706,7 +837,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
       },
       { id: "logout", label: "Sign out", keywords: "logout", icon: <LogOut className="h-4 w-4" />, run: () => void onLogout() },
     ],
-    [darkOnly, hydrateBootstrap, layoutPref, onLogout, publicIp, setLayoutPref, setSkin, skin, theme, toast, toggleTheme]
+    [darkOnly, hudSfx, hydrateBootstrap, layoutPref, motionQuality, onLogout, publicIp, setHudSfx, setLayoutPref, setMotionQuality, setSkin, skin, theme, toast, toggleTheme]
   );
 
   const activeSection = sectionFor(route as Section);
@@ -748,6 +879,9 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
               <a
                 href={hrefFor(sec.route)}
                 aria-current={active ? "page" : undefined}
+                onClick={() => {
+                  if (!active) playHudNav();
+                }}
                 className={cn(
                   "group flex items-center gap-3 rounded-xl px-3 py-2 text-[14px] font-semibold transition",
                   active ? "bg-surface text-ink shadow-[var(--qm-shadow)]" : "text-ink-2 hover:bg-surface/70 hover:text-ink"
@@ -766,6 +900,9 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
                       <a
                         key={s.id}
                         href={hrefFor(sec.route, s.id)}
+                        onClick={() => {
+                          if (!on) playHudNav();
+                        }}
                         className={cn("relative block rounded-lg px-2.5 py-1.5 text-[13px] transition", on ? "font-bold text-ember-ink bg-ember-soft" : "font-medium text-muted hover:text-ink")}
                       >
                         {on && <span className="absolute -left-[13.5px] top-1.5 bottom-1.5 w-[3px] rounded-full qm-sun" />}
@@ -808,7 +945,13 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
             <BrandLogo />
           </span>
         </a>
-        <nav className="flex min-w-0 items-center gap-1" aria-label="Primary">
+        <nav ref={topNavRef} className="relative flex min-w-0 items-center gap-1" aria-label="Primary">
+          <span
+            ref={topPill.pillRef}
+            aria-hidden
+            className="qm-glass-pill pointer-events-none absolute left-0 top-0 rounded-full"
+            style={topPill.style}
+          />
           {NAV.map((sec) => {
             const active = sec.route === route;
             return (
@@ -818,9 +961,16 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
                 aria-current={active ? "page" : undefined}
                 aria-label={sec.label}
                 title={sec.label}
+                onClick={() => {
+                  if (!active) playHudNav();
+                }}
                 className={cn(
-                  "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-2 text-[13px] font-bold transition xl:gap-2 xl:px-3.5 xl:text-[13.5px]",
-                  active ? "bg-ink text-paper" : "text-ink-2 hover:bg-sunk hover:text-ink"
+                  "relative z-[1] flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-2 text-[13px] font-bold transition-colors xl:gap-2 xl:px-3.5 xl:text-[13.5px]",
+                  active
+                    ? topPill.ready
+                      ? "text-ink"
+                      : "bg-ink text-paper"
+                    : "text-ink-2 hover:bg-sunk/70 hover:text-ink"
                 )}
               >
                 <NavIcon name={sec.icon} className="h-4 w-4 shrink-0" />
@@ -858,6 +1008,9 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
                 <a
                   key={s.id}
                   href={hrefFor(activeSection.route, s.id)}
+                  onClick={() => {
+                    if (!on) playHudNav();
+                  }}
                   className={cn(
                     "relative shrink-0 whitespace-nowrap py-2.5 text-[13px] font-semibold transition",
                     on ? "text-ink" : "text-muted hover:text-ink"
@@ -889,6 +1042,9 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
               href={hrefFor(sec.route)}
               aria-current={active ? "page" : undefined}
               title={sec.hint}
+              onClick={() => {
+                if (!active) playHudNav();
+              }}
               className={cn("flex w-[68px] flex-col items-center gap-1 rounded-xl py-2 text-[10.5px] font-bold transition", active ? "text-ink" : "text-muted hover:text-ink")}
             >
               <span className={cn("flex h-9 w-9 items-center justify-center rounded-xl transition", active ? "qm-sun text-on-ember shadow-[var(--qm-shadow-pop)]" : "bg-sunk")}>
@@ -1022,7 +1178,7 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
         <div className={cn("px-4 sm:px-6 lg:px-10 pt-5 pb-28 lg:pb-12", layout === "rail" ? "lg:pt-9" : "lg:pt-8")}>
           <div className={cn("mx-auto w-full space-y-6", layout === "rail" ? "max-w-[1240px]" : "max-w-[1320px]")}>
             <AlertsStrip />
-            <div key={route} className="space-y-6 qm-rise">
+            <div key={route} className="space-y-6 qm-page-enter">
               {children}
             </div>
           </div>
@@ -1031,7 +1187,13 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
 
       {/* Phones: bottom tab bar (all layouts) */}
       <nav className="lg:hidden fixed bottom-0 inset-x-0 z-30 border-t border-line bg-surface/92 backdrop-blur-md pb-[env(safe-area-inset-bottom)]" aria-label="Primary">
-        <div className="grid grid-cols-5">
+        <div ref={mobileNavRef} className="relative grid grid-cols-5">
+          <span
+            ref={mobilePill.pillRef}
+            aria-hidden
+            className="qm-glass-pill pointer-events-none absolute left-0 top-0 rounded-full"
+            style={mobilePill.style}
+          />
           {NAV.filter((sec) => !sec.mobileTab).map((sec) => {
             const active = sec.route === route || activeSection.mobileTab === sec.route;
             return (
@@ -1039,9 +1201,19 @@ export function AppShell({ route, children }: { route: NavRoute; onNavigate?: (r
                 key={sec.route}
                 href={hrefFor(sec.route)}
                 aria-current={active ? "page" : undefined}
-                className={cn("flex flex-col items-center gap-0.5 py-2 text-[10.5px] font-bold transition", active ? "text-ember-ink" : "text-muted")}
+                onClick={() => {
+                  if (!active) playHudNav();
+                }}
+                className={cn("relative z-[1] flex flex-col items-center gap-0.5 py-2 text-[10.5px] font-bold transition-colors", active ? "text-ember-ink" : "text-muted")}
               >
-                <span className={cn("flex h-7 w-11 items-center justify-center rounded-full transition", active && "qm-sun text-on-ember")}>
+                <span
+                  data-mobile-pill={active ? "true" : undefined}
+                  className={cn(
+                    "flex h-7 w-11 items-center justify-center rounded-full transition-colors",
+                    active && !mobilePill.ready && "qm-sun text-on-ember",
+                    active && mobilePill.ready && "text-ember-ink"
+                  )}
+                >
                   <NavIcon name={sec.icon} className="h-4 w-4" />
                 </span>
                 {sec.short}

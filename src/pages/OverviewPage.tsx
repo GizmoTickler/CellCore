@@ -28,19 +28,28 @@ import { hrefFor } from "../stores/route-store";
 import { useToastStore } from "../stores/toast-store";
 import { useLiveness, useWsStore } from "../stores/ws-store";
 import { Badge, Button, CopyButton, LiveDot, Meter, SignalDial, Skeleton, Sparkline, signalQuality } from "../components/ui";
+import { HudOscilloscope } from "../components/HudOscilloscope";
 import { InteractiveAreaChart, type ChartMarker } from "../components/Charts";
 import { EventRow, FailoverBadge, eventLabel } from "../components/obs";
+import { RollingNumber } from "../lib/motion";
 import { useObsStore } from "../stores/obs-store";
 import type { OverviewPulse } from "../types/cellcore";
 import { heatInk, heatVerdict } from "./system/parts";
 
-function splitRate(bps: number): { value: string; unit: string } {
+function splitRate(bps: number): { value: string; num: number | null; decimals: number; unit: string } {
   const [v, u] = formatBitrate(bps).split(" ");
-  return { value: v, unit: u ?? "" };
+  const num = Number(v);
+  const dot = v.indexOf(".");
+  return {
+    value: v,
+    num: Number.isFinite(num) ? num : null,
+    decimals: dot >= 0 ? v.length - dot - 1 : 0,
+    unit: u ?? "",
+  };
 }
 
 function Panel({ className, children }: { className?: string; children: React.ReactNode }) {
-  return <section className={cn("qm-card p-[var(--qm-pad)] min-w-0", className)}>{children}</section>;
+  return <section className={cn("qm-card qm-hud-card p-[var(--qm-pad)] min-w-0", className)}>{children}</section>;
 }
 
 function PanelTitle({ title, hint, action }: { title: string; hint?: string; action?: React.ReactNode }) {
@@ -88,6 +97,45 @@ const EMPTY_MIMO = {
 
 /* ───────────────────────── Isolated Hero Sub-components ───────────────────────── */
 
+const HeroBloomOrb = React.memo(function HeroBloomOrb() {
+  const rsrp = useWsStore((s) => s.modem?.serving?.rsrp ?? null);
+  const sinr = useWsStore((s) => s.modem?.serving?.sinr ?? null);
+  const failoverActive = useObsStore((s) => Boolean(s.failover?.active));
+  const liveness = useLiveness();
+
+  const quality = signalQuality(rsrp, sinr);
+  let bloomStyle: React.CSSProperties | undefined;
+  let orbClass = "qm-sun opacity-[0.13]";
+
+  if (!liveness.live || quality.tone === "crimson") {
+    orbClass = "opacity-[0.2]";
+    bloomStyle = {
+      background: "radial-gradient(circle, var(--qm-crimson) 0%, transparent 72%)",
+    };
+  } else if (failoverActive || quality.tone === "saffron") {
+    orbClass = "opacity-[0.18]";
+    bloomStyle = {
+      background: "radial-gradient(circle, var(--qm-saffron) 0%, transparent 72%)",
+    };
+  } else if (quality.tone === "jade") {
+    orbClass = "opacity-[0.17]";
+    bloomStyle = {
+      background: "radial-gradient(circle, var(--qm-jade) 0%, var(--qm-ember) 46%, transparent 74%)",
+    };
+  }
+
+  return (
+    <div
+      aria-hidden
+      className={cn(
+        "pointer-events-none absolute -top-40 -right-24 h-[420px] w-[420px] rounded-full blur-3xl transition-all duration-700",
+        orbClass
+      )}
+      style={bloomStyle}
+    />
+  );
+});
+
 const HeroSignalDial = React.memo(function HeroSignalDial() {
   const serving = useWsStore((s) => s.modem?.serving ?? null);
   const activeMeters = useWsStore((s) => s.modem?.timeAdvance?.activeMeters ?? null);
@@ -106,6 +154,8 @@ const HeroSignalDial = React.memo(function HeroSignalDial() {
     >
       <SignalDial
         value={serving?.rsrp ?? null}
+        sinr={serving?.sinr ?? null}
+        live={liveness.live}
         size={236}
         unit="dBm RSRP"
         caption={
@@ -116,15 +166,22 @@ const HeroSignalDial = React.memo(function HeroSignalDial() {
       />
       <div className="grid w-full max-w-[300px] grid-cols-3 gap-2 text-center qm-tabular">
         {[
-          { k: "SINR", v: serving?.sinr, u: "dB", pct: signalPercent("sinr", serving?.sinr ?? null) },
-          { k: "RSRQ", v: serving?.rsrq, u: "dB", pct: signalPercent("rsrq", serving?.rsrq ?? null) },
-          { k: "Tower", v: towerDist, u: "", pct: null },
+          { k: "SINR", num: serving?.sinr ?? null, text: undefined as string | null | undefined, u: "dB", pct: signalPercent("sinr", serving?.sinr ?? null) },
+          { k: "RSRQ", num: serving?.rsrq ?? null, text: undefined as string | null | undefined, u: "dB", pct: signalPercent("rsrq", serving?.rsrq ?? null) },
+          { k: "Tower", num: undefined as number | null | undefined, text: towerDist, u: "", pct: null },
         ].map((m) => (
-          <div key={m.k} className="rounded-2xl bg-sunk px-2 py-2.5">
+          <div key={m.k} className="qm-hud-card rounded-2xl border border-line/60 bg-sunk px-2 py-2.5">
             <div className="qm-eyebrow">{m.k}</div>
             <div className="mt-1 text-[15px] font-bold text-ink">
-              {m.v ?? "—"}
-              {m.u && m.v != null && <span className="ml-0.5 text-[11px] font-semibold text-muted">{m.u}</span>}
+              {m.num !== undefined ? (
+                <RollingNumber
+                  value={m.num}
+                  decimals={m.num != null && !Number.isInteger(m.num) ? 1 : 0}
+                />
+              ) : (
+                m.text ?? "—"
+              )}
+              {m.u && m.num != null && <span className="ml-0.5 text-[11px] font-semibold text-muted">{m.u}</span>}
             </div>
             {m.pct != null && <Meter pct={m.pct} thin className="mt-1.5" tone="sun" />}
           </div>
@@ -151,16 +208,36 @@ const HeroThroughput = React.memo(function HeroThroughput() {
         { label: "Download", icon: <ArrowDown className="h-3.5 w-3.5" />, rate: rx, series: rxSeries, color: "var(--qm-jade)", tone: "text-jade-ink" },
         { label: "Upload", icon: <ArrowUp className="h-3.5 w-3.5" />, rate: tx, series: txSeries, color: "var(--qm-berry)", tone: "text-berry-ink" },
       ].map((f) => (
-        <div key={f.label} className="rounded-2xl border border-line bg-raised/60 p-4 min-w-0">
+        <div key={f.label} className="qm-hud-card relative overflow-hidden rounded-2xl border border-line bg-raised/60 p-4 min-w-0">
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-x-3 top-0 h-px bg-gradient-to-r from-transparent via-white/30 to-transparent"
+          />
           <div className={cn("flex items-center gap-1.5 text-[12px] font-bold", f.tone)}>
             {f.icon}
             {f.label}
           </div>
           <div className="mt-1 flex items-baseline gap-1.5 qm-tabular">
-            <span className="qm-display text-[1.9rem] leading-none text-ink">{f.rate.value}</span>
+            {f.rate.num != null ? (
+              <RollingNumber
+                value={f.rate.num}
+                decimals={f.rate.decimals}
+                stiffness={210}
+                damping={28}
+                className="qm-display text-[1.9rem] leading-none text-ink"
+              />
+            ) : (
+              <span className="qm-display text-[1.9rem] leading-none text-ink">{f.rate.value}</span>
+            )}
             <span className="text-[12px] font-semibold text-muted">{f.rate.unit}</span>
           </div>
-          <Sparkline values={f.series} color={f.color} height={34} className="mt-2" />
+          <HudOscilloscope
+            values={f.series}
+            color={f.color}
+            height={46}
+            className="mt-2.5"
+            label={`${f.label} throughput waveform`}
+          />
         </div>
       ))}
     </div>
@@ -277,7 +354,7 @@ const HeroVerdictAndActions = React.memo(function HeroVerdictAndActions() {
             </span>
             <span className="font-bold qm-tabular text-ink">{speedtest.progress}%</span>
           </div>
-          <Meter pct={speedtest.progress} tone="sun" />
+          <Meter pct={speedtest.progress} tone="sun" shimmer={running} />
           <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[13px] qm-tabular">
             <span className="text-jade-ink font-bold">↓ {speedtest.downloadMbps ?? "—"} Mbps</span>
             <span className="text-berry-ink font-bold">↑ {speedtest.uploadMbps ?? "—"} Mbps</span>
@@ -404,11 +481,14 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
   return (
     <section
       aria-label="System health and self-healing pulse"
-      className={cn("grid gap-3 sm:grid-cols-2 lg:grid-cols-5 transition-opacity", !liveness.live && "opacity-60")}
+      className={cn("qm-stagger grid gap-3 sm:grid-cols-2 lg:grid-cols-5 transition-opacity", !liveness.live && "opacity-60")}
     >
       <a
         href={hrefFor("/diagnostics", "health")}
-        className="qm-card p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
+        className={cn(
+          "qm-card qm-hud-card qm-reticle p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0",
+          qwRecovering && "qm-scan-alert"
+        )}
       >
         <div className="flex items-center justify-between gap-2">
           <span className="qm-eyebrow flex items-center gap-1.5">
@@ -424,9 +504,10 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
       <a
         href={hrefFor("/cellular", "lock")}
         className={cn(
-          "qm-card p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0",
-          lockBypassed && "border-crimson/55 bg-crimson-soft"
+          "qm-card qm-hud-card qm-reticle p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0",
+          lockBypassed && "border-crimson/55 bg-crimson-soft qm-scan-alert"
         )}
+        style={lockBypassed ? ({ "--qm-alert-color": "var(--qm-crimson)" } as React.CSSProperties) : undefined}
       >
         <div className="flex items-center justify-between gap-2">
           <span className={cn("qm-eyebrow flex items-center gap-1.5", lockBypassed && "text-crimson-ink")}>
@@ -443,7 +524,7 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
 
       <a
         href={hrefFor("/network", "warp")}
-        className="qm-card p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
+        className="qm-card qm-hud-card qm-reticle p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
       >
         <div className="flex items-center justify-between gap-2">
           <span className="qm-eyebrow flex items-center gap-1.5">
@@ -473,7 +554,11 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
 
       <a
         href={hrefFor("/system", "hardware")}
-        className="qm-card p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
+        className={cn(
+          "qm-card qm-hud-card qm-reticle p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0",
+          tmdThrottle && "qm-scan-alert border-crimson/55"
+        )}
+        style={tmdThrottle ? ({ "--qm-alert-color": "var(--qm-crimson)" } as React.CSSProperties) : undefined}
       >
         <div className="flex items-center justify-between gap-2">
           <span className="qm-eyebrow flex items-center gap-1.5">
@@ -499,7 +584,7 @@ const HealthPulseStrip = React.memo(function HealthPulseStrip() {
 
       <a
         href={hrefFor("/cellular", "align")}
-        className="qm-card p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
+        className="qm-card qm-hud-card qm-reticle p-3.5 hover:border-line-strong transition flex flex-col justify-between gap-1.5 min-w-0"
       >
         <div className="flex items-center justify-between gap-2">
           <span className="qm-eyebrow flex items-center gap-1.5">
@@ -541,12 +626,14 @@ const SpectrumPanel = React.memo(function SpectrumPanel() {
           <div className="flex flex-wrap sm:flex-nowrap min-h-16 w-full gap-1 overflow-hidden rounded-2xl" role="img" aria-label="Carrier aggregation by bandwidth">
             {carriers.map((c, i) => {
               const bw = c.bandwidthMhz ?? 5;
+              const isActive = c.role === "PCC" || c.pcellState === 2;
               return (
                 <div
                   key={`${c.arfcn}-${i}`}
                   className={cn(
-                    "flex min-w-[68px] sm:min-w-[52px] flex-col justify-center overflow-hidden px-3 py-2 whitespace-nowrap transition-all",
-                    SEGMENT_TONES[Math.min(i, SEGMENT_TONES.length - 1)]
+                    "flex min-w-[68px] sm:min-w-[52px] flex-col justify-center overflow-hidden px-3 py-2 whitespace-nowrap transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
+                    SEGMENT_TONES[Math.min(i, SEGMENT_TONES.length - 1)],
+                    isActive ? "qm-energy-shimmer" : "qm-dormant-hatch opacity-80"
                   )}
                   style={{ flexGrow: bw, flexBasis: "68px" }}
                   title={`${c.role} ${c.band} · ${bw} MHz${c.dlMimoLayers ? ` · ${c.dlMimoLayers}×${c.ulMimoLayers ?? 1} MIMO` : ""}`}
@@ -622,6 +709,161 @@ const SpectrumPanel = React.memo(function SpectrumPanel() {
   );
 });
 
+const MimoRadarMini = React.memo(function MimoRadarMini({ rsrp }: { rsrp: (number | null)[] }) {
+  const cx = 110;
+  const cy = 58;
+  const rings = [
+    { r: 40, label: "-70" },
+    { r: 25, label: "-95" },
+    { r: 10, label: "-120" },
+  ];
+
+  const valid = rsrp.filter((v): v is number => v != null && Number.isFinite(v));
+  const spread = valid.length >= 2 ? Math.round((Math.max(...valid) - Math.min(...valid)) * 10) / 10 : null;
+  const accentColor =
+    spread == null
+      ? "var(--qm-muted)"
+      : spread <= 6
+        ? "var(--qm-jade)"
+        : spread <= 10
+          ? "var(--qm-saffron)"
+          : "var(--qm-crimson)";
+
+  const radiusFor = (v: number | null) => {
+    if (v == null || !Number.isFinite(v)) return 6;
+    return Math.max(6, Math.min(40, 10 + ((v + 120) / 50) * 30));
+  };
+
+  // RX0 top, RX1 right, RX2 bottom, RX3 left
+  const axes = [
+    { id: "RX0", dx: 0, dy: -1, lx: cx, ly: cy - 46, anchor: "middle" as const },
+    { id: "RX1", dx: 1, dy: 0, lx: cx + 47, ly: cy + 3.5, anchor: "start" as const },
+    { id: "RX2", dx: 0, dy: 1, lx: cx, ly: cy + 53, anchor: "middle" as const },
+    { id: "RX3", dx: -1, dy: 0, lx: cx - 47, ly: cy + 3.5, anchor: "end" as const },
+  ];
+
+  const pts = axes.map((a, i) => {
+    const val = rsrp[i] ?? null;
+    const rad = radiusFor(val);
+    return {
+      x: cx + a.dx * rad,
+      y: cy + a.dy * rad,
+      active: val != null && Number.isFinite(val),
+    };
+  });
+
+  const diamondPath = (r: number) => `${cx},${cy - r} ${cx + r},${cy} ${cx},${cy + r} ${cx - r},${cy}`;
+  const polyPoints = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+
+  return (
+    <div className="mb-4 rounded-2xl border border-line/70 bg-sunk/60 px-3 py-2">
+      <svg
+        viewBox="0 0 220 116"
+        className="h-[112px] w-full overflow-visible"
+        role="img"
+        aria-label={spread != null ? `4x4 MIMO symmetry radar, spread ${spread} dB` : "4x4 MIMO symmetry radar"}
+      >
+        {/* Concentric glass diamond rings (-70, -95, -120 dBm) */}
+        {rings.map((ring) => (
+          <polygon
+            key={ring.label}
+            points={diamondPath(ring.r)}
+            fill="none"
+            stroke="currentColor"
+            className="text-line-strong"
+            strokeWidth={ring.r === 40 ? "1" : "0.85"}
+            strokeDasharray={ring.r === 40 ? undefined : "2.5 2.5"}
+            opacity={ring.r === 40 ? "0.65" : "0.45"}
+          />
+        ))}
+
+        {/* Orthogonal RX0-RX3 axes */}
+        <line x1={cx} y1={cy - 40} x2={cx} y2={cy + 40} stroke="currentColor" className="text-line" strokeWidth="0.9" opacity="0.7" />
+        <line x1={cx - 40} y1={cy} x2={cx + 40} y2={cy} stroke="currentColor" className="text-line" strokeWidth="0.9" opacity="0.7" />
+
+        {/* Subtle ring scale annotations on the right margin */}
+        <text x={cx + 80} y={cy - 34} textAnchor="end" className="fill-muted text-[8.5px] font-mono qm-tabular" opacity="0.75">
+          -70 dBm
+        </text>
+        <text x={cx + 80} y={cy - 21} textAnchor="end" className="fill-muted text-[8.5px] font-mono qm-tabular" opacity="0.6">
+          -95 dBm
+        </text>
+        <text x={cx + 80} y={cy - 8} textAnchor="end" className="fill-muted text-[8.5px] font-mono qm-tabular" opacity="0.48">
+          -120 dBm
+        </text>
+
+        {/* Live plasma MIMO polygon */}
+        {valid.length > 0 && (
+          <polygon
+            points={polyPoints}
+            style={{
+              fill: accentColor,
+              fillOpacity: 0.2,
+              stroke: accentColor,
+              transition: "all 320ms cubic-bezier(0.22, 1, 0.36, 1)",
+            }}
+            strokeWidth="1.75"
+            strokeLinejoin="round"
+          />
+        )}
+
+        {/* Glowing vertex dots */}
+        {pts.map((p, i) => (
+          <g key={i} style={{ transition: "all 320ms cubic-bezier(0.22, 1, 0.36, 1)" }}>
+            {p.active && <circle cx={p.x} cy={p.y} r="5.2" style={{ fill: accentColor }} opacity="0.26" />}
+            <circle
+              cx={p.x}
+              cy={p.y}
+              r={p.active ? "2.7" : "1.8"}
+              style={{
+                fill: p.active ? accentColor : "var(--qm-muted)",
+                stroke: "var(--qm-surface)",
+              }}
+              strokeWidth="1"
+            />
+          </g>
+        ))}
+
+        {/* Axis labels */}
+        {axes.map((a) => (
+          <text
+            key={a.id}
+            x={a.lx}
+            y={a.ly}
+            textAnchor={a.anchor}
+            className="fill-ink-2 text-[9.5px] font-bold font-mono"
+          >
+            {a.id}
+          </text>
+        ))}
+
+        {/* Center spread readout pill */}
+        <g>
+          <rect
+            x={cx - 26}
+            y={cy - 9}
+            width="52"
+            height="18"
+            rx="9"
+            style={{ fill: "var(--qm-surface)", stroke: "var(--qm-line)" }}
+            fillOpacity="0.88"
+            strokeWidth="0.9"
+          />
+          <text
+            x={cx}
+            y={cy + 3.2}
+            textAnchor="middle"
+            style={{ fill: spread != null ? accentColor : "var(--qm-muted)" }}
+            className="text-[9.5px] font-bold qm-tabular"
+          >
+            {spread != null ? `Δ ${spread} dB` : "—"}
+          </text>
+        </g>
+      </svg>
+    </div>
+  );
+});
+
 const AntennasPanel = React.memo(function AntennasPanel() {
   const mimo = useWsStore((s) => s.modem?.mimo ?? EMPTY_MIMO);
   const antennaLabels = useWsStore((s) => s.settings?.antennaLabels);
@@ -638,6 +880,7 @@ const AntennasPanel = React.memo(function AntennasPanel() {
           </a>
         }
       />
+      <MimoRadarMini rsrp={mimo.rsrp} />
       <div className="space-y-4">
         {[0, 1, 2, 3].map((i) => {
           const role = (["PRX · TX0", "DRX", "MIMO · TX1", "MIMO"] as const)[i];
@@ -1047,10 +1290,10 @@ export function OverviewPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 qm-stagger">
       {/* ── Hero: verdict + dial + live flow ─────────────────────────── */}
-      <section className="qm-card qm-grain relative overflow-hidden p-0">
-        <div aria-hidden className="pointer-events-none absolute -top-40 -right-24 h-[420px] w-[420px] rounded-full qm-sun opacity-[0.13] blur-3xl" />
+      <section className="qm-card qm-hud-card qm-reticle qm-grain relative overflow-hidden p-0">
+        <HeroBloomOrb />
         <div className="relative grid lg:grid-cols-12">
           <HeroSignalDial />
           <HeroVerdictAndActions />

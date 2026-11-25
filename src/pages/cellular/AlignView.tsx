@@ -23,6 +23,8 @@ import {
   Zap,
 } from "lucide-react";
 import { Badge, Button, Card, Input, LiveDot, Skeleton } from "../../components/ui";
+import { playHudLock, triggerHaptic } from "../../lib/hud-fx";
+import { RollingNumber } from "../../lib/motion";
 import { cn, copyToClipboard } from "../../lib/utils";
 import type { AntennaAlignState } from "../../types/cellcore";
 import { TONE_BG, TONE_TEXT, rsrpPct, rsrpTone, rsrpWord } from "./shared";
@@ -269,9 +271,9 @@ function ChainMeter({
       onClick={onSelect}
       aria-pressed={focused}
       className={cn(
-        "qm-subcard flex flex-col p-3.5 sm:p-4 min-w-0 text-left transition-all cursor-pointer",
+        "qm-subcard qm-hud-card qm-spring-press flex flex-col p-3.5 sm:p-4 min-w-0 text-left transition-all cursor-pointer",
         focused
-          ? "ring-2 ring-ember bg-raised shadow-[var(--qm-shadow)]"
+          ? "qm-reticle ring-2 ring-ember bg-raised shadow-[var(--qm-shadow)]"
           : "hover:border-line-strong",
         dimmed && "opacity-65 hover:opacity-100"
       )}
@@ -419,6 +421,9 @@ export function AlignView({
   const [bookmarks, setBookmarks] = useState<AlignBookmark[]>(loadBookmarks);
   const [copiedBookmarks, setCopiedBookmarks] = useState(false);
   const [handover, setHandover] = useState<{ from: string; to: string } | null>(null);
+  const [justHitPeak, setJustHitPeak] = useState(false);
+  const [lockPulseSeq, setLockPulseSeq] = useState(0);
+  const peakPulseTimerRef = useRef<number | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const masterBusRef = useRef<DynamicsCompressorNode | null>(null);
@@ -701,6 +706,10 @@ export function AlignView({
 
   useEffect(() => {
     return () => {
+      if (peakPulseTimerRef.current != null) {
+        window.clearTimeout(peakPulseTimerRef.current);
+        peakPulseTimerRef.current = null;
+      }
       stopToneNodes();
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         try {
@@ -759,6 +768,7 @@ export function AlignView({
     setBestMeanScore(0);
     setBestChainScores([0, 0, 0, 0]);
     setHandover(null);
+    setJustHitPeak(false);
     prevFocusPeakRef.current = null;
     lastSpokenValRef.current = null;
     baseCellRef.current =
@@ -772,6 +782,7 @@ export function AlignView({
   useEffect(() => {
     prevFocusPeakRef.current = focusPeak;
     lastSpokenValRef.current = null;
+    setJustHitPeak(false);
   }, [focus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // WebSocket-driven trace updates, Voice readout, Peak chime & Port Auto-Detect
@@ -801,15 +812,32 @@ export function AlignView({
     const isNewPeak =
       focusPeak != null && prevFocusPeakRef.current != null && focusPeak > prevFocusPeakRef.current;
     if (isNewPeak) {
+      setJustHitPeak(true);
+      setLockPulseSeq((n) => n + 1);
+      if (peakPulseTimerRef.current != null) {
+        window.clearTimeout(peakPulseTimerRef.current);
+      }
+      peakPulseTimerRef.current = window.setTimeout(() => {
+        setJustHitPeak(false);
+        peakPulseTimerRef.current = null;
+      }, 2400);
+
       if (audioMode === "voice") {
         speakText(`Minus ${Math.abs(Math.round(focusPeak))}, new peak`, volume);
         lastSpokenAtRef.current = Date.now();
         lastSpokenValRef.current = Math.round(focusPeak);
-      } else {
+        if (haptics && typeof navigator.vibrate === "function") {
+          navigator.vibrate(30);
+        }
+      } else if (audioMode === "tone" || audioMode === "geiger") {
         playChime("peak");
-      }
-      if (haptics && typeof navigator.vibrate === "function") {
-        navigator.vibrate(30);
+        if (haptics && typeof navigator.vibrate === "function") {
+          navigator.vibrate(30);
+        }
+      } else {
+        // AlignView's own audio is OFF — softly cue HUD lock SFX/haptic if user opted into hudSfx
+        playHudLock();
+        if (haptics) triggerHaptic(10);
       }
     }
     prevFocusPeakRef.current = focusPeak;
@@ -1130,6 +1158,9 @@ export function AlignView({
   const trend = delta > 0.6 ? "up" : delta < -0.6 ? "down" : "flat";
   const scoreTone = focusScore >= 70 ? "jade" : focusScore >= 45 ? "saffron" : focusCur == null ? "muted" : "crimson";
   const peakGap = focusCur != null && focusPeak != null ? Math.round((focusCur - focusPeak) * 10) / 10 : null;
+  const isPeakLocked = peakGap != null && peakGap >= -1;
+  const showNewPeakPill = justHitPeak || (peakGap != null && peakGap >= 0 && focusPeak != null && samples > 1);
+  const heroDecimals = focus === "all" ? 1 : 0;
 
   return (
     <div className="space-y-4 sm:space-y-5">
@@ -1488,8 +1519,8 @@ export function AlignView({
       )}
 
       {/* 2. Across-the-Room Live Hero Readout + Gauge + 36s Trace */}
-      <Card className="qm-grain overflow-hidden p-0 sm:p-0">
-        <div className="relative z-[1] grid lg:grid-cols-12">
+      <Card className="qm-hud-card qm-reticle overflow-hidden p-0 sm:p-0">
+        <div className="qm-grain relative z-[1] grid lg:grid-cols-12">
           <div className="lg:col-span-5 flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-line px-5 py-5 sm:p-6">
             <div className="flex items-center justify-between gap-2">
               <span className="flex items-center gap-2 text-[12px] font-semibold text-ink-2">
@@ -1506,31 +1537,139 @@ export function AlignView({
               </div>
             </div>
 
-            {/* Big Across-the-Room Readout */}
+            {/* Big Across-the-Room Readout with Target-Lock Reticle */}
             <div className="my-4 flex flex-col items-center text-center qm-tabular">
               <div className="inline-flex items-center gap-2 rounded-full bg-sunk px-3 py-1 text-[12px] font-bold text-ink">
                 {focus === "all" ? "AIMING ALL 4" : `SOLOING ${focusTitle.toUpperCase()}`}
               </div>
-              <div className="mt-2 flex items-baseline justify-center gap-2">
-                <span className={cn("qm-display text-[4.1rem] sm:text-[5rem] font-bold leading-none tracking-tight", TONE_TEXT[rsrpTone(focusCur)])}>
-                  {focusCur ?? "—"}
-                </span>
-                <span className="text-[15px] font-bold text-muted">dBm</span>
+
+              <div
+                className={cn(
+                  "relative mt-3 flex items-center justify-center rounded-2xl px-8 py-4 sm:px-10 sm:py-5 transition-all duration-300",
+                  isPeakLocked &&
+                    "bg-jade-soft/20 shadow-[0_0_32px_-12px_var(--qm-jade)]"
+                )}
+              >
+                {/* Target-Lock SVG corner brackets + inner crosshair ring */}
+                <svg
+                  viewBox="0 0 240 120"
+                  preserveAspectRatio="none"
+                  className="pointer-events-none absolute inset-0 h-full w-full overflow-visible"
+                  aria-hidden
+                >
+                  {/* Inner crosshair ring & lock pulse */}
+                  <g
+                    className="transition-transform duration-300 ease-out"
+                    style={{
+                      transformOrigin: "120px 60px",
+                      transform: isPeakLocked ? "scale(0.92)" : "scale(1)",
+                    }}
+                  >
+                    <circle
+                      cx="120"
+                      cy="60"
+                      r="50"
+                      fill="none"
+                      stroke={isPeakLocked ? "var(--qm-jade)" : "var(--qm-line-strong)"}
+                      strokeWidth={isPeakLocked ? "1.25" : "0.9"}
+                      strokeDasharray="3 5"
+                      opacity={isPeakLocked ? "0.6" : "0.32"}
+                    />
+                    {/* 4 cardinal crosshair ticks */}
+                    <line x1="120" y1="3" x2="120" y2="12" stroke={isPeakLocked ? "var(--qm-jade)" : "var(--qm-line-strong)"} strokeWidth="1.2" opacity={isPeakLocked ? "0.8" : "0.38"} />
+                    <line x1="120" y1="108" x2="120" y2="117" stroke={isPeakLocked ? "var(--qm-jade)" : "var(--qm-line-strong)"} strokeWidth="1.2" opacity={isPeakLocked ? "0.8" : "0.38"} />
+                    <line x1="56" y1="60" x2="66" y2="60" stroke={isPeakLocked ? "var(--qm-jade)" : "var(--qm-line-strong)"} strokeWidth="1.2" opacity={isPeakLocked ? "0.8" : "0.38"} />
+                    <line x1="174" y1="60" x2="184" y2="60" stroke={isPeakLocked ? "var(--qm-jade)" : "var(--qm-line-strong)"} strokeWidth="1.2" opacity={isPeakLocked ? "0.8" : "0.38"} />
+                  </g>
+
+                  {/* Emerald lock radar ripple when within 1.0 dB of peak or setting a new peak */}
+                  {isPeakLocked && (
+                    <circle
+                      key={`lock-ring-${lockPulseSeq}`}
+                      cx="120"
+                      cy="60"
+                      r="52"
+                      fill="none"
+                      stroke="var(--qm-jade)"
+                      strokeWidth={justHitPeak ? "2" : "1.3"}
+                      className="qm-radar-ring"
+                    />
+                  )}
+
+                  {/* 4 dynamic corner targeting brackets that tighten inward on peak lock */}
+                  <g
+                    fill="none"
+                    stroke={isPeakLocked ? "var(--qm-jade-ink)" : "var(--qm-ember-ink)"}
+                    strokeWidth={isPeakLocked ? "2.4" : "1.6"}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    opacity={isPeakLocked ? "0.95" : "0.42"}
+                  >
+                    <path
+                      d="M 6 24 L 6 6 L 26 6"
+                      className="transition-transform duration-300 ease-out"
+                      style={{ transform: isPeakLocked ? "translate(6px, 4px)" : "translate(0px, 0px)" }}
+                    />
+                    <path
+                      d="M 214 6 L 234 6 L 234 24"
+                      className="transition-transform duration-300 ease-out"
+                      style={{ transform: isPeakLocked ? "translate(-6px, 4px)" : "translate(0px, 0px)" }}
+                    />
+                    <path
+                      d="M 6 96 L 6 114 L 26 114"
+                      className="transition-transform duration-300 ease-out"
+                      style={{ transform: isPeakLocked ? "translate(6px, -4px)" : "translate(0px, 0px)" }}
+                    />
+                    <path
+                      d="M 214 114 L 234 114 L 234 96"
+                      className="transition-transform duration-300 ease-out"
+                      style={{ transform: isPeakLocked ? "translate(-6px, -4px)" : "translate(0px, 0px)" }}
+                    />
+                  </g>
+                </svg>
+
+                <div className="relative z-[1] flex items-baseline justify-center gap-2">
+                  <span className={cn("qm-display text-[4.1rem] sm:text-[5rem] font-bold leading-none tracking-tight", TONE_TEXT[rsrpTone(focusCur)])}>
+                    <RollingNumber
+                      value={focusCur}
+                      decimals={heroDecimals}
+                      fallback="—"
+                      stiffness={210}
+                      damping={28}
+                    />
+                  </span>
+                  <span className="text-[15px] font-bold text-muted">dBm</span>
+                </div>
               </div>
 
-              <div className="mt-2 flex flex-wrap items-center justify-center gap-2 text-[13px]">
+              <div className="mt-2.5 flex flex-wrap items-center justify-center gap-2 text-[13px]">
                 <span className="rounded-lg bg-sunk px-2.5 py-1 font-semibold text-ink">
                   Peak <strong className="text-berry-ink">{focusPeak ?? "—"}</strong> dBm
                 </span>
+                {peakGap != null && (
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11.5px] font-bold qm-tabular transition-colors",
+                      showNewPeakPill
+                        ? "border-jade/50 bg-jade-soft text-jade-ink shadow-[0_0_16px_-4px_var(--qm-jade)]"
+                        : isPeakLocked
+                          ? "border-jade/40 bg-jade-soft/85 text-jade-ink"
+                          : peakGap >= -4
+                            ? "border-saffron/35 bg-saffron-soft/80 text-saffron-ink"
+                            : "border-line bg-sunk text-muted"
+                    )}
+                  >
+                    {showNewPeakPill
+                      ? "NEW PEAK ▲"
+                      : isPeakLocked
+                        ? "AT PEAK ▲"
+                        : `−${Math.abs(peakGap).toFixed(1)} dB from peak`}
+                  </span>
+                )}
                 <span className="rounded-lg bg-sunk px-2.5 py-1 font-semibold text-ink">
                   SINR <strong>{focusSinr ?? "—"}</strong>
                   {focusPeakSinr != null ? <span className="text-muted"> / {focusPeakSinr}</span> : null} dB
                 </span>
-                {peakGap != null && (
-                  <Badge variant={peakGap >= -1 ? "success" : "warning"}>
-                    {peakGap >= -1 ? "AT PEAK" : `${peakGap} dB from peak`}
-                  </Badge>
-                )}
               </div>
 
               <div

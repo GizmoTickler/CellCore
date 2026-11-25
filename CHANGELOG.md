@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.1.0 — Futuristic Glass UX Overhaul, 60/120 fps Motion Engine & Interactive Telemetry Cockpit
+
+- **Zero-Dependency 60/120 fps Motion Physics & Opt-In HUD SFX (`src/lib/motion.ts`, `src/lib/hud-fx.ts`, `src/stores/theme-store.ts`, `public/theme-init.js`):**
+  - Built a critically-damped spring physics engine (`useSpringRef`, `RollingNumber`, FLIP `useSpringPill`, desktop fine-pointer `usePointerGlow`) driving SVG/DOM refs directly at display refresh rate with zero per-frame React re-renders, auto-sleep at rest, and `document.hidden` auto-pause.
+  - Added **Motion Quality** control (`Full` · `Balanced` · `Reduced`, auto-honoring `prefers-reduced-motion`) and opt-in synthesized Web Audio **HUD Sound Effects** (`Off` by default, zero audio asset files, toggleable + testable in Appearance & `⌘K`).
+- **Flagship `Prism Glass` Skin & Universal Futuristic Glass Chrome (`src/index.css`, `src/components/ui.tsx`, `src/components/AppShell.tsx`, `src/components/CommandPalette.tsx`, `src/pages/LoginPage.tsx`):**
+  - Added deep obsidian-sapphire translucent **`Prism Glass`** skin with specular top-edge refraction and soft emerald/cyan/violet volumetric bloom as the new flagship default while preserving all 14 existing skins.
+  - Upgraded `SignalDial` into a **Multi-Ring Telemetry Core** (spring-damped 260° RSRP plasma arc + glowing orb + concentric SINR energy ring + frosted glass core + `RollingNumber`), added FLIP spring-gliding liquid-glass active pills on mobile bottom nav, desktop top bar, and sub-tab chips, upgraded modals/`CommandPalette`/`LoginPage` with crisp glass transitions, and preserved 100% of existing metrics and controls.
+- **`Now` Cockpit, Canvas2D Oscilloscopes & Glowing Charts (`src/components/HudOscilloscope.tsx`, `src/pages/OverviewPage.tsx`, `src/components/Charts.tsx`):**
+  - Replaced static hero sparklines with a Retina 60/120 fps **Canvas2D `HudOscilloscope`** featuring monotone spline curves, smooth lerped auto-scaling, gradient wash, and glowing live-edge beam dots.
+  - Added dynamic radio-state volumetric bloom tinting, `.qm-energy-shimmer` active CA spectrum segments / `.qm-dormant-hatch` dormant SCCs, a compact **4×4 MIMO Symmetry Radar Diamond** above the 4 detailed antenna chains, tactical `.qm-scan-alert` health pulse pods, and live-tip beacons + smooth GPU scrub crosshairs on all telemetry charts.
+- **Speedtest Warp Reactor, Target-Lock Aim HUD & Data-Plane Conduit (`src/pages/diagnostics/SpeedtestView.tsx`, `src/pages/cellular/AlignView.tsx`, `src/pages/network/DataPlaneView.tsx`):**
+  - Added a 260° phase-adaptive **Warp Tachometer** (`SpeedtestReactorGauge` with concentric ping radar ripples, emerald→cyan download plasma, violet→amber upload boost, and spring-pop Bufferbloat grade stamp) while keeping all RF snapshot pills, live radio strip, and history intact.
+  - Added an animated **Target-Lock Reticle** & live peak-delta pill (`NEW PEAK ▲`) around the `AlignView` hero RSRP readout (preserving Tone/Geiger/Voice audio & keyboard shortcuts).
+  - Added a live **Packet-Flow Conduit Topology** (`5G RF Link ═══► SDX75 Engine ═══► LAN / Egress & Tunnels`) in `DataPlaneView` with bitrate-scaled `.qm-flow-dash` streams and live IPv4/IPv6 liveness indicators.
+
 ## 2.0.2 — Cloudflare Edge `/cdn-cgi/trace` Latency Probes (Zero Worker Tarpit) & iPhone PWA Top Safe-Area
 
 - **Native Speedtest Latency, Jitter & Packet Loss (`crates/cellcored/src/speedtest.rs`):**

@@ -320,9 +320,15 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
           ) : null
         )}
 
-        {/* Spline paths + live endpoint */}
+        {/* Spline paths + glowing live-tip beacon */}
         {computedSeries.map((s, idx) => {
-          const last = s.coords[s.coords.length - 1];
+          let last: PointCoord | undefined;
+          for (let i = s.values.length - 1; i >= 0; i--) {
+            if (Number.isFinite(s.values[i])) {
+              last = s.coords[i];
+              break;
+            }
+          }
           return (
             <g key={`l-${idx}`}>
               {s.linePath && (
@@ -335,9 +341,24 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
                 />
               )}
               {last && activeIdx == null && (
-                <g>
-                  <circle cx={last.x} cy={last.y} r="5" style={{ fill: s.stroke }} opacity="0.2" />
-                  <circle cx={last.x} cy={last.y} r="2.75" style={{ fill: s.stroke }} />
+                <g className="pointer-events-none">
+                  <g opacity="0.42">
+                    <circle
+                      cx={last.x}
+                      cy={last.y}
+                      r="5.6"
+                      className="qm-beacon-pulse"
+                      style={{ fill: s.stroke }}
+                    />
+                  </g>
+                  <circle
+                    cx={last.x}
+                    cy={last.y}
+                    r="3.2"
+                    style={{ fill: s.stroke, stroke: "var(--qm-surface)" }}
+                    strokeWidth="1.2"
+                  />
+                  <circle cx={last.x} cy={last.y} r="1.15" fill="#ffffff" opacity="0.9" />
                 </g>
               )}
             </g>
@@ -435,9 +456,18 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
                   <circle
                     cx={mx}
                     cy={padT - 1}
-                    r={isNear ? "3.4" : "2.5"}
+                    r={isNear ? "6" : "4.4"}
+                    fill="none"
+                    style={{ stroke: col }}
+                    strokeWidth={isNear ? "1.35" : "1"}
+                    opacity={isNear ? "0.62" : "0.38"}
+                  />
+                  <circle
+                    cx={mx}
+                    cy={padT - 1}
+                    r={isNear ? "3.3" : "2.4"}
                     style={{ fill: col, stroke: "var(--qm-surface)" }}
-                    strokeWidth="1"
+                    strokeWidth="1.25"
                   />
                 </g>
               );
@@ -445,15 +475,19 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
           </g>
         )}
 
-        {/* Hover crosshair + active dots */}
+        {/* Hover crosshair + active dots (GPU-glided transform for smooth touch scrubbing) */}
         {activeIdx != null && activeX != null && (
-          <g>
+          <g className="pointer-events-none">
             <line
-              x1={activeX}
+              x1={0}
               y1={padT}
-              x2={activeX}
+              x2={0}
               y2={padT + plotH}
-              style={{ stroke: "var(--qm-muted)" }}
+              style={{
+                stroke: "var(--qm-muted)",
+                transform: `translate3d(${activeX}px, 0, 0)`,
+                transition: "transform 85ms cubic-bezier(0.22, 1, 0.36, 1)",
+              }}
               strokeDasharray="3 3"
               opacity="0.55"
             />
@@ -461,14 +495,22 @@ export const InteractiveAreaChart = React.memo(function InteractiveAreaChart({
               const pt = s.coords[activeIdx];
               if (!pt) return null;
               return (
-                <circle
+                <g
                   key={`h-${idx}`}
-                  cx={pt.x}
-                  cy={pt.y}
-                  r="4"
-                  style={{ fill: s.stroke, stroke: "var(--qm-surface)" }}
-                  strokeWidth="1.5"
-                />
+                  style={{
+                    transform: `translate3d(${pt.x}px, ${pt.y}px, 0)`,
+                    transition: "transform 85ms cubic-bezier(0.22, 1, 0.36, 1)",
+                  }}
+                >
+                  <circle cx={0} cy={0} r="7.5" style={{ fill: s.stroke }} opacity="0.2" />
+                  <circle
+                    cx={0}
+                    cy={0}
+                    r="4"
+                    style={{ fill: s.stroke, stroke: "var(--qm-surface)" }}
+                    strokeWidth="1.5"
+                  />
+                </g>
               );
             })}
           </g>

@@ -1,11 +1,13 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, History, Minus, Play, Radio, Square, Trash2 } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
+import { playHudSuccess } from "../../lib/hud-fx";
+import { RollingNumber, useSpringRef } from "../../lib/motion";
 import { cn } from "../../lib/utils";
 import { useWsStore } from "../../stores/ws-store";
 import { useToastStore } from "../../stores/toast-store";
-import type { SpeedtestRun } from "../../types/cellcore";
+import type { SpeedtestLiveState, SpeedtestRun } from "../../types/cellcore";
 import { Badge, Button, Card, CardHeader, LiveDot, Meter, Modal } from "../../components/ui";
 import { DualAreaChart, SmoothAreaChart } from "../../components/Charts";
 import { TONE_INK, TONE_SOFT, errMsg, fmtMbps, gradeMeta, median, type HeaderFn } from "./shared";
@@ -16,6 +18,410 @@ const STEPS = [
   { id: "upload", label: "Upload" },
   { id: "complete", label: "Done" },
 ] as const;
+
+const REACTOR_TICKS = [
+  { mbps: 0, label: "0" },
+  { mbps: 10, label: "10" },
+  { mbps: 50, label: "50" },
+  { mbps: 150, label: "150" },
+  { mbps: 400, label: "400" },
+  { mbps: 800, label: "800" },
+  { mbps: 1500, label: "1.5G" },
+] as const;
+
+const REACTOR_CX = 110;
+const REACTOR_CY = 108;
+const REACTOR_R = 84;
+const REACTOR_START = 140; // degrees (SVG 0° = east, clockwise)
+const REACTOR_SWEEP = 260;
+const REACTOR_ARC_LEN = (REACTOR_SWEEP / 360) * 2 * Math.PI * REACTOR_R;
+
+function mbpsToReactorNorm(mbps: number | null | undefined): number {
+  if (mbps == null || !Number.isFinite(mbps) || mbps <= 0) return 0;
+  return Math.max(0, Math.min(1, Math.pow(mbps / 1500, 0.45)));
+}
+
+function reactorPolar(deg: number, rad: number): readonly [number, number] {
+  const a = (deg * Math.PI) / 180;
+  return [REACTOR_CX + rad * Math.cos(a), REACTOR_CY + rad * Math.sin(a)] as const;
+}
+
+function describeReactorArc(startDeg: number, endDeg: number, rad: number): string {
+  const [x1, y1] = reactorPolar(startDeg, rad);
+  const [x2, y2] = reactorPolar(endDeg, rad);
+  const large = endDeg - startDeg > 180 ? 1 : 0;
+  return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${rad} ${rad} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+}
+
+const REACTOR_TRACK_PATH = describeReactorArc(REACTOR_START, REACTOR_START + REACTOR_SWEEP, REACTOR_R);
+const REACTOR_INNER_ARC = describeReactorArc(REACTOR_START, REACTOR_START + REACTOR_SWEEP, REACTOR_R - 14);
+
+const SpeedtestReactorGauge = React.memo(function SpeedtestReactorGauge({
+  phase,
+  running,
+  mbps,
+  pingMs,
+  grade,
+  gradeKey,
+}: {
+  phase: SpeedtestLiveState["phase"];
+  running: boolean;
+  mbps: number | null;
+  pingMs: number | null;
+  grade: string;
+  gradeKey: string;
+}) {
+  const gid = useId().replace(/:/g, "");
+  const arcRef = useRef<SVGPathElement | null>(null);
+  const arcGlowRef = useRef<SVGPathElement | null>(null);
+  const needleRef = useRef<SVGLineElement | null>(null);
+  const tipRef = useRef<SVGCircleElement | null>(null);
+  const tipHaloRef = useRef<SVGCircleElement | null>(null);
+
+  const isPing = running && (phase === "ping" || phase === "starting");
+  const isDownload = running && phase === "download";
+  const isUpload = running && phase === "upload";
+  const isSettled = !running;
+
+  const targetNorm = isPing ? 0 : mbpsToReactorNorm(mbps);
+  const initialNormRef = useRef(targetNorm);
+  const currentNormRef = useRef(targetNorm);
+
+  const applyFrame = (norm: number) => {
+    const clamped = Math.max(0, Math.min(1, norm));
+    currentNormRef.current = clamped;
+    const offset = (REACTOR_ARC_LEN * (1 - clamped)).toFixed(2);
+    const activeOpacity = clamped <= 0.003 ? "0" : "1";
+    const glowOpacity = clamped <= 0.003 ? "0" : isSettled ? "0.34" : "0.62";
+
+    if (arcRef.current) {
+      arcRef.current.setAttribute("stroke-dashoffset", offset);
+      arcRef.current.setAttribute("opacity", activeOpacity);
+    }
+    if (arcGlowRef.current) {
+      arcGlowRef.current.setAttribute("stroke-dashoffset", offset);
+      arcGlowRef.current.setAttribute("opacity", glowOpacity);
+    }
+
+    const deg = REACTOR_START + REACTOR_SWEEP * clamped;
+    const [nx1, ny1] = reactorPolar(deg, 50);
+    const [nx2, ny2] = reactorPolar(deg, REACTOR_R - 2);
+    const [tx, ty] = reactorPolar(deg, REACTOR_R);
+
+    if (needleRef.current) {
+      needleRef.current.setAttribute("x1", nx1.toFixed(2));
+      needleRef.current.setAttribute("y1", ny1.toFixed(2));
+      needleRef.current.setAttribute("x2", nx2.toFixed(2));
+      needleRef.current.setAttribute("y2", ny2.toFixed(2));
+      needleRef.current.setAttribute("opacity", activeOpacity);
+    }
+    if (tipRef.current) {
+      tipRef.current.setAttribute("cx", tx.toFixed(2));
+      tipRef.current.setAttribute("cy", ty.toFixed(2));
+      tipRef.current.setAttribute("opacity", activeOpacity);
+    }
+    if (tipHaloRef.current) {
+      tipHaloRef.current.setAttribute("cx", tx.toFixed(2));
+      tipHaloRef.current.setAttribute("cy", ty.toFixed(2));
+      tipHaloRef.current.setAttribute("opacity", clamped <= 0.003 ? "0" : isSettled ? "0.28" : "0.55");
+    }
+  };
+
+  useSpringRef(targetNorm, applyFrame, {
+    stiffness: running ? 190 : 120,
+    damping: running ? 24 : 22,
+    precision: 0.0005,
+    initial: initialNormRef.current,
+  });
+
+  // Sync glow opacity on running/settled transitions without interrupting spring interpolation
+  useEffect(() => {
+    applyFrame(currentNormRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSettled, isPing]);
+
+  const initDeg = REACTOR_START + REACTOR_SWEEP * initialNormRef.current;
+  const [initNx1, initNy1] = reactorPolar(initDeg, 50);
+  const [initNx2, initNy2] = reactorPolar(initDeg, REACTOR_R - 2);
+  const [initTx, initTy] = reactorPolar(initDeg, REACTOR_R);
+  const initOffset = REACTOR_ARC_LEN * (1 - initialNormRef.current);
+  const initVis = initialNormRef.current <= 0.003 ? 0 : 1;
+
+  const gradId = isDownload
+    ? `reactor-dl-${gid}`
+    : isUpload
+      ? `reactor-ul-${gid}`
+      : `reactor-idle-${gid}`;
+  const accentColor = isDownload
+    ? "#22d3ee"
+    : isUpload
+      ? "#c084fc"
+      : "var(--qm-ember)";
+  const gm = gradeMeta(grade);
+
+  const liveSpeedVal = mbps != null && Number.isFinite(mbps) && mbps > 0 ? mbps : null;
+  const speedDecimals = liveSpeedVal != null && liveSpeedVal >= 100 ? 0 : 1;
+  const livePingVal = pingMs != null && Number.isFinite(pingMs) && pingMs > 0 ? pingMs : null;
+
+  const phaseEyebrow = isPing
+    ? phase === "starting"
+      ? "CONNECTING"
+      : "PING"
+    : isDownload
+      ? "DOWNLOAD"
+      : isUpload
+        ? "UPLOAD"
+        : phase === "stopped"
+          ? "ABORTED"
+          : phase === "error"
+            ? "FAILED"
+            : "REACTOR";
+
+  return (
+    <div className="relative mx-auto flex w-[210px] shrink-0 flex-col items-center select-none">
+      <svg viewBox="0 0 220 202" className="w-[210px] h-auto overflow-visible" aria-hidden>
+        <defs>
+          <linearGradient id={`reactor-dl-${gid}`} x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stopColor="#10b981" />
+            <stop offset="55%" stopColor="#22d3ee" />
+            <stop offset="100%" stopColor="#67e8f9" />
+          </linearGradient>
+          <linearGradient id={`reactor-ul-${gid}`} x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stopColor="#8b5cf6" />
+            <stop offset="58%" stopColor="#c084fc" />
+            <stop offset="100%" stopColor="#f59e0b" />
+          </linearGradient>
+          <linearGradient id={`reactor-idle-${gid}`} x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" style={{ stopColor: "var(--qm-dial-a)" }} />
+            <stop offset="55%" style={{ stopColor: "var(--qm-dial-b)" }} />
+            <stop offset="100%" style={{ stopColor: "var(--qm-dial-c)" }} />
+          </linearGradient>
+          <radialGradient id={`reactor-core-${gid}`} cx="50%" cy="35%" r="65%">
+            <stop offset="0%" style={{ stopColor: "var(--qm-raised)", stopOpacity: 0.9 }} />
+            <stop offset="100%" style={{ stopColor: "var(--qm-sunk)", stopOpacity: 0.55 }} />
+          </radialGradient>
+          <filter id={`reactor-glow-${gid}`} x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="5" />
+          </filter>
+        </defs>
+
+        {/* Glass core housing */}
+        <circle
+          cx={REACTOR_CX}
+          cy={REACTOR_CY}
+          r="56"
+          fill={`url(#reactor-core-${gid})`}
+          className="stroke-line"
+          strokeWidth="1"
+        />
+        <circle
+          cx={REACTOR_CX}
+          cy={REACTOR_CY}
+          r="50"
+          fill="none"
+          className="stroke-line-strong/40"
+          strokeWidth="0.75"
+          strokeDasharray="2 5"
+        />
+
+        {/* Ping / Starting radar ripples */}
+        {isPing && (
+          <g>
+            <circle
+              cx={REACTOR_CX}
+              cy={REACTOR_CY}
+              r="52"
+              fill="none"
+              stroke="var(--qm-ember)"
+              strokeWidth="1.5"
+              className="qm-radar-ring"
+            />
+            <circle
+              cx={REACTOR_CX}
+              cy={REACTOR_CY}
+              r="52"
+              fill="none"
+              stroke="var(--qm-jade)"
+              strokeWidth="1.25"
+              className="qm-radar-ring"
+              style={{ animationDelay: "630ms" }}
+            />
+            <circle
+              cx={REACTOR_CX}
+              cy={REACTOR_CY}
+              r="52"
+              fill="none"
+              stroke="var(--qm-ember-ink)"
+              strokeWidth="1"
+              className="qm-radar-ring"
+              style={{ animationDelay: "1260ms" }}
+            />
+          </g>
+        )}
+
+        {/* Ambient track + inner guide */}
+        <path
+          d={REACTOR_TRACK_PATH}
+          fill="none"
+          strokeWidth="10"
+          strokeLinecap="round"
+          className="stroke-line/80"
+        />
+        <path
+          d={REACTOR_INNER_ARC}
+          fill="none"
+          strokeWidth="1"
+          className="stroke-line-strong/50"
+          strokeDasharray="1.5 6"
+        />
+
+        {/* Non-linear perceptual ticks */}
+        {REACTOR_TICKS.map((t) => {
+          const deg = REACTOR_START + mbpsToReactorNorm(t.mbps) * REACTOR_SWEEP;
+          const [x1, y1] = reactorPolar(deg, REACTOR_R - 11);
+          const [x2, y2] = reactorPolar(deg, REACTOR_R - 17);
+          const [lx, ly] = reactorPolar(deg, REACTOR_R + 13);
+          return (
+            <g key={t.mbps}>
+              <line
+                x1={x1}
+                y1={y1}
+                x2={x2}
+                y2={y2}
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                className="stroke-line-strong"
+              />
+              <text
+                x={lx}
+                y={ly}
+                textAnchor="middle"
+                dominantBaseline="central"
+                className="fill-muted font-mono text-[8.5px] font-semibold"
+              >
+                {t.label}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Plasma glow arc (mutated at 60/120fps via useSpringRef) */}
+        <path
+          ref={arcGlowRef}
+          d={REACTOR_TRACK_PATH}
+          fill="none"
+          stroke={`url(#${gradId})`}
+          strokeWidth="12"
+          strokeLinecap="round"
+          strokeDasharray={REACTOR_ARC_LEN}
+          strokeDashoffset={initOffset}
+          opacity={initVis ? (isSettled ? 0.34 : 0.62) : 0}
+          filter={`url(#reactor-glow-${gid})`}
+        />
+        <path
+          ref={arcRef}
+          d={REACTOR_TRACK_PATH}
+          fill="none"
+          stroke={`url(#${gradId})`}
+          strokeWidth="9.5"
+          strokeLinecap="round"
+          strokeDasharray={REACTOR_ARC_LEN}
+          strokeDashoffset={initOffset}
+          opacity={initVis}
+        />
+
+        {/* Glowing needle & tip orb (mutated directly via refs) */}
+        <line
+          ref={needleRef}
+          x1={initNx1}
+          y1={initNy1}
+          x2={initNx2}
+          y2={initNy2}
+          stroke={accentColor}
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          opacity={initVis}
+        />
+        <circle
+          ref={tipHaloRef}
+          cx={initTx}
+          cy={initTy}
+          r="9"
+          fill={accentColor}
+          opacity={initVis ? (isSettled ? 0.28 : 0.55) : 0}
+          filter={`url(#reactor-glow-${gid})`}
+        />
+        <circle
+          ref={tipRef}
+          cx={initTx}
+          cy={initTy}
+          r="4.2"
+          fill="#ffffff"
+          stroke={accentColor}
+          strokeWidth="2.2"
+          opacity={initVis}
+        />
+      </svg>
+
+      {/* Center glass readout */}
+      <div className="pointer-events-none absolute inset-x-0 top-[46px] flex flex-col items-center text-center">
+        <span
+          className={cn(
+            "text-[9.5px] font-bold tracking-[0.16em] uppercase",
+            isDownload ? "text-jade-ink" : isUpload ? "text-berry-ink" : isPing ? "text-ember-ink" : "text-muted"
+          )}
+        >
+          {phaseEyebrow}
+        </span>
+        {isPing ? (
+          <>
+            <div className="mt-1 qm-display text-[2rem] font-semibold leading-none text-ink qm-tabular">
+              <RollingNumber value={livePingVal} decimals={1} fallback="…" stiffness={200} damping={26} />
+            </div>
+            <span className="mt-0.5 text-[10.5px] font-semibold text-muted">ms ping</span>
+          </>
+        ) : (
+          <>
+            <div className="mt-1 qm-display text-[2.05rem] font-semibold leading-none text-ink qm-tabular">
+              <RollingNumber
+                value={liveSpeedVal}
+                decimals={speedDecimals}
+                fallback={running ? "0.0" : "--"}
+                stiffness={running ? 190 : 140}
+                damping={26}
+              />
+            </div>
+            <span className="mt-0.5 text-[10.5px] font-semibold text-muted">Mbps</span>
+          </>
+        )}
+      </div>
+
+      {/* Bottom reactor slot: Bufferbloat Grade badge with spring-pop animation when settled */}
+      <div className="relative -mt-4 flex min-h-[26px] items-center justify-center">
+        {isSettled && grade && grade !== "--" ? (
+          <span
+            key={gradeKey}
+            className={cn(
+              "qm-grade-slam inline-flex items-center gap-1.5 rounded-full border border-line/80 px-2.5 py-0.5 text-[11px] font-bold shadow-sm",
+              TONE_SOFT[gm.tone],
+              TONE_INK[gm.tone]
+            )}
+          >
+            <span className="text-[9.5px] uppercase tracking-wider opacity-80">Grade</span>
+            <span className="qm-display text-[13px] leading-none">{grade}</span>
+          </span>
+        ) : running ? (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-sunk/80 px-2.5 py-0.5 text-[10.5px] font-semibold text-ink-2">
+            <span className={cn("h-1.5 w-1.5 rounded-full qm-live-dot", isUpload ? "bg-berry" : "bg-jade")} />
+            {isPing ? "Probing latency" : isDownload ? "8-stream DL" : "8-stream UL"}
+          </span>
+        ) : (
+          <span className="text-[10.5px] font-medium text-muted">Ready · 0–1.5G+</span>
+        )}
+      </div>
+    </div>
+  );
+});
 
 function GradeChip({ grade, className }: { grade: string; className?: string }) {
   const m = gradeMeta(grade);
@@ -33,7 +439,9 @@ function GradeChip({ grade, className }: { grade: string; className?: string }) 
   );
 }
 
-function Numeral({ label, dot, value }: { label: string; dot: string; value: string }) {
+function Numeral({ label, dot, value }: { label: string; dot: string; value: number | null | undefined }) {
+  const numeric = value != null && Number.isFinite(value) && value > 0 ? value : null;
+  const decimals = numeric != null && numeric >= 100 ? 0 : 1;
   return (
     <div className="min-w-0">
       <div className="flex items-center gap-2 text-[12.5px] font-semibold text-muted">
@@ -41,8 +449,8 @@ function Numeral({ label, dot, value }: { label: string; dot: string; value: str
         {label}
       </div>
       <div className="mt-1 flex items-baseline gap-2 min-w-0">
-        <span className="qm-display qm-tabular font-semibold leading-[0.9] text-ink text-[3.1rem] sm:text-[4.4rem] lg:text-[5rem]">
-          {value}
+        <span className="qm-display qm-tabular font-semibold leading-[0.9] text-ink text-[2.65rem] sm:text-[3.5rem] xl:text-[4.25rem]">
+          <RollingNumber value={numeric} decimals={decimals} fallback="--" stiffness={190} damping={26} />
         </span>
         <span className="text-[13px] sm:text-[15px] font-semibold text-muted">Mbps</span>
       </div>
@@ -174,6 +582,19 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
     void refreshSpeedtestHistory();
   }, [refreshSpeedtestHistory]);
 
+  // Play HUD success triad once when a live run transitions from running -> complete
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    if (speedtest.running) {
+      wasRunningRef.current = true;
+    } else if (wasRunningRef.current && speedtest.phase === "complete") {
+      wasRunningRef.current = false;
+      playHudSuccess();
+    } else if (!speedtest.running && speedtest.phase !== "complete") {
+      wasRunningRef.current = false;
+    }
+  }, [speedtest.running, speedtest.phase]);
+
   async function startSpeedtestRun() {
     setBusy("speedtest");
     try {
@@ -267,13 +688,31 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [speedtestHistory]);
 
+  const latestPhaseSampleMbps = useMemo(() => {
+    for (let i = liveSamples.length - 1; i >= 0; i--) {
+      const s = liveSamples[i];
+      if (s.phase === speedtest.phase && Number.isFinite(s.mbps)) return s.mbps;
+    }
+    return null;
+  }, [liveSamples, speedtest.phase]);
+
+  const reactorMbps = speedtest.running
+    ? speedtest.phase === "download"
+      ? (speedtest.downloadMbps && speedtest.downloadMbps > 0 ? speedtest.downloadMbps : latestPhaseSampleMbps)
+      : speedtest.phase === "upload"
+        ? (speedtest.uploadMbps && speedtest.uploadMbps > 0 ? speedtest.uploadMbps : latestPhaseSampleMbps)
+        : 0
+    : activeRunDisplay?.downloadMbps ?? null;
+
+  const gradeKey = String(activeRunDisplay?.id ?? speedtest.phase);
+
   return (
     <>
       {header()}
 
-      {/* ── Hero: run + headline numbers + bufferbloat verdict ── */}
-      <Card className="qm-grain overflow-hidden p-0 sm:p-0">
-        <div className="relative z-[1] grid lg:grid-cols-12">
+      {/* ── Hero: run + warp-core reactor + headline numbers + bufferbloat verdict ── */}
+      <Card className="qm-hud-card qm-reticle overflow-hidden p-0 sm:p-0">
+        <div className="qm-grain relative z-[1] grid lg:grid-cols-12">
           <div className="lg:col-span-8 p-5 sm:p-7 space-y-6 min-w-0">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-[12.5px] font-semibold text-ink-2">
@@ -288,42 +727,55 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-4 sm:gap-8">
-              <Numeral label="Download" dot="bg-ember" value={fmtMbps(activeRunDisplay?.downloadMbps)} />
-              <Numeral label="Upload" dot="bg-berry" value={fmtMbps(activeRunDisplay?.uploadMbps)} />
-            </div>
+            <div className="flex flex-col md:flex-row md:items-center gap-6">
+              <SpeedtestReactorGauge
+                phase={speedtest.phase}
+                running={speedtest.running}
+                mbps={reactorMbps}
+                pingMs={activeRunDisplay?.pingMs ?? null}
+                grade={speedtest.running && !speedtest.bufferbloatGrade ? "--" : grade}
+                gradeKey={gradeKey}
+              />
 
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-[13px] text-ink-2 qm-tabular">
-              <span>
-                <span className="text-muted">Idle ping </span>
-                <b className="text-ink">{activeRunDisplay?.pingMs ? `${activeRunDisplay.pingMs} ms` : "--"}</b>
-              </span>
-              <span>
-                <span className="text-muted">Jitter </span>
-                <b className="text-ink">{activeRunDisplay?.jitterMs ? `${activeRunDisplay.jitterMs} ms` : "--"}</b>
-              </span>
-              {activeRunDisplay?.packetLoss != null && (
-                <span>
-                  <span className="text-muted">Loss </span>
-                  <b className="text-ink">{activeRunDisplay.packetLoss}%</b>
-                </span>
-              )}
-              {activeRunDisplay?.isp && (
-                <span>
-                  <span className="text-muted">ISP </span>
-                  <b className="text-ink">{activeRunDisplay.isp}</b>
-                </span>
-              )}
-            </div>
-
-            {(() => {
-              const latestRf = !isLive ? getRunRf(activeRunDisplay) : null;
-              return latestRf ? (
-                <div className="flex flex-wrap items-center gap-2">
-                  <RfSnapshotPill rf={latestRf} />
+              <div className="min-w-0 flex-1 space-y-4">
+                <div className="grid grid-cols-2 gap-4 sm:gap-6">
+                  <Numeral label="Download" dot="bg-ember" value={activeRunDisplay?.downloadMbps} />
+                  <Numeral label="Upload" dot="bg-berry" value={activeRunDisplay?.uploadMbps} />
                 </div>
-              ) : null;
-            })()}
+
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[13px] text-ink-2 qm-tabular">
+                  <span>
+                    <span className="text-muted">Idle ping </span>
+                    <b className="text-ink">{activeRunDisplay?.pingMs ? `${activeRunDisplay.pingMs} ms` : "--"}</b>
+                  </span>
+                  <span>
+                    <span className="text-muted">Jitter </span>
+                    <b className="text-ink">{activeRunDisplay?.jitterMs ? `${activeRunDisplay.jitterMs} ms` : "--"}</b>
+                  </span>
+                  {activeRunDisplay?.packetLoss != null && (
+                    <span>
+                      <span className="text-muted">Loss </span>
+                      <b className="text-ink">{activeRunDisplay.packetLoss}%</b>
+                    </span>
+                  )}
+                  {activeRunDisplay?.isp && (
+                    <span>
+                      <span className="text-muted">ISP </span>
+                      <b className="text-ink">{activeRunDisplay.isp}</b>
+                    </span>
+                  )}
+                </div>
+
+                {(() => {
+                  const latestRf = !isLive ? getRunRf(activeRunDisplay) : null;
+                  return latestRf ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <RfSnapshotPill rf={latestRf} />
+                    </div>
+                  ) : null;
+                })()}
+              </div>
+            </div>
 
             {/* Phase stepper */}
             <div className="space-y-2.5">
@@ -345,7 +797,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                   );
                 })}
               </ol>
-              <Meter pct={speedtest.progress} tone="sun" />
+              <Meter pct={speedtest.progress} tone="sun" className={speedtest.running ? "qm-energy-shimmer" : undefined} />
             </div>
 
             {speedtest.error && (
@@ -366,7 +818,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                   <Button
                     variant="danger"
                     size="lg"
-                    className="h-12 sm:min-w-[220px]"
+                    className="h-12 sm:min-w-[220px] qm-spring-press"
                     onClick={stopSpeedtestRun}
                     disabled={busy === "speedtest-stop"}
                   >
@@ -377,7 +829,7 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
                   <Button
                     variant="tier1"
                     size="lg"
-                    className="h-12 sm:min-w-[220px] text-[15px]"
+                    className="h-12 sm:min-w-[220px] text-[15px] qm-spring-press"
                     onClick={startSpeedtestRun}
                     disabled={busy === "speedtest"}
                   >
@@ -393,8 +845,10 @@ export function SpeedtestView({ header }: { header: HeaderFn }) {
           <div className="lg:col-span-4 border-t lg:border-t-0 lg:border-l border-line bg-sunk/70 p-6 sm:p-7 flex flex-col items-center justify-center text-center gap-4">
             <div className="qm-eyebrow">Bufferbloat grade</div>
             <div
+              key={`${gradeKey}-${grade}`}
               className={cn(
                 "flex h-36 w-36 sm:h-40 sm:w-40 items-center justify-center rounded-full ring-[10px]",
+                !speedtest.running && grade !== "--" && "qm-grade-slam",
                 TONE_SOFT[gm.tone],
                 gm.tone === "jade" ? "ring-jade/15" : gm.tone === "saffron" ? "ring-saffron/15" : gm.tone === "crimson" ? "ring-crimson/15" : "ring-line/60"
               )}

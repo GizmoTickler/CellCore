@@ -1,13 +1,16 @@
-import { useState } from "react";
+import React, { useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Cpu, Gauge, Network, RefreshCw, Server, ShieldCheck } from "lucide-react";
+import { ArrowDown, ArrowUp, Cloud, Cpu, Gauge, Network, Radio, RefreshCw, Server, ShieldCheck } from "lucide-react";
 import { apiFetch } from "../../lib/api";
 import { disruptiveFetch, isCancelled } from "../../lib/disruptive";
 import { resetAll, useDraft } from "../../lib/draft";
+import { RollingNumber, useEffectiveMotion } from "../../lib/motion";
 import { cn, formatBytes } from "../../lib/utils";
 import { Badge, Button, Card, CardHeader, Input, LiveDot, Select, Skeleton, Switch } from "../../components/ui";
 import { FailoverWarning } from "../../components/obs";
+import { useObsStore } from "../../stores/obs-store";
 import { useToastStore } from "../../stores/toast-store";
+import { useWsStore } from "../../stores/ws-store";
 import { LoadError, Notice, errText, useGuarded } from "../admin/shared";
 import { Fact } from "./VpnParts";
 
@@ -231,6 +234,337 @@ function verdict(s: DataplaneStatusResp["snapshot"]) {
   };
 }
 
+function splitBitrate(bps: number | null | undefined): { value: number; decimals: number; unit: string } {
+  const v = bps != null && Number.isFinite(bps) && bps > 0 ? bps : 0;
+  if (v >= 1_000_000_000) return { value: v / 1_000_000_000, decimals: 2, unit: "Gbps" };
+  if (v >= 100_000_000) return { value: v / 1_000_000, decimals: 0, unit: "Mbps" };
+  if (v >= 1_000_000) return { value: v / 1_000_000, decimals: 1, unit: "Mbps" };
+  if (v >= 1_000) return { value: v / 1_000, decimals: 0, unit: "Kbps" };
+  return { value: Math.round(v), decimals: 0, unit: "bps" };
+}
+
+const ConduitStream = React.memo(function ConduitStream({
+  color,
+  durationSec,
+  animate,
+  label,
+}: {
+  color: string;
+  durationSec: number;
+  animate: boolean;
+  label?: React.ReactNode;
+}) {
+  const gid = useId().replace(/:/g, "");
+  return (
+    <div className="flex flex-col items-center justify-center gap-1 py-1 md:py-0 min-w-0">
+      <svg
+        viewBox="0 0 120 26"
+        preserveAspectRatio="none"
+        className="h-6 w-full max-w-[180px] md:max-w-none overflow-visible"
+        aria-hidden
+      >
+        <defs>
+          <filter id={`conduit-glow-${gid}`} x="-15%" y="-80%" width="130%" height="260%">
+            <feGaussianBlur stdDeviation="2.2" />
+          </filter>
+        </defs>
+        {/* Base conduit rail */}
+        <line x1="2" y1="9" x2="118" y2="9" className="stroke-line" strokeWidth="1.5" strokeLinecap="round" />
+        <line x1="2" y1="17" x2="118" y2="17" className="stroke-line" strokeWidth="1.5" strokeLinecap="round" />
+
+        {/* Glow underlay */}
+        <line
+          x1="2"
+          y1="9"
+          x2="118"
+          y2="9"
+          stroke={color}
+          strokeWidth="3"
+          strokeDasharray="10 14"
+          strokeLinecap="round"
+          opacity={animate ? "0.42" : "0.18"}
+          filter={`url(#conduit-glow-${gid})`}
+          className={animate ? "qm-flow-dash" : undefined}
+          style={animate ? { animationDuration: `${durationSec}s` } : undefined}
+        />
+
+        {/* Forward DL light stream (left → right) */}
+        <line
+          x1="2"
+          y1="9"
+          x2="118"
+          y2="9"
+          stroke={color}
+          strokeWidth="2"
+          strokeDasharray="10 14"
+          strokeLinecap="round"
+          opacity={animate ? "0.95" : "0.35"}
+          className={animate ? "qm-flow-dash" : undefined}
+          style={animate ? { animationDuration: `${durationSec}s` } : undefined}
+        />
+
+        {/* Reverse UL light stream (right → left) */}
+        <line
+          x1="2"
+          y1="17"
+          x2="118"
+          y2="17"
+          stroke={color}
+          strokeWidth="1.6"
+          strokeDasharray="6 18"
+          strokeLinecap="round"
+          opacity={animate ? "0.75" : "0.28"}
+          className={animate ? "qm-flow-dash" : undefined}
+          style={animate ? { animationDuration: `${(durationSec * 1.18).toFixed(2)}s`, animationDirection: "reverse" } : undefined}
+        />
+
+        {/* Endpoint chevrons */}
+        <path d="M 113 6 L 118 9 L 113 12" fill="none" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" opacity="0.85" />
+        <path d="M 7 14 L 2 17 L 7 20" fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" opacity="0.65" />
+      </svg>
+      {label && <div className="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-0.5 text-[11px] font-mono qm-tabular">{label}</div>}
+    </div>
+  );
+});
+
+const PacketFlowConduit = React.memo(function PacketFlowConduit({
+  config,
+  snapshot: s,
+}: {
+  config: DataplaneStatusResp["config"];
+  snapshot: DataplaneStatusResp["snapshot"];
+}) {
+  const traffic = useWsStore((st) => st.traffic);
+  const modem = useWsStore((st) => st.modem);
+  const internals = useWsStore((st) => st.internals);
+  const failoverActive = useObsStore((st) => Boolean(st.failover?.active));
+  const motion = useEffectiveMotion();
+
+  const managedLink =
+    s.links.find((l) => l.name === config.iface) ??
+    s.links.find((l) => /^rmnet_data\d+$/.test(l.name) && l.up) ??
+    null;
+
+  const managedAddrs = managedLink ? s.addrs.filter((a) => a.ifindex === managedLink.ifindex) : [];
+  const hasLinkV4 = managedAddrs.some((a) => a.family === 2 && a.scope < 254);
+  const hasLinkV6 = managedAddrs.some((a) => a.family === 10 && a.scope === 0);
+
+  const wdsV4Connected =
+    s.wdsV4.state.toLowerCase() === "connected" ||
+    s.wdsV4.pktStatus?.status?.toLowerCase() === "connected";
+  const wdsV6Connected =
+    s.wdsV6.state.toLowerCase() === "connected" ||
+    s.wdsV6.pktStatus?.status?.toLowerCase() === "connected";
+
+  const v4Usable =
+    wdsV4Connected ||
+    Boolean(s.wdsV4.runtime?.ipv4Addr) ||
+    hasLinkV4 ||
+    Boolean(modem?.bearers.some((b) => Boolean(b.ipv4)));
+  const v6Usable =
+    wdsV6Connected ||
+    Boolean(s.wdsV6.runtime?.ipv6Addr) ||
+    hasLinkV6 ||
+    Boolean(modem?.bearers.some((b) => Boolean(b.ipv6)));
+
+  const linkDown =
+    !s.qrtr.available ||
+    (s.nasSys != null && !s.nasSys.registered) ||
+    (managedLink != null && !managedLink.up) ||
+    (!v4Usable && !v6Usable && config.mode === "native" && s.supervisorState !== "native-connected");
+
+  const conduitColor = linkDown
+    ? "var(--qm-crimson)"
+    : failoverActive
+      ? "var(--qm-saffron)"
+      : "var(--qm-jade)";
+  const conduitTone: "crimson" | "saffron" | "jade" = linkDown
+    ? "crimson"
+    : failoverActive
+      ? "saffron"
+      : "jade";
+
+  const totalMbps = (traffic.rxBps + traffic.txBps) / 1_000_000;
+  const flowIntensity = Math.max(0, Math.min(1, Math.pow(Math.max(0, totalMbps) / 400, 0.42)));
+  const durationSec = Number((2.6 - flowIntensity * (2.6 - 0.45)).toFixed(2));
+  const animateFlow = motion !== "reduced" && !linkDown;
+
+  const rat = modem?.serving?.rat || s.nasSys?.rat || "Cellular";
+  const band = modem?.serving?.band || (s.nasSys?.nr5gPsAttached ? "NR5G" : "—");
+  const caCount = modem?.carriers?.length ?? 0;
+  const rsrp = modem?.serving?.rsrp ?? s.nasSignal?.nr5gRsrpDbm ?? s.nasSignal?.lteRsrpDbm ?? null;
+  const sinr = modem?.serving?.sinr ?? s.nasSignal?.nr5gSnrDb ?? null;
+
+  const modeLabel = config.mode === "native" ? "Native QMI" : "Vendor";
+  const ifaceLabel = config.iface || traffic.primaryIface || "rmnet_data0";
+  const ipaActive = s.kernel.ipaDevPresent && s.kernel.ipacmRunning;
+  const ipaHw = s.kernel.ipaOffload.hwType ? `IPAv${s.kernel.ipaOffload.hwType}` : "IPA";
+  const ipaPct = s.kernel.ipaOffload.ethHardwareOffloadPct;
+
+  const lanIface = traffic.lanIface || "eth0";
+  const ethSpeed = internals?.ethSpeed?.trim() || "";
+  const cfRunning = Boolean(internals?.cloudflaredRunning);
+  const cfHa = internals?.cloudflaredHaConnections ?? null;
+
+  const rxRate = splitBitrate(traffic.rxBps);
+  const txRate = splitBitrate(traffic.txBps);
+
+  return (
+    <Card className="lg:col-span-12 qm-hud-card qm-reticle p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3.5">
+        <div className="flex items-center gap-2">
+          <LiveDot tone={conduitTone} />
+          <span className="qm-eyebrow">Live Packet-Flow Conduit</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold">
+          {failoverActive && (
+            <Badge variant="warning" dot>
+              Failover active
+            </Badge>
+          )}
+          <Badge variant={linkDown ? "danger" : failoverActive ? "warning" : "success"}>
+            {linkDown ? "Link down" : failoverActive ? "Carrying failover" : totalMbps >= 10 ? "High-speed flow" : "Conduit nominal"}
+          </Badge>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(76px,0.52fr)_minmax(0,1.2fr)_minmax(108px,0.72fr)_minmax(0,1fr)] items-center gap-2.5 md:gap-3">
+        {/* Node 1: 5G RF Link */}
+        <div className="qm-subcard p-3 sm:p-3.5 space-y-1.5 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-muted">
+              <Radio className="h-3.5 w-3.5 text-ember-ink shrink-0" />
+              5G RF Link
+            </span>
+            <LiveDot tone={conduitTone} className="h-1.5 w-1.5" />
+          </div>
+          <div className="qm-display text-[1.02rem] font-semibold text-ink truncate">
+            {rat} · {band}
+            {caCount > 0 ? ` · ${caCount}CA` : ""}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono qm-tabular text-muted">
+            <span>{rsrp != null ? `${rsrp} dBm` : "— dBm"}</span>
+            {sinr != null && <span>· SINR {sinr} dB</span>}
+          </div>
+        </div>
+
+        {/* Conduit 1: RF → Modem */}
+        <ConduitStream
+          color={conduitColor}
+          durationSec={durationSec}
+          animate={animateFlow}
+          label={
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">
+              {linkDown ? "No RF" : "RF ⇄ DSP"}
+            </span>
+          }
+        />
+
+        {/* Node 2: SDX75 Engine */}
+        <div className="qm-subcard p-3 sm:p-3.5 space-y-2 min-w-0 border-ember/25">
+          <div className="flex items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-muted">
+              <Cpu className="h-3.5 w-3.5 text-ember-ink shrink-0" />
+              SDX75 Engine
+            </span>
+            <span className="font-mono text-[11px] font-semibold text-ink-2 truncate">{ifaceLabel}</span>
+          </div>
+          <div className="qm-display text-[1.02rem] font-semibold text-ink truncate">
+            {modeLabel}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-bold qm-tabular",
+                v4Usable ? "bg-jade-soft text-jade-ink" : "bg-sunk text-muted border border-line"
+              )}
+              title={wdsV4Connected ? "QMI WDS IPv4 connected" : v4Usable ? "IPv4 address active" : "IPv4 inactive"}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", v4Usable ? "bg-jade" : "bg-muted/60")} />
+              v4
+            </span>
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-bold qm-tabular",
+                v6Usable ? "bg-jade-soft text-jade-ink" : "bg-sunk text-muted border border-line"
+              )}
+              title={wdsV6Connected ? "QMI WDS IPv6 connected" : v6Usable ? "IPv6 address active" : "IPv6 inactive"}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", v6Usable ? "bg-jade" : "bg-muted/60")} />
+              v6
+            </span>
+            <Badge variant={ipaActive ? "success" : "warning"} className="text-[10.5px] px-2 py-0">
+              {ipaHw}
+              {ipaActive && ipaPct != null ? ` ${ipaPct}%` : ipaActive ? " HW" : " off"}
+            </Badge>
+          </div>
+        </div>
+
+        {/* Conduit 2: Modem → LAN with live rolling throughput */}
+        <ConduitStream
+          color={conduitColor}
+          durationSec={durationSec}
+          animate={animateFlow}
+          label={
+            <>
+              <span className="inline-flex items-center gap-0.5 font-semibold text-jade-ink">
+                <ArrowDown className="h-3 w-3" />
+                <RollingNumber
+                  value={rxRate.value}
+                  decimals={rxRate.decimals}
+                  suffix={` ${rxRate.unit}`}
+                  stiffness={180}
+                  damping={26}
+                />
+              </span>
+              <span className="inline-flex items-center gap-0.5 font-semibold text-berry-ink">
+                <ArrowUp className="h-3 w-3" />
+                <RollingNumber
+                  value={txRate.value}
+                  decimals={txRate.decimals}
+                  suffix={` ${txRate.unit}`}
+                  stiffness={180}
+                  damping={26}
+                />
+              </span>
+            </>
+          }
+        />
+
+        {/* Node 3: LAN / Egress */}
+        <div className="qm-subcard p-3 sm:p-3.5 space-y-2 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-muted">
+              <Network className="h-3.5 w-3.5 text-ember-ink shrink-0" />
+              LAN / Egress
+            </span>
+            <LiveDot tone={traffic.lanState?.toLowerCase() === "down" ? "crimson" : "jade"} className="h-1.5 w-1.5" />
+          </div>
+          <div className="qm-display text-[1.02rem] font-semibold text-ink truncate">
+            {lanIface}
+            {ethSpeed ? ` · ${ethSpeed}` : ""}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {cfRunning ? (
+              <Badge variant="info" dot className="text-[10.5px] px-2 py-0">
+                <Cloud className="h-2.5 w-2.5" />
+                Cloudflared{cfHa != null ? ` · ${cfHa} HA` : ""}
+              </Badge>
+            ) : (
+              <span className="text-[11px] text-muted">Direct LAN egress</span>
+            )}
+            {s.ipaIpptActive && (
+              <Badge variant="plum" className="text-[10.5px] px-2 py-0">
+                IPPT
+              </Badge>
+            )}
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+});
+
 export function DataPlaneView() {
   const toast = useToastStore((s) => s.push);
   const qc = useQueryClient();
@@ -398,6 +732,8 @@ export function DataPlaneView() {
 
   return (
     <div className="grid gap-5 lg:grid-cols-12">
+      <PacketFlowConduit config={config} snapshot={s} />
+
       <div className="lg:col-span-7 min-w-0 space-y-5">
         <Card className="space-y-5">
           <CardHeader

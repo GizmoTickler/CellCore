@@ -1,6 +1,8 @@
-import React, { useEffect, useId, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, Copy, X } from "lucide-react";
+import { playHudNav, playHudTick, triggerHaptic } from "../lib/hud-fx";
+import { RollingNumber, usePointerGlow, useSpringPill, useSpringRef } from "../lib/motion";
 import { cn, copyToClipboard } from "../lib/utils";
 import { sectionFor, subFor } from "../lib/nav";
 import { hrefFor, type Section } from "../stores/route-store";
@@ -57,8 +59,10 @@ export function BrandLogo({ compact = false, subtitle }: { compact?: boolean; su
 /* ───────────────────────── Layout ───────────────────────── */
 
 export function Card({ children, className, ...rest }: React.HTMLAttributes<HTMLDivElement>) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  usePointerGlow(cardRef);
   return (
-    <div className={cn("qm-card p-[var(--qm-pad)] transition-colors", className)} {...rest}>
+    <div ref={cardRef} className={cn("qm-card qm-hud-card p-[var(--qm-pad)] transition-colors", className)} {...rest}>
       {children}
     </div>
   );
@@ -117,6 +121,12 @@ export function PageHeader({
   const sec = sectionFor(section);
   const active = sec.subs.length ? subFor(section, sub ?? null) : null;
   const activeChipRef = useRef<HTMLAnchorElement>(null);
+  const subNavRef = useRef<HTMLDivElement>(null);
+  const { style: pillStyle, ready: pillReady, pillRef } = useSpringPill(
+    subNavRef,
+    '[aria-current="page"], [data-active="true"]',
+    [sub, sec.route]
+  );
 
   useEffect(() => {
     activeChipRef.current?.scrollIntoView?.({ inline: "center", block: "nearest", behavior: "smooth" });
@@ -139,7 +149,13 @@ export function PageHeader({
       </div>
       {sec.subs.length > 0 && (
         <nav className="qm-subchips -mx-4 px-4 overflow-x-auto" aria-label={`${sec.label} sections`}>
-          <div className="flex gap-1.5 w-max">
+          <div ref={subNavRef} className="relative flex gap-1.5 w-max py-0.5">
+            <span
+              ref={pillRef}
+              aria-hidden
+              className="qm-glass-pill pointer-events-none absolute left-0 top-0 rounded-full"
+              style={pillStyle}
+            />
             {sec.subs.map((s) => {
               const on = s.id === active?.id;
               return (
@@ -147,17 +163,22 @@ export function PageHeader({
                   key={s.id}
                   ref={on ? activeChipRef : undefined}
                   href={hrefFor(section, s.id)}
+                  data-active={on ? "true" : undefined}
+                  aria-current={on ? "page" : undefined}
                   onClick={(e) => {
+                    if (!on) playHudNav();
                     if (onSubChange) {
                       e.preventDefault();
                       onSubChange(s.id);
                     }
                   }}
                   className={cn(
-                    "rounded-full border px-3.5 py-1.5 text-[12.5px] font-semibold whitespace-nowrap transition",
+                    "relative z-[1] rounded-full border px-3.5 py-1.5 text-[12.5px] font-semibold whitespace-nowrap transition-colors",
                     on
-                      ? "border-transparent bg-ink text-paper"
-                      : "border-line bg-surface text-ink-2 hover:border-line-strong"
+                      ? pillReady
+                        ? "border-transparent text-ink"
+                        : "border-transparent bg-ink text-paper"
+                      : "border-line bg-surface/65 text-ink-2 hover:border-line-strong hover:text-ink"
                   )}
                 >
                   {s.label}
@@ -257,13 +278,24 @@ export function Button({
   size = "md",
   className,
   type = "button",
+  onClick,
+  disabled,
   ...rest
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant; size?: ButtonSize }) {
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (!disabled) {
+      playHudTick();
+      triggerHaptic(6);
+    }
+    onClick?.(e);
+  };
   return (
     <button
       type={type}
+      disabled={disabled}
+      onClick={handleClick}
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 font-semibold transition-all cursor-pointer select-none disabled:opacity-45 disabled:cursor-not-allowed whitespace-nowrap active:translate-y-px",
+        "qm-spring-press inline-flex items-center justify-center gap-1.5 font-semibold transition-all cursor-pointer select-none disabled:opacity-45 disabled:cursor-not-allowed whitespace-nowrap",
         BTN[variant],
         BTN_SIZE[size],
         className
@@ -329,12 +361,15 @@ export function Meter({
   tone = "ember",
   className,
   thin = false,
+  shimmer = false,
 }: {
   pct: number;
   tone?: "ember" | "sun" | "jade" | "saffron" | "crimson" | "berry" | "muted";
   className?: string;
   thin?: boolean;
+  shimmer?: boolean;
 }) {
+  const clamped = Math.max(0, Math.min(100, pct));
   const fill = {
     ember: "bg-ember",
     sun: "qm-sun",
@@ -347,8 +382,12 @@ export function Meter({
   return (
     <div className={cn("rounded-full bg-line/80 overflow-hidden", thin ? "h-1.5" : "h-2.5", className)}>
       <div
-        className={cn("h-full rounded-full transition-[width] duration-500 ease-out", fill)}
-        style={{ width: `${Math.max(0, Math.min(100, pct))}%` }}
+        className={cn(
+          "h-full rounded-full transition-[width] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
+          fill,
+          shimmer && clamped > 0 && "qm-energy-shimmer"
+        )}
+        style={{ width: `${clamped}%` }}
       />
     </div>
   );
@@ -535,8 +574,12 @@ export function signalQuality(rsrp: number | null | undefined, sinr?: number | n
 }
 
 /**
- * The hero dial: a 260° arc filled with the sunset gradient, tick marks every 5 dB,
- * and the value set in the display face. Used on Now and the login preview.
+ * Futuristic Glass Multi-Ring Telemetry Core:
+ * - Outer 260° RSRP plasma arc + bloom + glowing orb knob driven via `useSpringRef`
+ * - Optional translucent peak-hold reticle tick on the outer ring
+ * - Middle concentric SINR energy ring (`r = 64`, -5..30 dB) driven via `useSpringRef`
+ * - Inner frosted translucent glass core ring (`r = 52`) with subtle `.qm-beacon-pulse`
+ * - Hero `RollingNumber` readout for smooth 60/120fps dBm gliding
  */
 export function SignalDial({
   value,
@@ -546,6 +589,10 @@ export function SignalDial({
   caption,
   size = 220,
   onDark = false,
+  sinr,
+  peakValue,
+  activityPct = 0,
+  live = true,
 }: {
   value: number | null;
   min?: number;
@@ -554,14 +601,24 @@ export function SignalDial({
   caption?: React.ReactNode;
   size?: number;
   onDark?: boolean;
+  sinr?: number | null;
+  peakValue?: number | null;
+  activityPct?: number;
+  live?: boolean;
 }) {
   const gid = useId().replace(/:/g, "");
   const shown = value;
   const sweep = 260;
-  const start = 90 + (360 - sweep) / 2; // degrees, SVG 0° = east, clockwise
+  const start = 90 + (360 - sweep) / 2; // 140°, SVG 0° = east, clockwise
   const r = 84;
+  const sinrR = 64;
+  const coreR = 52;
   const c = 100;
-  const frac = shown == null ? 0 : Math.max(0.02, Math.min(1, (shown - min) / (max - min)));
+  const outerLen = (sweep / 360) * 2 * Math.PI * r;
+  const sinrLen = (sweep / 360) * 2 * Math.PI * sinrR;
+  const sinrMin = -5;
+  const sinrMax = 30;
+
   const polar = (deg: number, rad: number) => {
     const a = (deg * Math.PI) / 180;
     return [c + rad * Math.cos(a), c + rad * Math.sin(a)] as const;
@@ -572,14 +629,94 @@ export function SignalDial({
     const large = to - from > 180 ? 1 : 0;
     return `M ${x1} ${y1} A ${rad} ${rad} 0 ${large} 1 ${x2} ${y2}`;
   };
-  const end = start + sweep * frac;
-  const [kx, ky] = polar(end, r);
+
+  const outerFullArc = arc(start, start + sweep, r);
+  const sinrFullArc = arc(start, start + sweep, sinrR);
+
+  const rsrpArcRef = useRef<SVGPathElement>(null);
+  const rsrpGlowRef = useRef<SVGPathElement>(null);
+  const knobRef = useRef<SVGCircleElement>(null);
+  const knobHaloRef = useRef<SVGCircleElement>(null);
+  const sinrArcRef = useRef<SVGPathElement>(null);
+  const sinrGlowRef = useRef<SVGPathElement>(null);
+
+  // Freeze initial SVG attributes so React never overwrites ref-driven spring frames on re-render
+  const initGeomRef = useRef<{
+    rsrpOffset: string;
+    kx: string;
+    ky: string;
+    sinrOffset: string;
+  } | null>(null);
+  if (!initGeomRef.current) {
+    const initRsrpFrac =
+      shown == null ? 0.02 : Math.max(0.02, Math.min(1, (shown - min) / (max - min)));
+    const [ikx, iky] = polar(start + sweep * initRsrpFrac, r);
+    const initSinrFrac =
+      sinr == null ? 0.02 : Math.max(0.02, Math.min(1, (sinr - sinrMin) / (sinrMax - sinrMin)));
+    initGeomRef.current = {
+      rsrpOffset: (outerLen * (1 - initRsrpFrac)).toFixed(2),
+      kx: ikx.toFixed(2),
+      ky: iky.toFixed(2),
+      sinrOffset: (sinrLen * (1 - initSinrFrac)).toFixed(2),
+    };
+  }
+
+  const applyRsrp = useCallback(
+    (v: number) => {
+      const f = Math.max(0.02, Math.min(1, (v - min) / (max - min)));
+      const offset = (outerLen * (1 - f)).toFixed(2);
+      rsrpArcRef.current?.setAttribute("stroke-dashoffset", offset);
+      rsrpGlowRef.current?.setAttribute("stroke-dashoffset", offset);
+      const deg = start + sweep * f;
+      const a = (deg * Math.PI) / 180;
+      const kx = (c + r * Math.cos(a)).toFixed(2);
+      const ky = (c + r * Math.sin(a)).toFixed(2);
+      knobRef.current?.setAttribute("cx", kx);
+      knobRef.current?.setAttribute("cy", ky);
+      knobHaloRef.current?.setAttribute("cx", kx);
+      knobHaloRef.current?.setAttribute("cy", ky);
+    },
+    [min, max, outerLen, start]
+  );
+
+  const applySinr = useCallback(
+    (v: number) => {
+      const f = Math.max(0.02, Math.min(1, (v - sinrMin) / (sinrMax - sinrMin)));
+      const offset = (sinrLen * (1 - f)).toFixed(2);
+      sinrArcRef.current?.setAttribute("stroke-dashoffset", offset);
+      sinrGlowRef.current?.setAttribute("stroke-dashoffset", offset);
+    },
+    [sinrLen]
+  );
+
+  useSpringRef(shown, applyRsrp, { stiffness: 170, damping: 24, precision: 0.02 });
+  useSpringRef(sinr ?? null, applySinr, { stiffness: 155, damping: 23, precision: 0.02 });
+
+  const wasRsrpNullRef = useRef(shown == null);
+  const prevBoundsRef = useRef({ min, max });
+  useLayoutEffect(() => {
+    const boundsChanged = prevBoundsRef.current.min !== min || prevBoundsRef.current.max !== max;
+    prevBoundsRef.current = { min, max };
+    if (shown != null && (wasRsrpNullRef.current || boundsChanged)) {
+      applyRsrp(shown);
+    }
+    wasRsrpNullRef.current = shown == null;
+  }, [shown, min, max, applyRsrp]);
+
+  const wasSinrNullRef = useRef(sinr == null);
+  useLayoutEffect(() => {
+    if (sinr != null && wasSinrNullRef.current) {
+      applySinr(sinr);
+    }
+    wasSinrNullRef.current = sinr == null;
+  }, [sinr, applySinr]);
+
   const ticks = [];
   for (let v = min; v <= max; v += 5) {
     const deg = start + ((v - min) / (max - min)) * sweep;
     const major = v % 10 === 0;
-    const [x1, y1] = polar(deg, r - 15);
-    const [x2, y2] = polar(deg, r - (major ? 22 : 19));
+    const [x1, y1] = polar(deg, r - 9.5);
+    const [x2, y2] = polar(deg, r - (major ? 14.5 : 12));
     ticks.push(
       <line
         key={v}
@@ -587,12 +724,39 @@ export function SignalDial({
         y1={y1}
         x2={x2}
         y2={y2}
-        strokeWidth={major ? 1.6 : 1}
+        strokeWidth={major ? 1.5 : 0.95}
         className={onDark ? "stroke-on-ember/35" : "stroke-line-strong"}
         strokeLinecap="round"
       />
     );
   }
+
+  let peakReticle: React.ReactNode = null;
+  if (peakValue != null && Number.isFinite(peakValue)) {
+    const pf = Math.max(0.02, Math.min(1, (peakValue - min) / (max - min)));
+    const pDeg = start + sweep * pf;
+    const [px1, py1] = polar(pDeg, r - 8);
+    const [px2, py2] = polar(pDeg, r + 8.5);
+    const [pdx, pdy] = polar(pDeg, r + 11.5);
+    peakReticle = (
+      <g opacity={onDark ? 0.78 : 0.72} pointerEvents="none">
+        <line
+          x1={px1}
+          y1={py1}
+          x2={px2}
+          y2={py2}
+          strokeWidth="2"
+          strokeLinecap="round"
+          className={onDark ? "stroke-on-ember" : "stroke-ember-ink"}
+        />
+        <circle cx={pdx} cy={pdy} r="1.75" className={onDark ? "fill-on-ember" : "fill-ember-ink"} />
+      </g>
+    );
+  }
+
+  const showBeacon = live !== false && activityPct > 0;
+  const beaconOpacity = Math.min(0.45, 0.16 + (Math.min(100, Math.max(0, activityPct)) / 100) * 0.28);
+
   return (
     <div className="relative" style={{ width: size, height: size * 0.86 }}>
       <svg viewBox="0 0 200 172" className="w-full h-full overflow-visible">
@@ -602,36 +766,138 @@ export function SignalDial({
             <stop offset="55%" style={{ stopColor: "var(--qm-dial-b)" }} />
             <stop offset="100%" style={{ stopColor: "var(--qm-dial-c)" }} />
           </linearGradient>
+          <linearGradient id={`sinr-${gid}`} x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stopColor={onDark ? "#67e8f9" : "#06b6d4"} />
+            <stop offset="55%" stopColor={onDark ? "#34d399" : "#22d3ee"} />
+            <stop offset="100%" stopColor={onDark ? "#a7f3d0" : "#34d399"} />
+          </linearGradient>
+          <radialGradient id={`core-${gid}`} cx="50%" cy="35%" r="65%">
+            <stop offset="0%" stopColor={onDark ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.14)"} />
+            <stop offset="100%" stopColor={onDark ? "rgba(255,255,255,0.02)" : "rgba(15,23,42,0.03)"} />
+          </radialGradient>
           <filter id={`glow-${gid}`} x="-50%" y="-50%" width="200%" height="200%">
-            <feGaussianBlur stdDeviation="4" />
+            <feGaussianBlur stdDeviation="4.2" />
+          </filter>
+          <filter id={`sinr-glow-${gid}`} x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="2.8" />
           </filter>
         </defs>
+
+        {/* Inner frosted translucent glass core ring */}
+        {showBeacon && (
+          <g opacity={beaconOpacity}>
+            <circle
+              cx={c}
+              cy={c}
+              r={coreR}
+              fill="none"
+              strokeWidth="1.4"
+              stroke={onDark ? "currentColor" : "var(--qm-ember)"}
+              className="qm-beacon-pulse"
+            />
+          </g>
+        )}
+        <circle
+          cx={c}
+          cy={c}
+          r={coreR}
+          fill={`url(#core-${gid})`}
+          strokeWidth="1"
+          className={onDark ? "stroke-on-ember/25" : "stroke-line-strong/65"}
+        />
+
+        {/* Middle concentric SINR track & animated energy ring */}
         <path
-          d={arc(start, start + sweep, r)}
+          d={sinrFullArc}
           fill="none"
-          strokeWidth="13"
+          strokeWidth="4.5"
+          strokeLinecap="round"
+          className={onDark ? "stroke-on-ember/14" : "stroke-line/70"}
+        />
+        <g opacity={sinr != null ? 1 : 0}>
+          <path
+            ref={sinrGlowRef}
+            d={sinrFullArc}
+            fill="none"
+            stroke={`url(#sinr-${gid})`}
+            strokeWidth="5.5"
+            strokeLinecap="round"
+            strokeDasharray={`${sinrLen} ${sinrLen}`}
+            strokeDashoffset={initGeomRef.current.sinrOffset}
+            opacity="0.48"
+            filter={`url(#sinr-glow-${gid})`}
+          />
+          <path
+            ref={sinrArcRef}
+            d={sinrFullArc}
+            fill="none"
+            stroke={`url(#sinr-${gid})`}
+            strokeWidth="4.5"
+            strokeLinecap="round"
+            strokeDasharray={`${sinrLen} ${sinrLen}`}
+            strokeDashoffset={initGeomRef.current.sinrOffset}
+          />
+        </g>
+
+        {/* Outer RSRP track & precision scale ticks */}
+        <path
+          d={outerFullArc}
+          fill="none"
+          strokeWidth="12"
           strokeLinecap="round"
           className={onDark ? "stroke-on-ember/15" : "stroke-line"}
         />
         {ticks}
-        {shown != null && (
-          <>
-            <path d={arc(start, end, r)} fill="none" stroke={`url(#dial-${gid})`} strokeWidth="13" strokeLinecap="round" opacity=".55" filter={`url(#glow-${gid})`} />
-            <path
-              d={arc(start, end, r)}
-              fill="none"
-              stroke={`url(#dial-${gid})`}
-              strokeWidth="13"
-              strokeLinecap="round"
-              style={{ transition: "d 600ms cubic-bezier(.2,.7,.2,1)" }}
-            />
-            <circle cx={kx} cy={ky} r="8.5" fill="#fff" style={{ stroke: "var(--qm-dial-b)" }} strokeWidth="3" />
-          </>
-        )}
+
+        {/* Outer animated RSRP plasma arc, bloom & orb knob */}
+        <g opacity={shown != null ? 1 : 0}>
+          <path
+            ref={rsrpGlowRef}
+            d={outerFullArc}
+            fill="none"
+            stroke={`url(#dial-${gid})`}
+            strokeWidth="13"
+            strokeLinecap="round"
+            strokeDasharray={`${outerLen} ${outerLen}`}
+            strokeDashoffset={initGeomRef.current.rsrpOffset}
+            opacity=".55"
+            filter={`url(#glow-${gid})`}
+          />
+          <path
+            ref={rsrpArcRef}
+            d={outerFullArc}
+            fill="none"
+            stroke={`url(#dial-${gid})`}
+            strokeWidth="12"
+            strokeLinecap="round"
+            strokeDasharray={`${outerLen} ${outerLen}`}
+            strokeDashoffset={initGeomRef.current.rsrpOffset}
+          />
+          <circle
+            ref={knobHaloRef}
+            cx={initGeomRef.current.kx}
+            cy={initGeomRef.current.ky}
+            r="11.5"
+            style={{ fill: "var(--qm-dial-b)" }}
+            opacity=".34"
+            filter={`url(#sinr-glow-${gid})`}
+          />
+          <circle
+            ref={knobRef}
+            cx={initGeomRef.current.kx}
+            cy={initGeomRef.current.ky}
+            r="7.8"
+            fill="#fff"
+            style={{ stroke: "var(--qm-dial-b)" }}
+            strokeWidth="3"
+          />
+        </g>
+
+        {peakReticle}
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center pt-1 text-center pointer-events-none">
         <div className={cn("qm-display font-semibold leading-none", onDark ? "text-on-ember" : "text-ink")} style={{ fontSize: size * 0.24 }}>
-          {shown ?? "––"}
+          <RollingNumber value={shown} decimals={0} fallback="—" />
         </div>
         <div className={cn("mt-1 text-[12px] font-semibold tracking-wide", onDark ? "text-on-ember" : "text-muted")}>{unit}</div>
         {caption && <div className="mt-2">{caption}</div>}
@@ -645,7 +911,7 @@ export function SignalGauge({ rsrp, sinr, rat }: { rsrp: number | null; sinr: nu
   const q = signalQuality(rsrp, sinr);
   return (
     <div className="flex flex-col items-center">
-      <SignalDial value={rsrp} size={150} unit={rat ? `dBm · ${rat}` : "dBm"} />
+      <SignalDial value={rsrp} sinr={sinr} size={150} unit={rat ? `dBm · ${rat}` : "dBm"} />
       <Badge variant={q.badge} className="-mt-3" dot>
         {q.label}
       </Badge>
@@ -752,7 +1018,7 @@ export function Modal({
       <div
         ref={dialogRef}
         tabIndex={-1}
-        className="qm-card qm-dialog qm-rise w-full max-w-md max-h-[90vh] overflow-y-auto px-6 pt-6 pb-[calc(1.25rem+env(safe-area-inset-bottom))] sm:p-6 shadow-[var(--qm-shadow-pop)] focus:outline-none"
+        className="qm-card qm-dialog qm-page-enter w-full max-w-md max-h-[90vh] overflow-y-auto px-6 pt-6 pb-[calc(1.25rem+env(safe-area-inset-bottom))] sm:p-6 shadow-[var(--qm-shadow-pop)] focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-2">

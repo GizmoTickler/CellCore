@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CornerDownLeft, Search } from "lucide-react";
+import { playHudTick } from "../lib/hud-fx";
+import { usePointerGlow } from "../lib/motion";
 import { NAV } from "../lib/nav";
 import { cn } from "../lib/utils";
 import { navigate } from "../stores/route-store";
@@ -89,8 +91,10 @@ function CommandPaletteDialog({
   const [q, setQ] = useState("");
   const [cursor, setCursor] = useState(0);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  usePointerGlow(panelRef);
 
   const entries = useMemo<Entry[]>(() => {
     const out: Entry[] = [];
@@ -157,6 +161,7 @@ function CommandPaletteDialog({
 
   const choose = (e?: Entry) => {
     if (!e) return;
+    playHudTick();
     onClose();
     e.run();
   };
@@ -186,7 +191,11 @@ function CommandPaletteDialog({
       aria-modal="true"
       aria-label="Command palette"
     >
-      <div className="qm-card qm-dialog qm-rise w-full max-w-xl overflow-hidden p-0 shadow-[var(--qm-shadow-pop)]" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={panelRef}
+        className="qm-card qm-hud-card qm-page-enter w-full max-w-xl overflow-hidden p-0 backdrop-blur-xl shadow-[var(--qm-shadow-pop)]"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center gap-3 border-b border-line px-4">
           <Search className="h-4.5 w-4.5 text-ember-ink shrink-0" />
           <input

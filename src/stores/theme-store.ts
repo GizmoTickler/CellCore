@@ -4,7 +4,9 @@ type Theme = "dark" | "light";
 export type Layout = "rail" | "top" | "dock";
 export type LayoutPref = "auto" | Layout;
 export type Density = "cozy" | "compact";
+export type MotionQuality = "full" | "balanced" | "reduced";
 export type Skin =
+  | "prism"
   | "ember"
   | "midnight"
   | "swiss"
@@ -21,6 +23,7 @@ export type Skin =
   | "radar";
 
 export const SKINS: Array<{ id: Skin; label: string; short: string; hint: string; swatch: string; layout: Layout; density: Density; darkOnly?: boolean }> = [
+  { id: "prism", label: "Prism Glass", short: "Prism", hint: "Futuristic deep glass, specular bloom & fluid motion", swatch: "linear-gradient(135deg,#070d19 15%,#22d3ee 55%,#34d399 82%,#a78bfa)", darkOnly: true, layout: "rail", density: "cozy" },
   { id: "midnight", label: "Midnight Signal", short: "Midnight", hint: "Instrument-panel navy, cyan→violet", swatch: "linear-gradient(118deg,#22d3ee,#3b82f6 48%,#8b5cf6)", layout: "rail", density: "cozy" },
   { id: "obsidian", label: "Obsidian OLED", short: "Obsidian", hint: "True pitch-black OLED, emerald→cyan", swatch: "linear-gradient(135deg,#000000 45%,#10b981 75%,#06b6d4)", darkOnly: true, layout: "rail", density: "compact" },
   { id: "tokyo", label: "Tokyo Night", short: "Tokyo", hint: "Deep indigo-slate, sky blue & violet", swatch: "linear-gradient(118deg,#1a1b26 15%,#7aa2f7 60%,#bb9af7)", layout: "rail", density: "cozy" },
@@ -56,15 +59,22 @@ interface ThemeState {
   theme: Theme;
   skin: Skin;
   layoutPref: LayoutPref;
+  motionQuality: MotionQuality;
+  hudSfx: boolean;
   setLayoutPref: (pref: LayoutPref) => void;
   setTheme: (theme: Theme) => void;
   toggleTheme: () => void;
   setSkin: (skin: Skin) => void;
+  setMotionQuality: (q: MotionQuality) => void;
+  setHudSfx: (on: boolean) => void;
 }
 
 const THEME_STORAGE_KEY = "qm-theme-v32";
 const SKIN_STORAGE_KEY = "qm-skin";
 const LAYOUT_STORAGE_KEY = "qm-layout";
+const MOTION_STORAGE_KEY = "qm-motion";
+const HUD_SFX_STORAGE_KEY = "qm-hud-sfx";
+const MOTION_QUALITIES: ReadonlyArray<MotionQuality> = ["full", "balanced", "reduced"];
 
 function store(key: string, value: string) {
   try {
@@ -91,38 +101,53 @@ function syncThemeColorMeta() {
   window.requestAnimationFrame(apply);
 }
 
-function applyDomTheme(theme: Theme) {
+function syncDarkClass(theme: Theme, skin: Skin) {
   if (typeof document === "undefined") return;
-  document.documentElement.classList.toggle("dark", theme === "dark");
+  const isDark = theme === "dark" || Boolean(skinMeta(skin).darkOnly);
+  document.documentElement.classList.toggle("dark", isDark);
+}
+
+function applyDomTheme(theme: Theme, skin: Skin) {
+  if (typeof document === "undefined") return;
+  syncDarkClass(theme, skin);
   store(THEME_STORAGE_KEY, theme);
   syncThemeColorMeta();
 }
 
-function applyDomSkin(skin: Skin, pref: LayoutPref) {
+function applyDomSkin(skin: Skin, pref: LayoutPref, theme: Theme) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
   root.dataset.skin = skin;
   root.dataset.layout = resolveLayout(skin, pref);
   root.dataset.density = skinMeta(skin).density;
+  syncDarkClass(theme, skin);
   store(SKIN_STORAGE_KEY, skin);
   store(LAYOUT_STORAGE_KEY, pref);
   syncThemeColorMeta();
 }
 
-const initialTheme: Theme = (() => {
-  try {
-    return localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
-  } catch {
-    return "light";
-  }
-})();
+function applyDomMotion(q: MotionQuality) {
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.motion = q;
+  store(MOTION_STORAGE_KEY, q);
+}
 
 const initialSkin: Skin = (() => {
   try {
     const v = localStorage.getItem(SKIN_STORAGE_KEY);
-    return SKINS.some((s) => s.id === v) ? (v as Skin) : "midnight";
+    return SKINS.some((s) => s.id === v) ? (v as Skin) : "prism";
   } catch {
-    return "midnight";
+    return "prism";
+  }
+})();
+
+const initialTheme: Theme = (() => {
+  try {
+    const v = localStorage.getItem(THEME_STORAGE_KEY);
+    if (v === "dark" || v === "light") return v;
+    return skinMeta(initialSkin).darkOnly ? "dark" : "light";
+  } catch {
+    return skinMeta(initialSkin).darkOnly ? "dark" : "light";
   }
 })();
 
@@ -135,8 +160,27 @@ const initialLayoutPref: LayoutPref = (() => {
   }
 })();
 
-applyDomTheme(initialTheme);
-applyDomSkin(initialSkin, initialLayoutPref);
+const initialMotionQuality: MotionQuality = (() => {
+  try {
+    const v = localStorage.getItem(MOTION_STORAGE_KEY);
+    return MOTION_QUALITIES.includes(v as MotionQuality) ? (v as MotionQuality) : "full";
+  } catch {
+    return "full";
+  }
+})();
+
+const initialHudSfx: boolean = (() => {
+  try {
+    const v = localStorage.getItem(HUD_SFX_STORAGE_KEY);
+    return v === "true" || v === "1";
+  } catch {
+    return false;
+  }
+})();
+
+applyDomTheme(initialTheme, initialSkin);
+applyDomSkin(initialSkin, initialLayoutPref, initialTheme);
+applyDomMotion(initialMotionQuality);
 if (typeof window !== "undefined") {
   window.addEventListener("load", syncThemeColorMeta, { once: true });
 }
@@ -145,21 +189,31 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   theme: initialTheme,
   skin: initialSkin,
   layoutPref: initialLayoutPref,
+  motionQuality: initialMotionQuality,
+  hudSfx: initialHudSfx,
   setLayoutPref: (layoutPref) => {
-    applyDomSkin(get().skin, layoutPref);
+    applyDomSkin(get().skin, layoutPref, get().theme);
     set({ layoutPref });
   },
   setTheme: (theme) => {
-    applyDomTheme(theme);
+    applyDomTheme(theme, get().skin);
     set({ theme });
   },
   toggleTheme: () => {
     const next: Theme = get().theme === "dark" ? "light" : "dark";
-    applyDomTheme(next);
+    applyDomTheme(next, get().skin);
     set({ theme: next });
   },
   setSkin: (skin) => {
-    applyDomSkin(skin, get().layoutPref);
+    applyDomSkin(skin, get().layoutPref, get().theme);
     set({ skin });
+  },
+  setMotionQuality: (motionQuality) => {
+    applyDomMotion(motionQuality);
+    set({ motionQuality });
+  },
+  setHudSfx: (hudSfx) => {
+    store(HUD_SFX_STORAGE_KEY, hudSfx ? "true" : "false");
+    set({ hudSfx });
   },
 }));

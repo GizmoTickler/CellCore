@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Eye, EyeOff, Lock, Moon, Sun } from "lucide-react";
 import { apiFetch } from "../lib/api";
+import { playHudSuccess } from "../lib/hud-fx";
+import { usePointerGlow } from "../lib/motion";
 import { cn, signalPercent } from "../lib/utils";
 import { useAuthStore } from "../stores/auth-store";
 import { SKINS, useThemeStore } from "../stores/theme-store";
@@ -18,6 +20,8 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const signInCardRef = useRef<HTMLDivElement>(null);
+  usePointerGlow(signInCardRef);
 
   const rfPreview = useQuery({
     queryKey: ["public-rf-preview"],
@@ -34,6 +38,9 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
     const validRsrp = mimo.rsrp.filter((v): v is number => v != null);
     const avgRsrp =
       validRsrp.length > 0 ? Math.round((validRsrp.reduce((a, b) => a + b, 0) / validRsrp.length) * 10) / 10 : null;
+    const validSinr = mimo.sinr.filter((v): v is number => v != null);
+    const avgSinr =
+      validSinr.length > 0 ? Math.round((validSinr.reduce((a, b) => a + b, 0) / validSinr.length) * 10) / 10 : null;
     return {
       carriers,
       mimo,
@@ -42,6 +49,7 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
       model: p?.model || "RM551E-GL",
       totalBw,
       avgRsrp,
+      avgSinr,
     };
   }, [rfPreview.data]);
 
@@ -60,6 +68,7 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
         body: JSON.stringify({ password }),
       });
       if (res?.status === "success" || res?.state === "success") {
+        playHudSuccess();
         setAuthenticated(true, res.token, res.csrfToken ?? null);
         onSuccess?.();
       } else {
@@ -76,7 +85,18 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
     <div className="flex flex-col min-h-screen lg:grid lg:grid-cols-2">
       {/* ── Signal panel ─────────────────────────────────────────── */}
       <section className="relative overflow-hidden qm-sun-ink qm-grain text-on-ember px-6 py-8 sm:px-10 lg:px-14 lg:py-12 flex flex-col">
+        {/* Volumetric bloom backdrop */}
         <div aria-hidden className="pointer-events-none absolute -bottom-48 -left-32 h-[520px] w-[520px] rounded-full bg-ember/25 blur-3xl" />
+        <div
+          aria-hidden
+          className="pointer-events-none absolute -top-36 right-[-14%] h-[440px] w-[440px] rounded-full blur-3xl opacity-35"
+          style={{ background: "radial-gradient(circle, rgba(255, 255, 255, 0.34) 0%, transparent 68%)" }}
+        />
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 opacity-25"
+          style={{ background: "radial-gradient(620px 380px at 26% 62%, rgba(255, 255, 255, 0.22), transparent 68%)" }}
+        />
         <div className="relative flex items-center gap-3">
           <BrandMark className="bg-on-ember/15 shadow-none ring-1 ring-on-ember/30 [background-image:none]" />
           <div className="leading-tight">
@@ -89,7 +109,15 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
 
         <div className="relative mt-8 lg:mt-auto flex flex-col items-center lg:items-start gap-6">
           <div className="flex flex-col sm:flex-row items-center gap-6 sm:gap-10">
-            <SignalDial value={summary.avgRsrp != null ? Math.round(summary.avgRsrp) : null} size={200} unit="dBm mean RSRP" onDark />
+            <SignalDial
+              value={summary.avgRsrp != null ? Math.round(summary.avgRsrp) : null}
+              sinr={summary.avgSinr ?? 22}
+              activityPct={summary.avgRsrp != null ? 45 : 25}
+              live
+              size={200}
+              unit="dBm mean RSRP"
+              onDark
+            />
             <div className="text-center sm:text-left">
               <div className="text-[11px] font-bold uppercase tracking-[0.16em]">Live right now</div>
               <div className="qm-display mt-1.5 text-[2rem] sm:text-[2.4rem] leading-[1.05]">{summary.operator}</div>
@@ -145,52 +173,54 @@ export function LoginPage({ onSuccess }: { onSuccess?: () => void }) {
           </Button>
         </div>
 
-        <div className="my-auto w-full max-w-sm mx-auto py-10">
-          <div className="qm-eyebrow">Gateway console</div>
-          <h1 className="qm-display mt-2 text-[2.2rem] leading-tight text-ink">Sign in</h1>
-          <p className="mt-2 text-[14px] text-ink-2">Use the gateway&apos;s root password.</p>
+        <div className="my-auto w-full max-w-sm mx-auto py-6">
+          <div ref={signInCardRef} className="qm-card qm-hud-card qm-reticle qm-page-enter p-6 sm:p-7">
+            <div className="qm-eyebrow">Gateway console</div>
+            <h1 className="qm-display mt-2 text-[2.2rem] leading-tight text-ink">Sign in</h1>
+            <p className="mt-2 text-[14px] text-ink-2">Use the gateway&apos;s root password.</p>
 
-          <form onSubmit={handleSubmit} className="mt-8 space-y-4">
-            <div>
-              <label className="block text-[12.5px] font-semibold mb-1.5 text-ink-2" htmlFor="qm-password">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="h-4 w-4 text-muted absolute left-3.5 top-3.5 pointer-events-none" />
-                <Input
-                  id="qm-password"
-                  type={showPassword ? "text" : "password"}
-                  autoComplete="current-password"
-                  autoFocus={typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(min-width: 1024px)").matches}
-                  placeholder="Root password"
-                  value={password}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
-                  className="h-11 pl-10 pr-11 text-[16px] sm:text-[14px]"
-                  aria-invalid={Boolean(error)}
-                  aria-describedby={error ? "qm-login-error" : undefined}
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((v) => !v)}
-                  aria-label={showPassword ? "Hide password" : "Show password"}
-                  className="absolute right-2 top-2 rounded-full p-1.5 text-muted hover:text-ink hover:bg-sunk cursor-pointer"
-                >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+            <form onSubmit={handleSubmit} className="mt-7 space-y-4">
+              <div>
+                <label className="block text-[12.5px] font-semibold mb-1.5 text-ink-2" htmlFor="qm-password">
+                  Password
+                </label>
+                <div className="relative">
+                  <Lock className="h-4 w-4 text-muted absolute left-3.5 top-3.5 pointer-events-none" />
+                  <Input
+                    id="qm-password"
+                    type={showPassword ? "text" : "password"}
+                    autoComplete="current-password"
+                    autoFocus={typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(min-width: 1024px)").matches}
+                    placeholder="Root password"
+                    value={password}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
+                    className="h-11 pl-10 pr-11 text-[16px] sm:text-[14px]"
+                    aria-invalid={Boolean(error)}
+                    aria-describedby={error ? "qm-login-error" : undefined}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    className="absolute right-2 top-2 rounded-full p-1.5 text-muted hover:text-ink hover:bg-sunk cursor-pointer"
+                  >
+                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
               </div>
-            </div>
 
-            {error && (
-              <div id="qm-login-error" role="alert" className="rounded-xl bg-crimson-soft px-3.5 py-2.5 text-[13px] font-medium text-crimson-ink">
-                {error}
-              </div>
-            )}
+              {error && (
+                <div id="qm-login-error" role="alert" className="rounded-xl bg-crimson-soft px-3.5 py-2.5 text-[13px] font-medium text-crimson-ink">
+                  {error}
+                </div>
+              )}
 
-            <Button type="submit" variant="tier1" size="lg" className="w-full" disabled={submitting}>
-              {submitting ? "Signing in…" : "Sign in"}
-              {!submitting && <ArrowRight className="h-4 w-4" />}
-            </Button>
-          </form>
+              <Button type="submit" variant="tier1" size="lg" className="w-full" disabled={submitting}>
+                {submitting ? "Signing in…" : "Sign in"}
+                {!submitting && <ArrowRight className="h-4 w-4" />}
+              </Button>
+            </form>
+          </div>
         </div>
 
         <div className="mx-auto w-full max-w-sm">
